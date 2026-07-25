@@ -1,0 +1,15 @@
+[package]
+name = "bx-pipeline"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Sequencer, accounts, matching and event publication"
+
+[dependencies]
+bx-protocol = { path = "../protocol" }
+bx-journal = { path = "../journal" }
+bx-engine = { path = "../engine" }
+
+[lints]
+workspace = true

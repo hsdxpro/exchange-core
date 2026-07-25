@@ -15,6 +15,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bx-pipeline"
+version = "0.1.0"
+dependencies = [
+ "bx-engine",
+ "bx-journal",
+ "bx-protocol",
+]
+
+[[package]]
 name = "bx-protocol"
 version = "0.1.0"
 dependencies = [
