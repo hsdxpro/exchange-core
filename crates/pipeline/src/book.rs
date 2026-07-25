@@ -101,14 +101,14 @@ impl SlotAllocator {
         }
     }
 
-    fn allocate(&mut self, order: OrderId) -> Option<u32> {
+    fn allocate(&mut self, order: OrderId) -> Result<u32, SlotError> {
         if self.to_slot.contains_key(&order) {
-            return None;
+            return Err(SlotError::Duplicate);
         }
-        let slot = self.free.pop()?;
+        let slot = self.free.pop().ok_or(SlotError::Exhausted)?;
         self.to_slot.insert(order, slot);
         self.to_order[slot as usize] = order;
-        Some(slot)
+        Ok(slot)
     }
 
     fn slot_of(&self, order: OrderId) -> Option<u32> {
@@ -127,6 +127,26 @@ impl SlotAllocator {
 
     fn live(&self) -> usize {
         self.capacity as usize - self.free.len()
+    }
+}
+
+/// Why a slot could not be handed out.
+///
+/// These are different failures and a client must be able to tell them apart:
+/// a duplicate ID is the client's mistake and retrying with a new ID fixes it,
+/// while an exhausted pool is the venue being full and retrying makes it worse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotError {
+    Duplicate,
+    Exhausted,
+}
+
+impl SlotError {
+    const fn reject_reason(self) -> RejectReason {
+        match self {
+            Self::Duplicate => RejectReason::DuplicateOrderId,
+            Self::Exhausted => RejectReason::OrderLimitReached,
+        }
     }
 }
 
@@ -233,7 +253,7 @@ impl Book {
         else {
             return false;
         };
-        let Some(id) = self.slots.allocate(order) else {
+        let Ok(id) = self.slots.allocate(order) else {
             return false;
         };
         if self
@@ -292,9 +312,12 @@ impl Book {
             }
         };
 
-        let Some(engine_order) = self.slots.allocate(order) else {
-            out.reject_with(RejectReason::DuplicateOrderId);
-            return;
+        let engine_order = match self.slots.allocate(order) {
+            Ok(slot) => slot,
+            Err(reason) => {
+                out.reject_with(reason.reject_reason());
+                return;
+            }
         };
 
         // The fill callback needs the buffers while the engine holds `self`,
@@ -470,8 +493,69 @@ const fn map_error(error: OrderError) -> RejectReason {
 mod tests {
     use super::*;
 
+    const POOL: u32 = 1_024;
+
     fn book() -> Book {
-        Book::new(Instrument::new(1, 10, 20, 1_000, 1_000_000, 1_024))
+        Book::new(Instrument::new(1, 10, 20, 1_000, 1_000_000, POOL))
+    }
+
+    #[test]
+    fn there_is_no_limit_on_orders_at_one_price_level() {
+        // A price level is a head and tail index into one shared pool, not an
+        // array, so a single level can hold every order the book can hold.
+        let mut book = book();
+        for order in 1..=u64::from(POOL) {
+            assert!(
+                rest(&mut book, order, Side::Bid, 1_500, 1).reject.is_none(),
+                "order {order} at a single price was refused"
+            );
+        }
+        assert_eq!(book.live_orders(), POOL as usize);
+        assert_eq!(book.level_quantity(Side::Bid, 1_500), u64::from(POOL));
+    }
+
+    #[test]
+    fn the_pool_is_shared_across_prices_and_sides_not_divided_between_them() {
+        // Spreading the same orders over many levels and both sides changes
+        // nothing about how many fit.
+        let mut book = book();
+        for order in 1..=u64::from(POOL) {
+            let side = if order.is_multiple_of(2) {
+                Side::Bid
+            } else {
+                Side::Ask
+            };
+            let price = match side {
+                Side::Bid => 1_500 - (order as Ticks % 400),
+                Side::Ask => 1_501 + (order as Ticks % 400),
+            };
+            assert!(rest(&mut book, order, side, price, 1).reject.is_none());
+        }
+        assert_eq!(book.live_orders(), POOL as usize);
+    }
+
+    #[test]
+    fn exhausting_the_pool_rejects_cleanly_and_a_cancel_frees_a_slot() {
+        let mut book = book();
+        for order in 1..=u64::from(POOL) {
+            rest(&mut book, order, Side::Bid, 1_500, 1);
+        }
+        // One past the pool is refused, not a panic and not silent loss.
+        assert_eq!(
+            rest(&mut book, u64::from(POOL) + 1, Side::Bid, 1_500, 1).reject,
+            Some(RejectReason::OrderLimitReached)
+        );
+
+        // Cancelling returns the slot, so the venue recovers by itself.
+        let mut out = Outcome::default();
+        book.cancel_into(&mut out, 1);
+        assert!(out.reject.is_none());
+        assert!(
+            rest(&mut book, u64::from(POOL) + 1, Side::Bid, 1_500, 1)
+                .reject
+                .is_none(),
+            "a freed slot was not reused"
+        );
     }
 
     fn rest(book: &mut Book, order: OrderId, side: Side, price: Ticks, qty: Quantity) -> Outcome {

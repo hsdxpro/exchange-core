@@ -228,7 +228,12 @@ These were argued out. Do not relitigate without new information.
   ladder size, read as though the book could only hold 65,535 prices. It is now
   `Instrument::max_open_orders`, declared per instrument. A benchmark had
   already saturated it silently, so every order past the limit was being
-  rejected and the measurement was meaningless.
+  rejected and the measurement was meaningless. Proving there is no per-level
+  limit then turned up a second bug: the slot allocator returned `None` for
+  both a duplicate order ID and an exhausted pool, and the caller reported both
+  as `DuplicateOrderId`. A full venue therefore told every client "order ID is
+  already live", which a client answers by retrying with a fresh ID forever.
+  `OrderLimitReached` existed and was never emitted.
 - **An instrument's ladder range IS its price band.** The memory bound and the
   fat-finger control are the same mechanism. Implemented in
   `instrument.rs::to_slot`.
