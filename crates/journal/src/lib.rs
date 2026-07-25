@@ -85,19 +85,12 @@ pub trait LogStorage {
     /// # Errors
     /// Returns the underlying I/O error if the read fails.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
-
-    fn len(&self) -> u64;
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 /// A journal in a real file.
 #[derive(Debug)]
 pub struct FileLog {
     file: File,
-    len: u64,
 }
 
 impl FileLog {
@@ -117,10 +110,7 @@ impl FileLog {
         if len == 0 {
             file.write_all(&MAGIC)?;
             file.sync_all()?;
-            return Ok(Self {
-                file,
-                len: HEADER_LEN,
-            });
+            return Ok(Self { file });
         }
 
         let mut magic = [0_u8; MAGIC.len()];
@@ -130,15 +120,13 @@ impl FileLog {
             return Err(JournalError::NotAJournal);
         }
         file.seek(SeekFrom::End(0))?;
-        Ok(Self { file, len })
+        Ok(Self { file })
     }
 }
 
 impl LogStorage for FileLog {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes)?;
-        self.len += bytes.len() as u64;
-        Ok(())
+        self.file.write_all(bytes)
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -149,10 +137,6 @@ impl LogStorage for FileLog {
         let mut handle = self.file.try_clone()?;
         handle.seek(SeekFrom::Start(offset))?;
         handle.read(buf)
-    }
-
-    fn len(&self) -> u64 {
-        self.len
     }
 }
 
@@ -195,13 +179,6 @@ impl MemoryLog {
         self
     }
 
-    /// Bytes that reached durable storage. Anything past this is what a crash
-    /// would discard.
-    #[must_use]
-    pub fn synced_len(&self) -> u64 {
-        self.synced_len
-    }
-
     /// Discards everything not yet synced, simulating power loss.
     pub fn crash(&mut self) {
         self.bytes.truncate(self.synced_len as usize);
@@ -241,10 +218,6 @@ impl LogStorage for MemoryLog {
         let n = available.len().min(buf.len());
         buf[..n].copy_from_slice(&available[..n]);
         Ok(n)
-    }
-
-    fn len(&self) -> u64 {
-        self.bytes.len() as u64
     }
 }
 

@@ -108,16 +108,6 @@ impl Instruments {
         self.by_symbol.get(symbol as usize)?.as_ref()
     }
 
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.by_symbol.iter().flatten().count()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &Instrument> {
         self.by_symbol.iter().flatten()
     }
@@ -166,7 +156,7 @@ mod tests {
         let mut set = Instruments::new();
         set.insert(instrument());
         set.insert(Instrument::new(9, 100, 200, 0, 10));
-        assert_eq!(set.len(), 2);
+        assert_eq!(set.iter().count(), 2);
         assert_eq!(set.get(1).unwrap().floor_ticks, 10_000);
         assert_eq!(set.get(9).unwrap().floor_ticks, 0);
         assert!(set.get(2).is_none());

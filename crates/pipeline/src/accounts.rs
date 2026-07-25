@@ -153,19 +153,6 @@ impl Accounts {
             .map(|(_, b)| b.total())
             .sum()
     }
-
-    #[must_use]
-    pub fn accounts_holding(&self, asset: AssetId) -> Vec<AccountId> {
-        let mut out: Vec<_> = self
-            .balances
-            .keys()
-            .filter(|(_, a)| *a == asset)
-            .map(|(account, _)| *account)
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
 }
 
 #[cfg(test)]

@@ -94,13 +94,6 @@ pub enum RejectReason {
     EngineCapacity = 15,
 }
 
-impl RejectReason {
-    #[must_use]
-    pub const fn is_rejected(self) -> bool {
-        !matches!(self, Self::None)
-    }
-}
-
 impl fmt::Display for RejectReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -355,7 +348,5 @@ mod tests {
         messages.sort_unstable();
         messages.dedup();
         assert_eq!(messages.len(), total, "two reject reasons share a message");
-        assert!(!RejectReason::None.is_rejected());
-        assert!(RejectReason::UnknownAccount.is_rejected());
     }
 }

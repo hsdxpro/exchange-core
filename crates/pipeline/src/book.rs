@@ -32,7 +32,6 @@ pub struct LevelChange {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Execution {
     pub resting_order: OrderId,
-    pub resting_side: Side,
     pub price: Ticks,
     pub quantity: Quantity,
 }
@@ -150,11 +149,6 @@ impl Book {
     }
 
     #[must_use]
-    pub const fn instrument(&self) -> &Instrument {
-        &self.instrument
-    }
-
-    #[must_use]
     pub fn live_orders(&self) -> usize {
         self.slots.live()
     }
@@ -163,13 +157,6 @@ impl Book {
     pub fn best_bid(&self) -> Option<Ticks> {
         let best = self.engine.best_bid();
         (best >= 0).then(|| self.instrument.to_price(best as u16))
-    }
-
-    #[must_use]
-    pub fn best_ask(&self) -> Option<Ticks> {
-        let best = self.engine.best_ask();
-        (best >= 0 && best < bx_engine::PRICE_COUNT as i32)
-            .then(|| self.instrument.to_price(best as u16))
     }
 
     /// Aggregate quantity resting at a price.
@@ -248,9 +235,6 @@ impl Book {
             return;
         };
 
-        out.touch(side.opposite(), slot);
-        out.touch(side, slot);
-
         // The fill callback needs the buffers while the engine holds `self`,
         // so they are moved out and put back. A `Vec` is three words; this
         // costs nothing and keeps the borrow checker satisfied without unsafe.
@@ -272,7 +256,6 @@ impl Book {
                     // Engine slot index for now; resolved to the client's order
                     // ID below, once the borrow has ended.
                     resting_order: u64::from(fill.maker_order_id),
-                    resting_side: side.opposite(),
                     price: i64::from(fill.price),
                     quantity: u64::from(fill.quantity),
                 });
@@ -298,6 +281,13 @@ impl Book {
                 }
                 if report.rested_quantity == 0 {
                     self.slots.release(order);
+                } else {
+                    // Only now is the order's own price known to have changed.
+                    // Touching it up front would publish a phantom empty level
+                    // for every order that never rests, and a market order
+                    // addresses the ladder extreme, so the phantom would be at
+                    // a price no book ever occupies.
+                    out.touch(side, slot);
                 }
                 out.resting_quantity = u64::from(report.rested_quantity);
                 self.resolve_levels(out);
@@ -596,6 +586,37 @@ mod tests {
         assert_eq!(
             cancel(&mut book, 404).reject,
             Some(RejectReason::UnknownOrderId)
+        );
+    }
+
+    #[test]
+    fn no_delta_is_emitted_for_a_price_that_did_not_change() {
+        let mut book = book();
+        rest(&mut book, 1, Side::Ask, 1_500, 5);
+
+        // A market buy consumes the whole ask level. The only price that
+        // changed is 1_500; the ladder extreme the market order addresses must
+        // not be published as a phantom empty level.
+        let mut outcome = Outcome::default();
+        book.submit_into(
+            &mut outcome,
+            9,
+            Side::Bid,
+            0,
+            5,
+            TimeInForce::ImmediateOrCancel,
+            true,
+        );
+
+        let prices: Vec<_> = outcome
+            .level_changes
+            .iter()
+            .map(|c| (c.side, c.price))
+            .collect();
+        assert_eq!(
+            prices,
+            vec![(Side::Ask, 1_500)],
+            "only the level that actually changed should be published"
         );
     }
 
