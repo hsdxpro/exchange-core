@@ -219,6 +219,16 @@ These were argued out. Do not relitigate without new information.
   order — **not yet implemented.**
 - **MBP public, MBO colocated only.** MBO leaks trading patterns and is 10–100×
   the volume.
+- **Price levels and order slots are different things and must not share a
+  number.** The book has 65,536 *price levels* because that is the bitmap
+  ladder, and that is the design. It separately needs a pool of *resting order
+  slots*, because the engine addresses orders by dense index to keep insert and
+  cancel O(1) with no allocation. That pool used to be a `DEFAULT_BOOK_CAPACITY`
+  of 65,535 sitting in `lib.rs` — a magic number that, by coinciding with the
+  ladder size, read as though the book could only hold 65,535 prices. It is now
+  `Instrument::max_open_orders`, declared per instrument. A benchmark had
+  already saturated it silently, so every order past the limit was being
+  rejected and the measurement was meaningless.
 - **An instrument's ladder range IS its price band.** The memory bound and the
   fat-finger control are the same mechanism. Implemented in
   `instrument.rs::to_slot`.
@@ -262,8 +272,6 @@ Ordered by how much it matters.
    works, but a client sees a `Canceled` it did not ask for.
 5. **`market_order` uses `Ticks::MIN` as its sentinel.** Works, but a real
    protocol should carry an explicit order-type field.
-6. **Book capacity is a hardcoded 65,535** per symbol in `pipeline/src/lib.rs`.
-   Should come from the instrument definition.
 7. **openraft's reported 40 ms blocking issue is unverified** against our
    batching pattern. Measure before committing to it on the data path.
 

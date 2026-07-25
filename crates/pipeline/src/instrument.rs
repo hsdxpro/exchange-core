@@ -28,6 +28,17 @@ pub struct Instrument {
     /// Largest single-order quantity. Bounds the arithmetic below and stops one
     /// order from consuming the whole book by accident.
     pub max_quantity: Quantity,
+    /// How many orders may rest in this book at once.
+    ///
+    /// The engine holds resting orders in a preallocated pool addressed by a
+    /// dense index, which is what makes insert, cancel and amend O(1) with no
+    /// allocation on the command path. The pool has to be sized, and its size
+    /// is a venue policy per instrument — a thin altcoin does not need the pool
+    /// a major pair does — so it is declared here rather than assumed.
+    ///
+    /// This is unrelated to how many *price levels* the book has. Those come
+    /// from the bitmap ladder and are always [`LADDER_SLOTS`].
+    pub max_open_orders: u32,
 }
 
 impl Instrument {
@@ -38,6 +49,7 @@ impl Instrument {
         quote: AssetId,
         floor_ticks: Ticks,
         max_quantity: Quantity,
+        max_open_orders: u32,
     ) -> Self {
         Self {
             symbol,
@@ -45,6 +57,7 @@ impl Instrument {
             quote,
             floor_ticks,
             max_quantity,
+            max_open_orders,
         }
     }
 
@@ -119,7 +132,7 @@ mod tests {
 
     fn instrument() -> Instrument {
         // Band runs from 10,000 to 75,535 ticks.
-        Instrument::new(1, 100, 200, 10_000, 1_000_000)
+        Instrument::new(1, 100, 200, 10_000, 1_000_000, 1_024)
     }
 
     #[test]
@@ -155,7 +168,7 @@ mod tests {
     fn lookup_is_by_symbol_and_missing_symbols_are_absent() {
         let mut set = Instruments::new();
         set.insert(instrument());
-        set.insert(Instrument::new(9, 100, 200, 0, 10));
+        set.insert(Instrument::new(9, 100, 200, 0, 10, 1_024));
         assert_eq!(set.iter().count(), 2);
         assert_eq!(set.get(1).unwrap().floor_ticks, 10_000);
         assert_eq!(set.get(9).unwrap().floor_ticks, 0);

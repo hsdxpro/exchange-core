@@ -16,6 +16,9 @@ pub const USD: AssetId = 2;
 pub const SYMBOL: u32 = 1;
 pub const FLOOR: Ticks = 10_000;
 pub const MAX_QUANTITY: u64 = 1_000_000;
+/// Resting-order pool for the test instrument. Large enough that no test hits
+/// it by accident, which would turn a real assertion into a capacity reject.
+pub const MAX_OPEN_ORDERS: u32 = 200_000;
 
 /// Accounts the funded fixtures create, and what each starts with.
 pub const ACCOUNTS: std::ops::RangeInclusive<AccountId> = 1..=8;
@@ -25,7 +28,14 @@ pub const START_BTC: u128 = 10_000;
 #[must_use]
 pub fn instruments() -> Instruments {
     let mut instruments = Instruments::new();
-    instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, MAX_QUANTITY));
+    instruments.insert(Instrument::new(
+        SYMBOL,
+        BTC,
+        USD,
+        FLOOR,
+        MAX_QUANTITY,
+        MAX_OPEN_ORDERS,
+    ));
     instruments
 }
 

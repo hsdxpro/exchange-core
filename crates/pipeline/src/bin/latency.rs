@@ -24,10 +24,20 @@ const USD: AssetId = 2;
 const SYMBOL: u32 = 1;
 const FLOOR: Ticks = 10_000;
 const REPS: usize = 7;
+/// Bigger than any run below places, so no measurement is polluted by orders
+/// being rejected for want of a slot.
+const MAX_OPEN_ORDERS: u32 = 400_000;
 
 fn venue() -> Exchange<MemoryLog> {
     let mut instruments = Instruments::new();
-    instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000_000));
+    instruments.insert(Instrument::new(
+        SYMBOL,
+        BTC,
+        USD,
+        FLOOR,
+        1_000_000_000,
+        MAX_OPEN_ORDERS,
+    ));
     let mut exchange = Exchange::new(MemoryLog::new(), instruments).unwrap();
     for account in 1..=16 {
         exchange.deposit(account, USD, u128::from(u64::MAX));
@@ -257,7 +267,14 @@ fn on_disk(sink: &mut u64, batch: usize) -> Vec<f64> {
         let _ = std::fs::remove_file(&path);
 
         let mut instruments = Instruments::new();
-        instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000_000));
+        instruments.insert(Instrument::new(
+            SYMBOL,
+            BTC,
+            USD,
+            FLOOR,
+            1_000_000_000,
+            MAX_OPEN_ORDERS,
+        ));
         let mut exchange = Exchange::new(FileLog::open(&path).unwrap(), instruments).unwrap();
         for account in 1..=16 {
             exchange.deposit(account, USD, u128::from(u64::MAX));
@@ -281,6 +298,92 @@ fn on_disk(sink: &mut u64, batch: usize) -> Vec<f64> {
         let _ = std::fs::remove_file(&path);
     }
     samples
+}
+
+/// How long a restart takes, with and without a snapshot.
+///
+/// Recovery time is an availability number, not a throughput one: it is how
+/// long the venue is down after a crash. Replaying from zero grows without
+/// bound as the journal does, which is the whole reason snapshots exist.
+///
+/// The saving depends entirely on the ratio between the journal and the resting
+/// book, because restoring a snapshot costs one insert per resting order. Flow
+/// here posts and later cancels, so the book stays near a thousand orders while
+/// the journal runs to two hundred thousand — which is the shape of a real
+/// venue, where commands vastly outnumber live orders. A journal where nothing
+/// is ever cancelled saturates the book and the snapshot saves almost nothing.
+fn recovery() -> (f64, f64, u64) {
+    const COUNT: u64 = 200_000;
+    const SNAPSHOT_AFTER: u64 = 190_000;
+    /// How long an order rests before its owner cancels it.
+    const LIFETIME: u64 = 2_001;
+
+    let mut exchange = venue();
+    let mut snapshot = None;
+    for i in 0..COUNT {
+        let mut command = if i.is_multiple_of(2) {
+            let price = FLOOR + 1_000 + (i % 4_000) as Ticks;
+            limit_order(1 + i % 16, SYMBOL, i + 1, Side::Bid, price, 1)
+        } else if i > LIFETIME {
+            // Cancels the order posted LIFETIME commands ago, so the resting
+            // book stays bounded while the journal keeps growing.
+            Command::new(
+                CommandKind::Cancel,
+                1 + i % 16,
+                SYMBOL,
+                i - LIFETIME + 1,
+                Side::Bid,
+                0,
+                0,
+                TimeInForce::GoodTillCancel,
+            )
+        } else {
+            let price = FLOOR + 1_000 + (i % 4_000) as Ticks;
+            limit_order(1 + i % 16, SYMBOL, i + 1, Side::Bid, price, 1)
+        };
+        exchange.submit(&mut command).unwrap();
+        if i + 1 == SNAPSHOT_AFTER {
+            snapshot = Some(exchange.snapshot());
+        }
+    }
+    let snapshot = snapshot.unwrap();
+    let storage = exchange.into_storage();
+
+    let mut instruments = Instruments::new();
+    instruments.insert(Instrument::new(
+        SYMBOL,
+        BTC,
+        USD,
+        FLOOR,
+        1_000_000_000,
+        MAX_OPEN_ORDERS,
+    ));
+    let mut full = Exchange::new(storage, instruments).unwrap();
+    for account in 1..=16 {
+        full.deposit(account, USD, u128::from(u64::MAX));
+        full.deposit(account, BTC, u128::from(u64::MAX));
+    }
+    let started = Instant::now();
+    let replayed = full.recover().unwrap();
+    let full_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    let mut instruments = Instruments::new();
+    instruments.insert(Instrument::new(
+        SYMBOL,
+        BTC,
+        USD,
+        FLOOR,
+        1_000_000_000,
+        MAX_OPEN_ORDERS,
+    ));
+    let mut partial = Exchange::new(full.into_storage(), instruments).unwrap();
+    let started = Instant::now();
+    let after = partial.recover_from(&snapshot).unwrap();
+    let snapshot_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    assert_eq!(replayed, COUNT);
+    assert_eq!(after, COUNT - SNAPSHOT_AFTER);
+    (full_ms, snapshot_ms, snapshot.orders.len() as u64)
 }
 
 fn main() {
@@ -324,6 +427,18 @@ fn main() {
             "per command",
         );
     }
+
+    println!();
+    println!("Restart time for a 200,000 command journal, snapshot taken at 190,000:");
+    println!("{}", "-".repeat(80));
+    let (full_ms, snapshot_ms, orders) = recovery();
+    println!("{:<38}{full_ms:>9.1} ms", "replay all 200,000");
+    println!("{:<38}{snapshot_ms:>9.1} ms", "snapshot + replay 10,000");
+    println!(
+        "{:<38}{:>9.1}x   ({orders} orders in the snapshot)",
+        "speedup",
+        full_ms / snapshot_ms
+    );
 
     println!("{}", "-".repeat(80));
     println!("sink {sink:#x}");

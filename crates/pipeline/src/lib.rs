@@ -37,9 +37,6 @@ pub fn accounting_violations() -> u64 {
     VIOLATIONS.load(Ordering::Relaxed)
 }
 
-/// Orders one book holds before rejecting for capacity.
-const DEFAULT_BOOK_CAPACITY: u32 = 65_535;
-
 /// What an order tied up, so it is released exactly when the order ends.
 #[derive(Clone, Copy, Debug)]
 struct Reservation {
@@ -76,10 +73,7 @@ impl<S: LogStorage> Exchange<S> {
     pub fn new(storage: S, instruments: Instruments) -> bx_journal::Result<Self> {
         let mut books = BTreeMap::new();
         for instrument in instruments.iter() {
-            books.insert(
-                instrument.symbol,
-                book::Book::new(*instrument, DEFAULT_BOOK_CAPACITY),
-            );
+            books.insert(instrument.symbol, book::Book::new(*instrument));
         }
         Ok(Self {
             journal: Journal::open(storage)?,

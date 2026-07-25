@@ -149,7 +149,8 @@ pub struct Book {
 
 impl Book {
     #[must_use]
-    pub fn new(instrument: Instrument, capacity: u32) -> Self {
+    pub fn new(instrument: Instrument) -> Self {
+        let capacity = instrument.max_open_orders;
         Self {
             instrument,
             engine: L3Book::new(capacity as usize, capacity as usize),
@@ -470,7 +471,7 @@ mod tests {
     use super::*;
 
     fn book() -> Book {
-        Book::new(Instrument::new(1, 10, 20, 1_000, 1_000_000), 1_024)
+        Book::new(Instrument::new(1, 10, 20, 1_000, 1_000_000, 1_024))
     }
 
     fn rest(book: &mut Book, order: OrderId, side: Side, price: Ticks, qty: Quantity) -> Outcome {
