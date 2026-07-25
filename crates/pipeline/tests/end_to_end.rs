@@ -7,31 +7,16 @@
 //! matches the exchange's actual book, which is the only way to know the feed
 //! is truthful.
 
+mod common;
+
 use bx_journal::MemoryLog;
-use bx_pipeline::instrument::{AssetId, Instrument, Instruments};
 use bx_pipeline::{Exchange, accounting_violations, limit_order, market_order};
 use bx_protocol::{Command, CommandKind, Event, EventKind, RejectReason, Side, Ticks, TimeInForce};
+use common::{
+    BTC, FLOOR, START_BTC, START_USD, SYMBOL, TraderPopulation, USD, cancel, fund, funded,
+    instruments, venue,
+};
 use std::collections::BTreeMap;
-
-const BTC: AssetId = 1;
-const USD: AssetId = 2;
-const SYMBOL: u32 = 1;
-const FLOOR: Ticks = 10_000;
-
-fn venue() -> Exchange<MemoryLog> {
-    let mut instruments = Instruments::new();
-    instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000));
-    Exchange::new(MemoryLog::new(), instruments).unwrap()
-}
-
-fn funded() -> Exchange<MemoryLog> {
-    let mut exchange = venue();
-    for account in 1..=8 {
-        exchange.deposit(account, USD, 100_000_000);
-        exchange.deposit(account, BTC, 10_000);
-    }
-    exchange
-}
 
 /// A subscriber that knows nothing except the events it receives. It rebuilds
 /// the book from deltas, exactly as a real client would.
@@ -213,17 +198,8 @@ fn cancelling_removes_the_level_for_subscribers_too() {
     );
     assert_eq!(subscriber.depth(Side::Bid, 10), vec![(10_100, 5)]);
 
-    let mut cancel = Command::new(
-        CommandKind::Cancel,
-        1,
-        SYMBOL,
-        101,
-        Side::Bid,
-        10_100,
-        0,
-        TimeInForce::GoodTillCancel,
-    );
-    let events = exchange.submit(&mut cancel).unwrap().to_vec();
+    let mut request = cancel(1, 101);
+    let events = exchange.submit(&mut request).unwrap().to_vec();
     subscriber.consume(&events);
 
     assert!(
@@ -256,16 +232,16 @@ fn balances_move_correctly_and_nothing_is_created_or_destroyed() {
     );
 
     // Seller gave 5 BTC and received 5 * 10_100 USD.
-    assert_eq!(exchange.accounts().balance(1, BTC).total(), 10_000 - 5);
+    assert_eq!(exchange.accounts().balance(1, BTC).total(), START_BTC - 5);
     assert_eq!(
         exchange.accounts().balance(1, USD).total(),
-        100_000_000 + 5 * 10_100
+        START_USD + 5 * 10_100
     );
     // Buyer received 5 BTC and paid for them.
-    assert_eq!(exchange.accounts().balance(2, BTC).total(), 10_000 + 5);
+    assert_eq!(exchange.accounts().balance(2, BTC).total(), START_BTC + 5);
     assert_eq!(
         exchange.accounts().balance(2, USD).total(),
-        100_000_000 - 5 * 10_100
+        START_USD - 5 * 10_100
     );
 
     assert_eq!(
@@ -348,76 +324,6 @@ fn prices_outside_the_band_are_refused() {
     );
 }
 
-/// A population of traders, driving the venue through the public API only.
-///
-/// Deterministic: the same seed produces the same order flow, so a failure is
-/// reproducible from the seed alone.
-struct TraderPopulation {
-    state: u64,
-    next_order: u64,
-}
-
-impl TraderPopulation {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: seed,
-            next_order: 1,
-        }
-    }
-
-    fn next(&mut self) -> u64 {
-        self.state = self
-            .state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
-        self.state >> 16
-    }
-
-    /// Produces one plausible action: post, cancel, or take.
-    fn act(&mut self, resting: &mut Vec<(u64, u64)>) -> Command {
-        let roll = self.next() % 100;
-        let account = 1 + self.next() % 8;
-        let order_id = self.next_order;
-        self.next_order += 1;
-
-        if roll < 20 && !resting.is_empty() {
-            let index = (self.next() as usize) % resting.len();
-            let (id, owner) = resting.remove(index);
-            return Command::new(
-                CommandKind::Cancel,
-                owner,
-                SYMBOL,
-                id,
-                Side::Bid,
-                0,
-                0,
-                TimeInForce::GoodTillCancel,
-            );
-        }
-        if roll < 35 {
-            let side = if self.next().is_multiple_of(2) {
-                Side::Bid
-            } else {
-                Side::Ask
-            };
-            return market_order(account, SYMBOL, order_id, side, 1 + self.next() % 3);
-        }
-
-        let side = if self.next().is_multiple_of(2) {
-            Side::Bid
-        } else {
-            Side::Ask
-        };
-        // Bids below the mid, asks above, so the book is not permanently crossed.
-        let price = match side {
-            Side::Bid => 10_100 - (self.next() as Ticks % 20),
-            Side::Ask => 10_101 + (self.next() as Ticks % 20),
-        };
-        resting.push((order_id, account));
-        limit_order(account, SYMBOL, order_id, side, price, 1 + self.next() % 5)
-    }
-}
-
 #[test]
 fn a_trading_session_keeps_the_feed_and_the_book_in_agreement() {
     for seed in [1_u64, 7, 99, 2_026] {
@@ -492,13 +398,8 @@ fn replaying_the_journal_reproduces_the_book_exactly() {
         // Deposits are not journalled yet, so they are re-applied the way a
         // real venue would restore balances from its account store.
         let storage = exchange.into_storage();
-        let mut instruments = Instruments::new();
-        instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000));
-        let mut recovered = Exchange::new(storage, instruments).unwrap();
-        for account in 1..=8 {
-            recovered.deposit(account, USD, 100_000_000);
-            recovered.deposit(account, BTC, 10_000);
-        }
+        let mut recovered = Exchange::new(storage, instruments()).unwrap();
+        fund(&mut recovered);
         let replayed = recovered.recover().unwrap();
 
         assert_eq!(
@@ -552,13 +453,8 @@ fn a_crash_before_sync_loses_nothing_that_was_acknowledged() {
     let mut storage = exchange.into_storage();
     storage.crash();
 
-    let mut instruments = Instruments::new();
-    instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000));
-    let mut recovered = Exchange::new(storage, instruments).unwrap();
-    for account in 1..=8 {
-        recovered.deposit(account, USD, 100_000_000);
-        recovered.deposit(account, BTC, 10_000);
-    }
+    let mut recovered = Exchange::new(storage, instruments()).unwrap();
+    fund(&mut recovered);
     let replayed = recovered.recover().unwrap();
 
     assert_eq!(replayed, acknowledged, "an acknowledged command was lost");

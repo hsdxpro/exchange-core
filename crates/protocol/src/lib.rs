@@ -159,7 +159,12 @@ pub struct Command {
 const _: () = assert!(size_of::<Command>() == 64);
 
 /// An event emitted by the pipeline. Also 64 bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+///
+/// `Default` is all zeros, which is what an unwritten slot in a subscription
+/// ring holds before anything is published into it.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
 #[repr(C)]
 pub struct Event {
     /// Position in this event's channel, so a subscriber detects a gap by
@@ -181,6 +186,32 @@ pub struct Event {
 }
 
 const _: () = assert!(size_of::<Event>() == 64);
+
+impl Event {
+    /// Returns `None` if the discriminant is not a value this version defines.
+    #[must_use]
+    pub fn kind(&self) -> Option<EventKind> {
+        match self.kind {
+            0 => Some(EventKind::Received),
+            1 => Some(EventKind::Rejected),
+            2 => Some(EventKind::Resting),
+            3 => Some(EventKind::Filled),
+            4 => Some(EventKind::Canceled),
+            5 => Some(EventKind::BookDelta),
+            6 => Some(EventKind::Trade),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn side(&self) -> Option<Side> {
+        match self.side {
+            0 => Some(Side::Bid),
+            1 => Some(Side::Ask),
+            _ => None,
+        }
+    }
+}
 
 impl Command {
     /// Builds a command with the sequence unset. The sequencer stamps it.
@@ -321,6 +352,33 @@ mod tests {
         };
         assert_eq!(size_of::<Event>(), 64);
         assert_eq!(Event::read_from_bytes(event.as_bytes()).unwrap(), event);
+    }
+
+    #[test]
+    fn event_discriminants_decode_and_unknown_ones_are_refused() {
+        for (byte, kind) in [
+            (0, EventKind::Received),
+            (1, EventKind::Rejected),
+            (2, EventKind::Resting),
+            (3, EventKind::Filled),
+            (4, EventKind::Canceled),
+            (5, EventKind::BookDelta),
+            (6, EventKind::Trade),
+        ] {
+            let event = Event {
+                kind: byte,
+                ..Event::default()
+            };
+            assert_eq!(event.kind(), Some(kind));
+        }
+        assert!(
+            Event {
+                kind: 7,
+                ..Event::default()
+            }
+            .kind()
+            .is_none()
+        );
     }
 
     #[test]

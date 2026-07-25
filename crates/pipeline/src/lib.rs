@@ -9,6 +9,7 @@
 pub mod accounts;
 pub mod book;
 pub mod fastmap;
+pub mod hub;
 pub mod instrument;
 
 use accounts::Accounts;
