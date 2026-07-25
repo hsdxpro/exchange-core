@@ -1,0 +1,28 @@
+[package]
+name = "bitmap-exchange"
+version = "1.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+description = "Dependency-free hierarchical-bitmap MBP/MBO order book and price-time FIFO matching engine"
+
+[lib]
+name = "bitmap_exchange"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bx-bench"
+path = "src/bin/bench.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# The engine publishes fills through a caller callback and guarantees the book
+# stays valid if that callback unwinds. Verifying that requires `catch_unwind`,
+# so the release profile must not abort on panic.
+panic = "unwind"
+strip = "symbols"
+overflow-checks = false
+debug-assertions = false
+incremental = false
