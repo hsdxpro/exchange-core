@@ -1,0 +1,15 @@
+[package]
+name = "bx-protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Wire types for the exchange: fixed-layout, zero-copy, versioned"
+
+[dependencies]
+# Safe zero-copy casts between byte slices and fixed-layout structs. The unsafe
+# lives here, audited, instead of being spread through our decoders.
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[lints]
+workspace = true

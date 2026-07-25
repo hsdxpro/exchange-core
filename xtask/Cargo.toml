@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Local task runner: everything runs from cargo, no external tooling"
+
+[lints]
+workspace = true
