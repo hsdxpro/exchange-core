@@ -91,16 +91,17 @@ Plus real journal replay (take the storage, build a fresh exchange over it, call
 `cargo x latency`. Full path per command: sequence, journal append and sync,
 reserve, match, emit. In-memory journal, so no real disk.
 
-| Path | before | now |
+| Path | first cut | now |
 |---|---|---|
-| passive limit order | 432 ns | **217 ns** |
-| crossing order, one fill | 372 ns | **130 ns** |
-| cancel by order id | 298 ns | **106 ns** |
-| mixed stream | 500 ns | **213 ns** |
+| passive limit order | 432 ns | **117 ns** |
+| crossing order, one fill | 372 ns | **75 ns** |
+| cancel by order id | 298 ns | **118 ns** |
+| mixed stream | 500 ns | **163 ns** |
 
-Roughly 4.7M commands/sec on the mixed stream, up from 2.2M.
+Roughly 6M commands/sec on the mixed stream, up from 2M.
 
-Two changes got that, and the second was the one that mattered:
+Three changes got there. The first was the one asked for, the second was the
+one that mattered, and the third was a bug fix that happened to help:
 
 1. **Zero allocation on the command path.** `Outcome` is a caller-owned buffer
    that `Exchange` reuses; `Book` writes into it. Capacity settles at the
@@ -109,6 +110,10 @@ Two changes got that, and the second was the one that mattered:
    lookups, all keyed by integers. `SipHash` costs 20–30 ns each, which was most
    of the budget. `FastMap` uses the FxHash finalizer instead, and
    `reservations` moved from `BTreeMap` to a hash map since nothing iterates it.
+3. **Publishing only levels that actually changed.** The order's price was
+   touched speculatively before matching, so every command paid for level
+   lookups and events it did not need — and a market order, which addresses the
+   ladder extreme, published two deltas for a price no book occupies.
 
 **Batching did not help.** `submit_batch` exists and is correct — no command is
 acknowledged until the whole batch is durable — but against an in-memory journal
