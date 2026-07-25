@@ -141,9 +141,14 @@ impl LogStorage for FileLog {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let mut handle = self.file.try_clone()?;
-        handle.seek(SeekFrom::Start(offset))?;
-        handle.read(buf)
+        // Appends write at the cursor, so reading has to put it back. A cloned
+        // handle would not help: `dup` shares the offset, so seeking the clone
+        // seeks the original and the next append lands mid-log.
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(offset))?;
+        let read = file.read(buf)?;
+        file.seek(SeekFrom::End(0))?;
+        Ok(read)
     }
 
     fn truncate(&mut self, len: u64) -> io::Result<()> {
@@ -684,6 +689,36 @@ mod file_tests {
         let journal = Journal::open(FileLog::open(&scratch.0).unwrap()).unwrap();
         let replayed = journal.replay().collect_all().unwrap();
         assert_eq!(replayed.len(), 8, "records after the tear were lost");
+    }
+
+    #[test]
+    fn replaying_then_appending_does_not_overwrite_the_log() {
+        // Replay reads at absolute offsets. If reading moves the file cursor,
+        // the next append lands in the middle of the log and silently destroys
+        // records that were already durable.
+        let scratch = Scratch::new("replay-then-append");
+        let mut journal = Journal::open(FileLog::open(&scratch.0).unwrap()).unwrap();
+        for i in 0..10 {
+            journal.append(&mut command(i)).unwrap();
+        }
+        journal.sync().unwrap();
+
+        // Replay, as recovery would, then keep trading on the same instance.
+        assert_eq!(journal.replay().collect_all().unwrap().len(), 10);
+        for i in 10..20 {
+            journal.append(&mut command(i)).unwrap();
+        }
+        journal.sync().unwrap();
+
+        let replayed = journal.replay().collect_all().unwrap();
+        assert_eq!(
+            replayed.len(),
+            20,
+            "appending after a replay overwrote existing records"
+        );
+        for (i, command) in replayed.iter().enumerate() {
+            assert_eq!(command.sequence, i as u64, "record {i} is wrong");
+        }
     }
 
     #[test]

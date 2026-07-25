@@ -58,15 +58,15 @@ xtask/             xtask         local task runner. Replaces CI.
 
 ## 3. What exists and is tested
 
-**93 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**107 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
 | `bx-engine` | 44 | The engine's own suite, unchanged from the shipped version. |
 | `bx-protocol` | 6 | Record round-trip, 64-byte layout, unknown discriminants, short buffers. |
-| `bx-journal` | 9 | Append/replay, torn writes, crash before sync, corruption, sequence gaps, device failure. |
-| `bx-pipeline` | 23 | Instrument price mapping, balances and reservation, engine adapter, deltas. |
-| end-to-end | 11 | Full path with simulated traders and a subscriber. |
+| `bx-journal` | 15 | Append/replay, torn writes, crash before sync, corruption, sequence gaps, device failure, and the same against a real file. |
+| `bx-pipeline` | 28 | Instrument price mapping, balances and reservation, engine adapter, deltas, hashing. |
+| end-to-end | 14 | Full path with simulated traders and a subscriber. |
 
 ### The end-to-end tests matter most
 
@@ -96,9 +96,13 @@ reserve, match, emit. In-memory journal, so no real disk.
 | passive limit order | 432 ns | **117 ns** |
 | crossing order, one fill | 372 ns | **75 ns** |
 | cancel by order id | 298 ns | **118 ns** |
-| mixed stream | 500 ns | **163 ns** |
+| mixed stream | 500 ns | **169 ns** |
 
 Roughly 6M commands/sec on the mixed stream, up from 2M.
+
+These drift by 10-20% between sessions on this desktop even for an unchanged
+binary, which is why the benchmark reports the minimum of seven runs and why no
+change is kept on a single-digit-percent showing.
 
 Three changes got there. The first was the one asked for, the second was the
 one that mattered, and the third was a bug fix that happened to help:
@@ -210,6 +214,15 @@ These were argued out. Do not relitigate without new information.
 
 ### Things learned the hard way
 
+- **A journal that cannot recover from a torn write is not durable at all.**
+  Replay stopped at the tear correctly, but the partial record was left in
+  place, so the next append landed after it and every later record was
+  unreachable. `Journal::open` now truncates to the last intact record. The
+  component whose only job is fault tolerance had no test against a real file.
+- **`File::try_clone` shares the file offset on Unix.** Seeking the clone seeks
+  the original, so a read during replay would move the append cursor and the
+  next write would land mid-log. It happens to be harmless on Windows, so no
+  local test could have caught it.
 - **Benchmarks on this desktop swing 2–4× between runs of the same binary.**
   Use minimum-of-N, never a single run. A supposed 9–12% improvement turned out
   to be **two byte-identical binaries** — always checksum A/B artifacts.
@@ -242,24 +255,26 @@ Ordered by how much it matters.
 
 ## 6. Next steps, in order
 
-1. **Kill the per-command allocations.** Do this before piling more layers on
-   top, so the latency number stays honest.
-2. **Subscription channels.** `book.{symbol}`, `trades.{symbol}`, `bbo.{symbol}`,
+The disk measurement reordered this list. Per-command compute is no longer the
+constraint, so **openraft moved up from last to second**: reaching a quorum in
+memory over a LAN is two orders of magnitude faster than an fsync, which makes
+replication a throughput decision, not only a fault-tolerance one.
+
+1. **Subscription channels.** `book.{symbol}`, `trades.{symbol}`, `bbo.{symbol}`,
    and the private per-account channels. Per-channel sequence numbers, a
    fixed-size ring buffer, and `RESUME {channel, last_seq}` that replays from the
    ring or forces a fresh snapshot. The `Subscriber` in the e2e tests already
    models the client side of this.
-3. **Snapshots.** Serialize book plus balances at a sequence, so recovery does
+4. **Snapshots.** Serialize book plus balances at a sequence, so recovery does
    not replay from zero. Cadence derived from a recovery-time target, not picked.
-4. **QUIC gateway.** `quinn`, binary framing, session handling. **The e2e
+5. **QUIC gateway.** `quinn`, binary framing, session handling. **The e2e
    scenarios were written transport-agnostic on purpose** — the same assertions
    should run over real sockets.
-5. **Multi-process local tests.** Separate gateway and core processes, real
+6. **Multi-process local tests.** Separate gateway and core processes, real
    sockets, same scenarios.
-6. **Deterministic simulation.** Fake clock and lossy network behind the traits
+7. **Deterministic simulation.** Fake clock and lossy network behind the traits
    that already exist, whole cluster in one process, failure injection,
    reproducible from a seed.
-7. **openraft replication and quorum ack.**
 
 ---
 
