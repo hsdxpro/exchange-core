@@ -12,7 +12,7 @@
 //! desktop the median moves by a factor of two or more between runs; the
 //! minimum barely moves.
 
-use bx_journal::MemoryLog;
+use bx_journal::{FileLog, MemoryLog};
 use bx_pipeline::instrument::{AssetId, Instrument, Instruments};
 use bx_pipeline::{Exchange, limit_order, market_order};
 use bx_protocol::{Command, CommandKind, Side, Ticks, TimeInForce};
@@ -240,6 +240,49 @@ fn batched_stream(sink: &mut u64, batch: usize) -> Vec<f64> {
     samples
 }
 
+/// The same mixed traffic against a real file, at several batch sizes.
+///
+/// This is the number that decides the venue's throughput. An fsync is tens of
+/// microseconds; the in-memory figures above are five hundred times smaller and
+/// say nothing about it. Durability is per batch, and no command in a batch is
+/// acknowledged until every one of them is on disk.
+fn on_disk(sink: &mut u64, batch: usize) -> Vec<f64> {
+    const COUNT: u64 = 20_000;
+    let mut samples = Vec::with_capacity(3);
+    for run in 0..3 {
+        let path = std::env::temp_dir().join(format!(
+            "bx-latency-{}-{batch}-{run}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut instruments = Instruments::new();
+        instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000_000));
+        let mut exchange = Exchange::new(FileLog::open(&path).unwrap(), instruments).unwrap();
+        for account in 1..=16 {
+            exchange.deposit(account, USD, u128::from(u64::MAX));
+            exchange.deposit(account, BTC, u128::from(u64::MAX));
+        }
+
+        let mut commands: Vec<Command> = (0..COUNT)
+            .map(|i| {
+                let price = FLOOR + 1_000 + (i % 4_000) as Ticks;
+                limit_order(1 + i % 16, SYMBOL, i + 1, Side::Bid, price, 1)
+            })
+            .collect();
+
+        let started = Instant::now();
+        for chunk in commands.chunks_mut(batch) {
+            let events = exchange.submit_batch(chunk).unwrap();
+            *sink = sink.wrapping_add(events.len() as u64);
+        }
+        samples.push(started.elapsed().as_secs_f64() * 1e9 / COUNT as f64);
+        drop(exchange);
+        let _ = std::fs::remove_file(&path);
+    }
+    samples
+}
+
 fn main() {
     println!("\nExchange pipeline latency");
     println!("Full path per command: sequence, journal append and sync, reserve, match, emit.");
@@ -270,6 +313,17 @@ fn main() {
         &mut batched_stream(&mut sink, 1_024),
         "per command",
     );
+
+    println!();
+    println!("Against a real file, where the fsync dominates:");
+    println!("{}", "-".repeat(80));
+    for batch in [1_usize, 16, 256, 4_096] {
+        report(
+            &format!("on disk, batch {batch}"),
+            &mut on_disk(&mut sink, batch),
+            "per command",
+        );
+    }
 
     println!("{}", "-".repeat(80));
     println!("sink {sink:#x}");

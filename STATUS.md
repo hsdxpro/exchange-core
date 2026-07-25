@@ -115,11 +115,33 @@ one that mattered, and the third was a bug fix that happened to help:
    lookups and events it did not need — and a market order, which addresses the
    ladder extreme, published two deltas for a price no book occupies.
 
-**Batching did not help.** `submit_batch` exists and is correct — no command is
-acknowledged until the whole batch is durable — but against an in-memory journal
-the sync is already free, so batching is pure overhead and measures *slower*. It
-will matter on a real disk, where the sync dominates. Worth remembering as an
-instance of the general rule: measure before optimizing.
+### Against a real disk, which is the number that actually matters
+
+Everything above uses an in-memory journal. On a real file, per command:
+
+| batch size | per command | commands/sec |
+|---|---:|---:|
+| 1 | **3,098,161 ns** | 322 |
+| 16 | 198,256 ns | 5,000 |
+| 256 | 15,168 ns | 66,000 |
+| 4,096 | **3,935 ns** | 254,000 |
+
+One `fsync` costs about 3 ms here. The in-memory figure of 142 ns is **twenty
+thousand times smaller** than the real cost of an unbatched command, so all the
+micro-optimisation above is noise next to durability. Batching turns 3.1 ms into
+3.9 µs — a 787× improvement — which is the design's claim that batching is
+mandatory rather than an optimisation, now measured.
+
+Two consequences worth carrying:
+
+- **Even at batch 4,096 this is 254k commands/sec, not millions.** Local `fsync`
+  cannot reach the target on this hardware. Windows `FlushFileBuffers` is
+  unusually slow and Linux NVMe would do far better, but the shape holds.
+- **Replicating to memory on two other machines is probably faster than an
+  fsync to local disk.** A LAN round trip is 10–50 µs against 3 ms here. That is
+  precisely why real venues reach quorum over the network rather than waiting on
+  a platter, and it makes the openraft path a throughput decision as well as a
+  fault-tolerance one.
 
 ---
 

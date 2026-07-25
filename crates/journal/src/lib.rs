@@ -85,6 +85,13 @@ pub trait LogStorage {
     /// # Errors
     /// Returns the underlying I/O error if the read fails.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// Discards everything past `len`, so a partial trailing record left by a
+    /// crash is removed before anything is appended after it.
+    ///
+    /// # Errors
+    /// Returns the underlying I/O error if the truncation fails.
+    fn truncate(&mut self, len: u64) -> io::Result<()>;
 }
 
 /// A journal in a real file.
@@ -137,6 +144,12 @@ impl LogStorage for FileLog {
         let mut handle = self.file.try_clone()?;
         handle.seek(SeekFrom::Start(offset))?;
         handle.read(buf)
+    }
+
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.sync_all()
     }
 }
 
@@ -219,6 +232,12 @@ impl LogStorage for MemoryLog {
         buf[..n].copy_from_slice(&available[..n]);
         Ok(n)
     }
+
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.bytes.truncate(len as usize);
+        self.synced_len = self.synced_len.min(len);
+        Ok(())
+    }
 }
 
 /// Appends sequenced commands and replays them.
@@ -233,11 +252,15 @@ impl<S: LogStorage> Journal<S> {
     ///
     /// # Errors
     /// Fails on I/O error, or if the log contains a corrupt record or a gap.
-    pub fn open(storage: S) -> Result<Self> {
-        let next_sequence = Replay::new(&storage).last_sequence()?.map_or(0, |s| s + 1);
+    pub fn open(mut storage: S) -> Result<Self> {
+        let (last_sequence, intact_len) = Replay::new(&storage).scan()?;
+        // Drop any partial trailing record before appending. Leaving it would
+        // put the next append after the torn bytes, and every record from there
+        // on would be unreachable — replay stops at the tear.
+        storage.truncate(intact_len)?;
         Ok(Self {
             storage,
-            next_sequence,
+            next_sequence: last_sequence.map_or(0, |s| s + 1),
         })
     }
 
@@ -318,16 +341,17 @@ impl<'a, S: LogStorage> Replay<'a, S> {
         Ok(self)
     }
 
-    /// The highest sequence in the log, or `None` if it is empty.
+    /// Walks the whole log, returning the highest sequence it holds and the
+    /// offset where the last intact record ends.
     ///
     /// # Errors
     /// Propagates any error encountered while scanning.
-    pub fn last_sequence(mut self) -> Result<Option<Sequence>> {
+    fn scan(mut self) -> Result<(Option<Sequence>, u64)> {
         let mut last = None;
         while let Some(command) = self.next_record()? {
             last = Some(command.sequence);
         }
-        Ok(last)
+        Ok((last, self.offset))
     }
 
     /// # Errors
@@ -458,6 +482,36 @@ mod tests {
     }
 
     #[test]
+    fn records_written_after_a_torn_write_are_still_reachable() {
+        // A crash leaves half a record. On restart the venue keeps trading, so
+        // it appends more. If the torn bytes are still there, every record
+        // after them is unreachable: replay stops at the tear and the new
+        // commands vanish silently, which is the worst possible failure.
+        let mut journal = Journal::open(MemoryLog::new().tearing_append(3)).unwrap();
+        for i in 0..3 {
+            journal.append(&mut command(i)).unwrap();
+        }
+        let mut reopened = Journal::open(journal.into_storage()).unwrap();
+        assert_eq!(
+            reopened.next_sequence(),
+            2,
+            "the torn record is not durable"
+        );
+
+        for i in 2..5 {
+            reopened.append(&mut command(i)).unwrap();
+        }
+        reopened.sync().unwrap();
+
+        let replayed = reopened.replay().collect_all().unwrap();
+        assert_eq!(
+            replayed.len(),
+            5,
+            "records appended after a torn write must be reachable"
+        );
+    }
+
+    #[test]
     fn crashing_before_sync_discards_only_the_unsynced_tail() {
         let mut journal = journal_with(10);
         for i in 10..15 {
@@ -518,6 +572,127 @@ mod tests {
         assert!(matches!(
             journal.append(&mut command(3)),
             Err(JournalError::Io(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+    use bx_protocol::{CommandKind, Side, TimeInForce};
+    use std::env;
+    use std::fs;
+
+    /// A scratch path that cleans itself up.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = env::temp_dir().join(format!("bxjrnl-{name}-{}.log", std::process::id()));
+            let _ = fs::remove_file(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn command(order_id: u64) -> Command {
+        Command::new(
+            CommandKind::NewOrder,
+            1,
+            1,
+            order_id,
+            Side::Bid,
+            100,
+            5,
+            TimeInForce::GoodTillCancel,
+        )
+    }
+
+    #[test]
+    fn a_real_file_round_trips_and_survives_reopening() {
+        let scratch = Scratch::new("roundtrip");
+        {
+            let mut journal = Journal::open(FileLog::open(&scratch.0).unwrap()).unwrap();
+            for i in 0..500 {
+                journal.append(&mut command(i)).unwrap();
+            }
+            journal.sync().unwrap();
+        }
+        // Reopen from disk, as a restart would.
+        let journal = Journal::open(FileLog::open(&scratch.0).unwrap()).unwrap();
+        assert_eq!(journal.next_sequence(), 500);
+        let replayed = journal.replay().collect_all().unwrap();
+        assert_eq!(replayed.len(), 500);
+        assert_eq!(replayed[499].order_id, 499);
+    }
+
+    #[test]
+    fn appending_continues_across_a_reopen() {
+        let scratch = Scratch::new("append");
+        {
+            let mut journal = Journal::open(FileLog::open(&scratch.0).unwrap()).unwrap();
+            for i in 0..10 {
+                journal.append(&mut command(i)).unwrap();
+            }
+            journal.sync().unwrap();
+        }
+        {
+            let mut journal = Journal::open(FileLog::open(&scratch.0).unwrap()).unwrap();
+            for i in 10..20 {
+                journal.append(&mut command(i)).unwrap();
+            }
+            journal.sync().unwrap();
+        }
+        let journal = Journal::open(FileLog::open(&scratch.0).unwrap()).unwrap();
+        let replayed = journal.replay().collect_all().unwrap();
+        assert_eq!(replayed.len(), 20, "records were lost across a reopen");
+        for (i, command) in replayed.iter().enumerate() {
+            assert_eq!(command.sequence, i as u64);
+        }
+    }
+
+    #[test]
+    fn a_torn_record_on_disk_is_truncated_rather_than_poisoning_the_log() {
+        let scratch = Scratch::new("torn");
+        {
+            let mut journal = Journal::open(FileLog::open(&scratch.0).unwrap()).unwrap();
+            for i in 0..5 {
+                journal.append(&mut command(i)).unwrap();
+            }
+            journal.sync().unwrap();
+        }
+        // Simulate a crash mid-write: append half a record's worth of bytes.
+        {
+            use std::io::Write;
+            let mut file = OpenOptions::new().append(true).open(&scratch.0).unwrap();
+            file.write_all(&[0_u8; RECORD_LEN / 2]).unwrap();
+            file.sync_all().unwrap();
+        }
+        // Restart: the tear must be dropped, and new records must be reachable.
+        let mut journal = Journal::open(FileLog::open(&scratch.0).unwrap()).unwrap();
+        assert_eq!(journal.next_sequence(), 5);
+        for i in 5..8 {
+            journal.append(&mut command(i)).unwrap();
+        }
+        journal.sync().unwrap();
+
+        let journal = Journal::open(FileLog::open(&scratch.0).unwrap()).unwrap();
+        let replayed = journal.replay().collect_all().unwrap();
+        assert_eq!(replayed.len(), 8, "records after the tear were lost");
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_journal_is_refused() {
+        let scratch = Scratch::new("foreign");
+        fs::write(&scratch.0, b"this is not a journal at all").unwrap();
+        assert!(matches!(
+            FileLog::open(&scratch.0),
+            Err(JournalError::NotAJournal)
         ));
     }
 }
