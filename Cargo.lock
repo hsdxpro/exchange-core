@@ -21,6 +21,7 @@ dependencies = [
  "bx-engine",
  "bx-journal",
  "bx-protocol",
+ "zerocopy",
 ]
 
 [[package]]

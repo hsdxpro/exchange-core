@@ -145,6 +145,26 @@ impl Accounts {
     /// Trading moves value between accounts; it never creates or destroys it.
     /// Tests assert this is invariant across a whole session, which catches a
     /// whole class of accounting bug that per-operation checks miss.
+    /// Every non-empty holding, sorted, so a snapshot of the same state is
+    /// byte-identical no matter what order the balances were created in.
+    #[must_use]
+    pub fn sorted(&self) -> Vec<((AccountId, AssetId), Balance)> {
+        let mut all: Vec<_> = self
+            .balances
+            .iter()
+            .filter(|(_, balance)| balance.total() > 0)
+            .map(|(key, balance)| (*key, *balance))
+            .collect();
+        all.sort_unstable_by_key(|(key, _)| *key);
+        all
+    }
+
+    /// Sets a holding outright. Only for restoring a snapshot; ordinary flow
+    /// goes through deposit, reserve, release and settle.
+    pub fn restore(&mut self, account: AccountId, asset: AssetId, balance: Balance) {
+        self.balances.insert((account, asset), balance);
+    }
+
     #[must_use]
     pub fn total_supply(&self, asset: AssetId) -> u128 {
         self.balances

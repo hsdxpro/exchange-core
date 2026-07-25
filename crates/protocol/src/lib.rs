@@ -42,6 +42,17 @@ pub enum Side {
 }
 
 impl Side {
+    /// Decodes a wire byte, returning `None` if it is not a side this version
+    /// defines.
+    #[must_use]
+    pub const fn from_wire(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Bid),
+            1 => Some(Self::Ask),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub const fn opposite(self) -> Self {
         match self {
@@ -205,11 +216,7 @@ impl Event {
 
     #[must_use]
     pub fn side(&self) -> Option<Side> {
-        match self.side {
-            0 => Some(Side::Bid),
-            1 => Some(Side::Ask),
-            _ => None,
-        }
+        Side::from_wire(self.side)
     }
 }
 
@@ -283,6 +290,63 @@ impl Command {
         self.kind().is_some() && self.side().is_some() && self.time_in_force().is_some()
     }
 }
+
+// ------------------------------------------------------- snapshot records
+
+/// Identifies a snapshot file and its layout version.
+pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAP ";
+
+/// Header of a snapshot: what it contains and where in the journal it applies.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+#[repr(C)]
+pub struct SnapshotHeader {
+    pub magic: [u8; 8],
+    /// The first journal sequence **not** included. Recovery replays from here.
+    pub sequence: Sequence,
+    pub orders: u64,
+    pub balances: u64,
+}
+
+const _: () = assert!(size_of::<SnapshotHeader>() == 32);
+
+/// One resting order, written in the exact price-then-time order it rests in,
+/// so restoring in file order reproduces queue priority.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+#[repr(C)]
+pub struct SnapshotOrder {
+    /// Balance still held for this order. Carried explicitly because a
+    /// partially filled order's hold is not recomputable from price and
+    /// quantity alone.
+    pub reserved: u128,
+    pub order_id: OrderId,
+    pub account: AccountId,
+    pub quantity: Quantity,
+    pub price: Ticks,
+    pub symbol: SymbolId,
+    pub side: u8,
+    pub _pad: [u8; 11],
+}
+
+const _: () = assert!(size_of::<SnapshotOrder>() == 64);
+
+/// One account's holding of one asset.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+#[repr(C)]
+pub struct SnapshotBalance {
+    pub free: u128,
+    pub reserved: u128,
+    pub account: AccountId,
+    pub asset: u32,
+    pub _pad: [u8; 4],
+}
+
+const _: () = assert!(size_of::<SnapshotBalance>() == 48);
 
 #[cfg(test)]
 mod tests {
@@ -378,6 +442,44 @@ mod tests {
             }
             .kind()
             .is_none()
+        );
+    }
+
+    #[test]
+    fn snapshot_records_round_trip_and_have_no_padding_holes() {
+        let order = SnapshotOrder {
+            reserved: u128::from(u64::MAX) * 3,
+            order_id: 7,
+            account: 42,
+            quantity: 900,
+            price: -12,
+            symbol: 3,
+            side: Side::Ask as u8,
+            _pad: [0; 11],
+        };
+        assert_eq!(SnapshotOrder::read_from_bytes(order.as_bytes()), Ok(order));
+
+        let balance = SnapshotBalance {
+            free: u128::MAX / 2,
+            reserved: 17,
+            account: 5,
+            asset: 2,
+            _pad: [0; 4],
+        };
+        assert_eq!(
+            SnapshotBalance::read_from_bytes(balance.as_bytes()),
+            Ok(balance)
+        );
+
+        let header = SnapshotHeader {
+            magic: SNAPSHOT_MAGIC,
+            sequence: 1_000,
+            orders: 2,
+            balances: 3,
+        };
+        assert_eq!(
+            SnapshotHeader::read_from_bytes(header.as_bytes()),
+            Ok(header)
         );
     }
 

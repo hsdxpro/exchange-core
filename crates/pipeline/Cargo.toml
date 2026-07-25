@@ -10,6 +10,7 @@ description = "Sequencer, accounts, matching and event publication"
 bx-protocol = { path = "../protocol" }
 bx-journal = { path = "../journal" }
 bx-engine = { path = "../engine" }
+zerocopy = { version = "0.8", features = ["derive"] }
 
 [lints]
 workspace = true

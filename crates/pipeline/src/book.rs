@@ -130,6 +130,15 @@ impl SlotAllocator {
     }
 }
 
+/// One resting order, as a snapshot sees it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Resting {
+    pub order: OrderId,
+    pub side: Side,
+    pub price: Ticks,
+    pub quantity: Quantity,
+}
+
 /// One symbol's order book.
 #[derive(Debug)]
 pub struct Book {
@@ -183,6 +192,58 @@ impl Book {
                 out.push((self.instrument.to_price(slot), quantity));
             });
         out
+    }
+
+    /// Walks every resting order in price-then-time priority.
+    ///
+    /// That is exactly the order they have to be restored in, so a snapshot
+    /// written from this walk reproduces queue position and not merely depth.
+    pub fn for_each_resting(&self, mut visitor: impl FnMut(Resting)) {
+        for side in [Side::Bid, Side::Ask] {
+            let engine_side = engine_side(side);
+            self.engine
+                .for_each_level(engine_side, usize::MAX, |slot, _| {
+                    self.engine
+                        .for_each_order_at_level(engine_side, slot, |view| {
+                            visitor(Resting {
+                                order: self.slots.order_of(view.id),
+                                side,
+                                price: self.instrument.to_price(slot),
+                                quantity: u64::from(view.quantity),
+                            });
+                        });
+                });
+        }
+    }
+
+    /// Re-adds an order from a snapshot. Called in the order the snapshot was
+    /// written, which is what preserves priority.
+    ///
+    /// Returns false if the order does not fit: an unmappable price, a quantity
+    /// wider than the engine takes, or no free slot.
+    pub fn restore(
+        &mut self,
+        order: OrderId,
+        side: Side,
+        price: Ticks,
+        quantity: Quantity,
+    ) -> bool {
+        let (Some(slot), Ok(quantity)) = (self.instrument.to_slot(price), u32::try_from(quantity))
+        else {
+            return false;
+        };
+        let Some(id) = self.slots.allocate(order) else {
+            return false;
+        };
+        if self
+            .engine
+            .add_passive(id, engine_side(side), slot, quantity)
+            .is_err()
+        {
+            self.slots.release(order);
+            return false;
+        }
+        true
     }
 
     /// Submits a new order, writing the result into `out`.

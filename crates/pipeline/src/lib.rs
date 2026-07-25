@@ -11,16 +11,18 @@ pub mod book;
 pub mod fastmap;
 pub mod hub;
 pub mod instrument;
+pub mod snapshot;
 
 use accounts::Accounts;
 use book::{Execution, Outcome};
 use bx_journal::{Journal, LogStorage};
 use bx_protocol::{
     AccountId, Command, CommandKind, Event, EventKind, OrderId, Quantity, RejectReason, Sequence,
-    Side, SymbolId, Ticks, TimeInForce,
+    Side, SnapshotBalance, SnapshotOrder, SymbolId, Ticks, TimeInForce,
 };
 use fastmap::FastMap;
 use instrument::{Instrument, Instruments};
+use snapshot::{Snapshot, balance_of};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -159,13 +161,35 @@ impl<S: LogStorage> Exchange<S> {
         Ok(&self.events)
     }
 
-    /// Rebuilds state by replaying the journal. Events are not re-emitted;
-    /// subscribers were told the first time.
+    /// Rebuilds state by replaying the whole journal. Events are not
+    /// re-emitted; subscribers were told the first time.
     ///
     /// # Errors
     /// Fails if the journal is unreadable, corrupt, or has a gap.
     pub fn recover(&mut self) -> bx_journal::Result<u64> {
         let commands = self.journal.replay().collect_all()?;
+        Ok(self.apply_all(commands))
+    }
+
+    /// Restores a snapshot, then replays only the journal after it.
+    ///
+    /// The result is identical to [`Self::recover`]; the snapshot is purely an
+    /// optimisation, and discarding every snapshot costs recovery time and
+    /// nothing else.
+    ///
+    /// # Errors
+    /// Fails if the journal is unreadable, corrupt, or has a gap.
+    pub fn recover_from(&mut self, snapshot: &Snapshot) -> bx_journal::Result<u64> {
+        self.restore(snapshot);
+        let commands = self
+            .journal
+            .replay()
+            .from_sequence(snapshot.sequence)?
+            .collect_all()?;
+        Ok(self.apply_all(commands))
+    }
+
+    fn apply_all(&mut self, commands: Vec<Command>) -> u64 {
         let count = commands.len() as u64;
         for command in commands {
             self.events.clear();
@@ -173,7 +197,83 @@ impl<S: LogStorage> Exchange<S> {
         }
         self.events.clear();
         self.event_sequence = 0;
-        Ok(count)
+        count
+    }
+
+    /// Captures the state as of the current journal position.
+    ///
+    /// Resting orders come out in price-then-time priority, so restoring them
+    /// in this order reproduces queue position and not merely depth.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        let mut orders = Vec::new();
+        for (symbol, book) in &self.books {
+            book.for_each_resting(|resting| {
+                let held = self.reservations.get(&resting.order);
+                orders.push(SnapshotOrder {
+                    reserved: held.map_or(0, |r| r.remaining),
+                    order_id: resting.order,
+                    account: held.map_or(0, |r| r.account),
+                    quantity: resting.quantity,
+                    price: resting.price,
+                    symbol: *symbol,
+                    side: resting.side as u8,
+                    _pad: [0; 11],
+                });
+            });
+        }
+        let balances = self
+            .accounts
+            .sorted()
+            .into_iter()
+            .map(|((account, asset), balance)| SnapshotBalance {
+                free: balance.free,
+                reserved: balance.reserved,
+                account,
+                asset,
+                _pad: [0; 4],
+            })
+            .collect();
+        Snapshot {
+            sequence: self.journal.next_sequence(),
+            orders,
+            balances,
+        }
+    }
+
+    /// Rebuilds books, balances and holds from a snapshot.
+    ///
+    /// Anything in the snapshot that will not load is counted as an accounting
+    /// violation: a snapshot that silently drops orders would lose client money
+    /// and look like a successful recovery.
+    pub fn restore(&mut self, snapshot: &Snapshot) {
+        for record in &snapshot.balances {
+            self.accounts
+                .restore(record.account, record.asset, balance_of(record));
+        }
+        for record in &snapshot.orders {
+            let Some(side) = Side::from_wire(record.side) else {
+                Self::violation();
+                continue;
+            };
+            let restored = self.books.get_mut(&record.symbol).is_some_and(|book| {
+                book.restore(record.order_id, side, record.price, record.quantity)
+            });
+            if !restored {
+                Self::violation();
+                continue;
+            }
+            self.reservations.insert(
+                record.order_id,
+                Reservation {
+                    account: record.account,
+                    symbol: record.symbol,
+                    side,
+                    limit_price: record.price,
+                    remaining: record.reserved,
+                },
+            );
+        }
     }
 
     fn apply(&mut self, command: Command) {
