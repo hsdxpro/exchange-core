@@ -10,9 +10,9 @@
 //! type. Overflow returns an error rather than wrapping; a wrapped reservation
 //! would let an account spend money it does not have.
 
+use crate::fastmap::FastMap;
 use crate::instrument::AssetId;
 use bx_protocol::AccountId;
-use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Balance {
@@ -40,7 +40,7 @@ pub enum BalanceError {
 
 #[derive(Debug, Default)]
 pub struct Accounts {
-    balances: HashMap<(AccountId, AssetId), Balance>,
+    balances: FastMap<(AccountId, AssetId), Balance>,
 }
 
 impl Accounts {

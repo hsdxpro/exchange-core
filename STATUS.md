@@ -91,15 +91,30 @@ Plus real journal replay (take the storage, build a fresh exchange over it, call
 `cargo x latency`. Full path per command: sequence, journal append and sync,
 reserve, match, emit. In-memory journal, so no real disk.
 
-| Path | min |
-|---|---|
-| passive limit order | 432 ns |
-| crossing order, one fill | 372 ns |
-| cancel by order id | 298 ns |
-| mixed stream | 500 ns |
+| Path | before | now |
+|---|---|---|
+| passive limit order | 432 ns | **217 ns** |
+| crossing order, one fill | 372 ns | **130 ns** |
+| cancel by order id | 298 ns | **106 ns** |
+| mixed stream | 500 ns | **213 ns** |
 
-Roughly 2M commands/sec. The engine alone is 10–35 ns, so the pipeline costs
-10–15× the engine. See debt below.
+Roughly 4.7M commands/sec on the mixed stream, up from 2.2M.
+
+Two changes got that, and the second was the one that mattered:
+
+1. **Zero allocation on the command path.** `Outcome` is a caller-owned buffer
+   that `Exchange` reuses; `Book` writes into it. Capacity settles at the
+   high-water mark of real traffic rather than a guessed reserve.
+2. **A fast hasher for integer keys.** The command path does about seven map
+   lookups, all keyed by integers. `SipHash` costs 20–30 ns each, which was most
+   of the budget. `FastMap` uses the FxHash finalizer instead, and
+   `reservations` moved from `BTreeMap` to a hash map since nothing iterates it.
+
+**Batching did not help.** `submit_batch` exists and is correct — no command is
+acknowledged until the whole batch is durable — but against an in-memory journal
+the sync is already free, so batching is pure overhead and measures *slower*. It
+will matter on a real disk, where the sync dominates. Worth remembering as an
+instance of the general rule: measure before optimizing.
 
 ---
 
@@ -183,11 +198,7 @@ These were argued out. Do not relitigate without new information.
 
 Ordered by how much it matters.
 
-1. **The pipeline allocates per command.** `Vec` for executions, level changes
-   and events, every command. The engine allocates nothing after construction;
-   this directly contradicts that principle and is most of the 10–15× gap.
-   Fix: reusable buffers owned by `Exchange`, cleared not reallocated.
-2. **No owner on the order**, so self-trade prevention cannot be implemented.
+1. **No owner on the order**, so self-trade prevention cannot be implemented.
    Requires `OrderSlot` to grow from 24 to 32 bytes in the engine.
 3. **Deposits are not journalled.** Balances are not recovered by replay; tests
    re-apply them manually. Needs a `Deposit` command kind.

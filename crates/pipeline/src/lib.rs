@@ -8,6 +8,7 @@
 
 pub mod accounts;
 pub mod book;
+pub mod fastmap;
 pub mod instrument;
 
 use accounts::Accounts;
@@ -17,6 +18,7 @@ use bx_protocol::{
     AccountId, Command, CommandKind, Event, EventKind, OrderId, Quantity, RejectReason, Sequence,
     Side, SymbolId, Ticks, TimeInForce,
 };
+use fastmap::FastMap;
 use instrument::{Instrument, Instruments};
 use std::collections::BTreeMap;
 
@@ -42,9 +44,15 @@ pub struct Exchange<S: LogStorage> {
     instruments: Instruments,
     /// Ordered, so any iteration is deterministic.
     books: BTreeMap<SymbolId, book::Book>,
-    reservations: BTreeMap<OrderId, Reservation>,
+    /// Keyed by client order ID. A hash map, not a tree: this is looked up
+    /// several times per command and nothing iterates it, so ordering is not
+    /// needed and O(log n) tree descents are pure cost.
+    reservations: FastMap<OrderId, Reservation>,
     events: Vec<Event>,
     event_sequence: Sequence,
+    /// Reused across commands. Swapped into the book for the duration of a
+    /// call so the book can fill it while `self` stays borrowable.
+    scratch: Outcome,
 }
 
 impl<S: LogStorage> Exchange<S> {
@@ -63,9 +71,10 @@ impl<S: LogStorage> Exchange<S> {
             accounts: Accounts::new(),
             instruments,
             books,
-            reservations: BTreeMap::new(),
+            reservations: FastMap::default(),
             events: Vec::new(),
             event_sequence: 0,
+            scratch: Outcome::default(),
         })
     }
 
@@ -112,6 +121,28 @@ impl<S: LogStorage> Exchange<S> {
         self.journal.sync()?;
         self.events.clear();
         self.apply(*command);
+        Ok(&self.events)
+    }
+
+    /// Sequences and journals a whole batch, syncs **once**, then applies it.
+    ///
+    /// This is the throughput path. Durability is per batch rather than per
+    /// command, which is not a weakening: no command in the batch is
+    /// acknowledged until every one of them is durable. On a real disk the sync
+    /// dominates everything else, so batching is the difference between tens of
+    /// thousands and millions of commands per second.
+    ///
+    /// # Errors
+    /// Fails only if the journal cannot be written.
+    pub fn submit_batch(&mut self, commands: &mut [Command]) -> bx_journal::Result<&[Event]> {
+        for command in commands.iter_mut() {
+            self.journal.append(command)?;
+        }
+        self.journal.sync()?;
+        self.events.clear();
+        for command in commands.iter() {
+            self.apply(*command);
+        }
         Ok(&self.events)
     }
 
@@ -215,12 +246,15 @@ impl<S: LogStorage> Exchange<S> {
             },
         );
 
+        let mut outcome = std::mem::take(&mut self.scratch);
         let Some(book) = self.books.get_mut(&command.symbol) else {
+            self.scratch = outcome;
             self.release_all(command.order_id);
             self.reject(command, RejectReason::UnknownSymbol);
             return;
         };
-        let outcome = book.submit(
+        book.submit_into(
+            &mut outcome,
             command.order_id,
             side,
             command.price,
@@ -230,6 +264,7 @@ impl<S: LogStorage> Exchange<S> {
         );
 
         if let Some(reason) = outcome.reject {
+            self.scratch = outcome;
             self.release_all(command.order_id);
             self.reject(command, reason);
             return;
@@ -242,30 +277,38 @@ impl<S: LogStorage> Exchange<S> {
             self.release_all(command.order_id);
         }
         self.emit_outcome(command, side, &outcome);
+        self.scratch = outcome;
     }
 
     fn apply_cancel(&mut self, command: &Command) {
+        let mut outcome = std::mem::take(&mut self.scratch);
         let Some(book) = self.books.get_mut(&command.symbol) else {
+            self.scratch = outcome;
             self.reject(command, RejectReason::UnknownSymbol);
             return;
         };
-        let outcome = book.cancel(command.order_id);
+        book.cancel_into(&mut outcome, command.order_id);
         if let Some(reason) = outcome.reject {
+            self.scratch = outcome;
             self.reject(command, reason);
             return;
         }
         self.release_all(command.order_id);
         self.push(command, EventKind::Canceled, command.order_id, 0, 0, 0);
         self.emit_levels(command, &outcome);
+        self.scratch = outcome;
     }
 
     fn apply_amend(&mut self, command: &Command) {
+        let mut outcome = std::mem::take(&mut self.scratch);
         let Some(book) = self.books.get_mut(&command.symbol) else {
+            self.scratch = outcome;
             self.reject(command, RejectReason::UnknownSymbol);
             return;
         };
-        let outcome = book.amend_down(command.order_id, command.quantity);
+        book.amend_down_into(&mut outcome, command.order_id, command.quantity);
         if let Some(reason) = outcome.reject {
+            self.scratch = outcome;
             self.reject(command, reason);
             return;
         }
@@ -296,6 +339,7 @@ impl<S: LogStorage> Exchange<S> {
             0,
         );
         self.emit_levels(command, &outcome);
+        self.scratch = outcome;
     }
 
     /// Moves assets for every execution, on both sides of each trade.

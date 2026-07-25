@@ -182,6 +182,64 @@ fn mixed_stream(sink: &mut u64) -> Vec<f64> {
     samples
 }
 
+/// The same mixed traffic, submitted in batches. One journal sync covers the
+/// whole batch, which is the difference between being sync-bound and being
+/// compute-bound.
+fn batched_stream(sink: &mut u64, batch: usize) -> Vec<f64> {
+    const COUNT: u64 = 200_000;
+    let mut samples = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut exchange = venue();
+        let mut state = 0x2026_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            state >> 16
+        };
+        let mut commands: Vec<Command> = (0..COUNT)
+            .map(|i| {
+                let account = 1 + next() % 16;
+                let roll = next() % 100;
+                if roll < 20 && i > 100 {
+                    Command::new(
+                        CommandKind::Cancel,
+                        account,
+                        SYMBOL,
+                        i - 100,
+                        Side::Bid,
+                        0,
+                        0,
+                        TimeInForce::GoodTillCancel,
+                    )
+                } else if roll < 30 {
+                    market_order(account, SYMBOL, i + 1, Side::Bid, 1)
+                } else {
+                    let side = if next().is_multiple_of(2) {
+                        Side::Bid
+                    } else {
+                        Side::Ask
+                    };
+                    let price = match side {
+                        Side::Bid => FLOOR + 1_000 - (next() % 50) as Ticks,
+                        Side::Ask => FLOOR + 1_001 + (next() % 50) as Ticks,
+                    };
+                    limit_order(account, SYMBOL, i + 1, side, price, 1)
+                }
+            })
+            .collect();
+
+        let started = Instant::now();
+        for chunk in commands.chunks_mut(batch) {
+            let events = exchange.submit_batch(chunk).unwrap();
+            *sink = sink.wrapping_add(events.len() as u64);
+        }
+        samples.push(started.elapsed().as_secs_f64() * 1e9 / COUNT as f64);
+        black_box(&exchange);
+    }
+    samples
+}
+
 fn main() {
     println!("\nExchange pipeline latency");
     println!("Full path per command: sequence, journal append and sync, reserve, match, emit.");
@@ -202,6 +260,16 @@ fn main() {
     );
     report("cancel by order id", &mut cancels(&mut sink), "per cancel");
     report("mixed stream", &mut mixed_stream(&mut sink), "per command");
+    report(
+        "mixed stream, batch 64",
+        &mut batched_stream(&mut sink, 64),
+        "per command",
+    );
+    report(
+        "mixed stream, batch 1024",
+        &mut batched_stream(&mut sink, 1_024),
+        "per command",
+    );
 
     println!("{}", "-".repeat(80));
     println!("sink {sink:#x}");

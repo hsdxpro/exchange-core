@@ -14,10 +14,10 @@
 //! that traded. Re-reading the aggregate at those few prices gives the delta
 //! set, without touching the engine or paying for a full book scan.
 
+use crate::fastmap::FastMap;
 use crate::instrument::Instrument;
 use bx_engine::{L3Book, OrderError, Side as ESide, TimeInForce as ETif};
 use bx_protocol::{OrderId, Quantity, RejectReason, Side, Ticks, TimeInForce};
-use std::collections::HashMap;
 
 /// A price whose aggregate quantity changed, and what it changed to.
 /// A quantity of zero means the level is now empty.
@@ -45,14 +45,30 @@ pub struct Outcome {
     pub level_changes: Vec<LevelChange>,
     /// Quantity that came to rest, if any.
     pub resting_quantity: Quantity,
+    /// Prices this command could have moved. Scratch, reused across commands.
+    touched: Vec<(Side, u16)>,
 }
 
 impl Outcome {
-    #[must_use]
-    pub fn rejected(reason: RejectReason) -> Self {
-        Self {
-            reject: Some(reason),
-            ..Self::default()
+    /// Empties the buffers without releasing their capacity, so a steady-state
+    /// pipeline allocates nothing. Capacity settles at the high-water mark of
+    /// whatever traffic actually arrived rather than a guessed reserve.
+    pub fn clear(&mut self) {
+        self.reject = None;
+        self.executions.clear();
+        self.level_changes.clear();
+        self.touched.clear();
+        self.resting_quantity = 0;
+    }
+
+    fn reject_with(&mut self, reason: RejectReason) {
+        self.clear();
+        self.reject = Some(reason);
+    }
+
+    fn touch(&mut self, side: Side, slot: u16) {
+        if !self.touched.contains(&(side, slot)) {
+            self.touched.push((side, slot));
         }
     }
 
@@ -70,7 +86,7 @@ impl Outcome {
 /// engine's own design avoids internally.
 #[derive(Debug)]
 struct SlotAllocator {
-    to_slot: HashMap<OrderId, u32>,
+    to_slot: FastMap<OrderId, u32>,
     to_order: Vec<OrderId>,
     free: Vec<u32>,
     capacity: u32,
@@ -79,7 +95,7 @@ struct SlotAllocator {
 impl SlotAllocator {
     fn new(capacity: u32) -> Self {
         Self {
-            to_slot: HashMap::new(),
+            to_slot: FastMap::default(),
             to_order: vec![0; capacity as usize],
             free: (0..capacity).rev().collect(),
             capacity,
@@ -182,21 +198,32 @@ impl Book {
         out
     }
 
-    /// Submits a new order. `price` is ignored for market orders.
-    pub fn submit(
+    /// Submits a new order, writing the result into `out`.
+    ///
+    /// The caller owns the buffer and reuses it, so a steady-state pipeline
+    /// performs no allocation on this path.
+    // One argument over clippy's threshold. Grouping them into a struct would
+    // add a type whose only purpose is to satisfy a lint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_into(
         &mut self,
+        out: &mut Outcome,
         order: OrderId,
         side: Side,
         price: Ticks,
         quantity: Quantity,
         tif: TimeInForce,
         market: bool,
-    ) -> Outcome {
+    ) {
+        out.clear();
+
         let Ok(engine_quantity) = u32::try_from(quantity) else {
-            return Outcome::rejected(RejectReason::QuantityTooLarge);
+            out.reject_with(RejectReason::QuantityTooLarge);
+            return;
         };
         if engine_quantity == 0 {
-            return Outcome::rejected(RejectReason::QuantityZero);
+            out.reject_with(RejectReason::QuantityZero);
+            return;
         }
 
         // A market order addresses the far end of the band, so the price-band
@@ -209,18 +236,26 @@ impl Book {
         } else {
             match self.instrument.to_slot(price) {
                 Some(slot) => slot,
-                None => return Outcome::rejected(RejectReason::OutsidePriceBand),
+                None => {
+                    out.reject_with(RejectReason::OutsidePriceBand);
+                    return;
+                }
             }
         };
 
         let Some(engine_order) = self.slots.allocate(order) else {
-            return Outcome::rejected(RejectReason::DuplicateOrderId);
+            out.reject_with(RejectReason::DuplicateOrderId);
+            return;
         };
 
-        let mut executions = Vec::new();
-        let mut touched = TouchedPrices::default();
-        touched.add(side.opposite(), slot);
-        touched.add(side, slot);
+        out.touch(side.opposite(), slot);
+        out.touch(side, slot);
+
+        // The fill callback needs the buffers while the engine holds `self`,
+        // so they are moved out and put back. A `Vec` is three words; this
+        // costs nothing and keeps the borrow checker satisfied without unsafe.
+        let mut executions = std::mem::take(&mut out.executions);
+        let mut touched = std::mem::take(&mut out.touched);
 
         let result = self.engine.submit_limit_with(
             engine_order,
@@ -229,136 +264,113 @@ impl Book {
             engine_quantity,
             engine_tif(tif),
             |fill| {
-                touched.add(side.opposite(), fill.price);
+                let key = (side.opposite(), fill.price);
+                if !touched.contains(&key) {
+                    touched.push(key);
+                }
                 executions.push(Execution {
-                    resting_order: 0, // filled in below; the closure cannot borrow self
+                    // Engine slot index for now; resolved to the client's order
+                    // ID below, once the borrow has ended.
+                    resting_order: u64::from(fill.maker_order_id),
                     resting_side: side.opposite(),
                     price: i64::from(fill.price),
                     quantity: u64::from(fill.quantity),
                 });
-                executions.last_mut().unwrap().resting_order = u64::from(fill.maker_order_id);
             },
         );
 
+        out.executions = executions;
+        out.touched = touched;
+
         match result {
             Ok(report) => {
-                // Resolve maker slot indices to client order IDs, and ladder
-                // slots to wire prices, now that the borrow has ended.
-                for execution in &mut executions {
-                    let slot = u32::try_from(execution.resting_order).unwrap_or(0);
-                    execution.resting_order = self.slots.order_of(slot);
-                    execution.price = self.instrument.to_price(execution.price as u16);
+                for index in 0..out.executions.len() {
+                    let execution = &out.executions[index];
+                    let engine_slot = u32::try_from(execution.resting_order).unwrap_or(0);
+                    let client_order = self.slots.order_of(engine_slot);
+                    let price = self.instrument.to_price(execution.price as u16);
+                    out.executions[index].resting_order = client_order;
+                    out.executions[index].price = price;
+                    // A maker the engine consumed entirely frees its slot.
+                    if !self.engine.contains(engine_slot) {
+                        self.slots.release(client_order);
+                    }
                 }
-                // Fully-filled makers are gone from the engine; free their slots.
-                self.reap_dead_slots(&executions);
                 if report.rested_quantity == 0 {
                     self.slots.release(order);
                 }
-                Outcome {
-                    reject: None,
-                    level_changes: touched.resolve(self),
-                    resting_quantity: u64::from(report.rested_quantity),
-                    executions,
-                }
+                out.resting_quantity = u64::from(report.rested_quantity);
+                self.resolve_levels(out);
             }
             Err(error) => {
                 self.slots.release(order);
-                Outcome::rejected(map_error(error))
+                out.reject_with(map_error(error));
             }
         }
     }
 
-    pub fn cancel(&mut self, order: OrderId) -> Outcome {
+    pub fn cancel_into(&mut self, out: &mut Outcome, order: OrderId) {
+        out.clear();
         let Some(slot) = self.slots.slot_of(order) else {
-            return Outcome::rejected(RejectReason::UnknownOrderId);
+            out.reject_with(RejectReason::UnknownOrderId);
+            return;
         };
         let Some(view) = self.engine.order(slot) else {
-            return Outcome::rejected(RejectReason::UnknownOrderId);
+            out.reject_with(RejectReason::UnknownOrderId);
+            return;
         };
-        let side = wire_side(view.side);
-        let price = view.price;
+        let (side, price) = (wire_side(view.side), view.price);
 
         match self.engine.cancel(slot) {
             Ok(()) => {
                 self.slots.release(order);
-                let mut touched = TouchedPrices::default();
-                touched.add(side, price);
-                Outcome {
-                    level_changes: touched.resolve(self),
-                    ..Outcome::default()
-                }
+                out.touch(side, price);
+                self.resolve_levels(out);
             }
-            Err(error) => Outcome::rejected(map_error(error)),
+            Err(error) => out.reject_with(map_error(error)),
         }
     }
 
-    pub fn amend_down(&mut self, order: OrderId, quantity: Quantity) -> Outcome {
+    pub fn amend_down_into(&mut self, out: &mut Outcome, order: OrderId, quantity: Quantity) {
+        out.clear();
         let Some(slot) = self.slots.slot_of(order) else {
-            return Outcome::rejected(RejectReason::UnknownOrderId);
+            out.reject_with(RejectReason::UnknownOrderId);
+            return;
         };
         let Ok(engine_quantity) = u32::try_from(quantity) else {
-            return Outcome::rejected(RejectReason::QuantityTooLarge);
+            out.reject_with(RejectReason::QuantityTooLarge);
+            return;
         };
         let Some(view) = self.engine.order(slot) else {
-            return Outcome::rejected(RejectReason::UnknownOrderId);
+            out.reject_with(RejectReason::UnknownOrderId);
+            return;
         };
-        let side = wire_side(view.side);
-        let price = view.price;
+        let (side, price) = (wire_side(view.side), view.price);
 
         match self.engine.amend_down(slot, engine_quantity) {
             Ok(()) => {
                 if engine_quantity == 0 {
                     self.slots.release(order);
                 }
-                let mut touched = TouchedPrices::default();
-                touched.add(side, price);
-                Outcome {
-                    level_changes: touched.resolve(self),
-                    ..Outcome::default()
-                }
+                out.touch(side, price);
+                self.resolve_levels(out);
             }
-            Err(error) => Outcome::rejected(map_error(error)),
+            Err(error) => out.reject_with(map_error(error)),
         }
     }
 
-    /// Frees allocator slots for makers the engine fully consumed.
-    fn reap_dead_slots(&mut self, executions: &[Execution]) {
-        for execution in executions {
-            if let Some(slot) = self.slots.slot_of(execution.resting_order)
-                && !self.engine.contains(slot)
-            {
-                self.slots.release(execution.resting_order);
-            }
-        }
-    }
-}
-
-/// The prices one command could have changed. Small and duplicated-heavy, so a
-/// vector with a dedup beats a set.
-#[derive(Debug, Default)]
-struct TouchedPrices {
-    prices: Vec<(Side, u16)>,
-}
-
-impl TouchedPrices {
-    fn add(&mut self, side: Side, slot: u16) {
-        if !self.prices.contains(&(side, slot)) {
-            self.prices.push((side, slot));
-        }
-    }
-
-    /// Re-reads the aggregate at each touched price. Prices that are still
-    /// empty and were empty before produce a zero delta, which is harmless and
-    /// far cheaper than tracking prior state.
-    fn resolve(self, book: &Book) -> Vec<LevelChange> {
-        self.prices
-            .into_iter()
-            .map(|(side, slot)| LevelChange {
+    /// Re-reads the aggregate at each touched price. A price that was empty and
+    /// stayed empty yields a zero delta, which is harmless and far cheaper than
+    /// tracking prior state.
+    fn resolve_levels(&self, out: &mut Outcome) {
+        for index in 0..out.touched.len() {
+            let (side, slot) = out.touched[index];
+            out.level_changes.push(LevelChange {
                 side,
-                price: book.instrument.to_price(slot),
-                quantity: book.engine.level_quantity(engine_side(side), slot),
-            })
-            .collect()
+                price: self.instrument.to_price(slot),
+                quantity: self.engine.level_quantity(engine_side(side), slot),
+            });
+        }
     }
 }
 
@@ -411,7 +423,29 @@ mod tests {
     }
 
     fn rest(book: &mut Book, order: OrderId, side: Side, price: Ticks, qty: Quantity) -> Outcome {
-        book.submit(order, side, price, qty, TimeInForce::GoodTillCancel, false)
+        let mut out = Outcome::default();
+        book.submit_into(
+            &mut out,
+            order,
+            side,
+            price,
+            qty,
+            TimeInForce::GoodTillCancel,
+            false,
+        );
+        out
+    }
+
+    fn cancel(book: &mut Book, order: OrderId) -> Outcome {
+        let mut out = Outcome::default();
+        book.cancel_into(&mut out, order);
+        out
+    }
+
+    fn amend(book: &mut Book, order: OrderId, quantity: Quantity) -> Outcome {
+        let mut out = Outcome::default();
+        book.amend_down_into(&mut out, order, quantity);
+        out
     }
 
     #[test]
@@ -511,7 +545,7 @@ mod tests {
         }
         assert_eq!(book.live_orders(), 500);
         for i in 0..500 {
-            assert!(book.cancel(i).reject.is_none());
+            assert!(cancel(&mut book, i).reject.is_none());
         }
         assert_eq!(book.live_orders(), 0, "slots must return to the pool");
         // And the book is genuinely empty.
@@ -535,7 +569,7 @@ mod tests {
     fn amending_down_keeps_the_order_and_reports_the_new_level() {
         let mut book = book();
         rest(&mut book, 1, Side::Bid, 1_500, 10);
-        let outcome = book.amend_down(1, 4);
+        let outcome = amend(&mut book, 1, 4);
         assert!(outcome.reject.is_none());
         assert_eq!(book.level_quantity(Side::Bid, 1_500), 4);
         assert!(outcome.level_changes.contains(&LevelChange {
@@ -550,7 +584,7 @@ mod tests {
         let mut book = book();
         rest(&mut book, 1, Side::Bid, 1_500, 10);
         assert_eq!(
-            book.amend_down(1, 20).reject,
+            amend(&mut book, 1, 20).reject,
             Some(RejectReason::AmendWouldIncrease)
         );
         assert_eq!(book.level_quantity(Side::Bid, 1_500), 10);
@@ -559,7 +593,10 @@ mod tests {
     #[test]
     fn cancelling_an_unknown_order_is_refused() {
         let mut book = book();
-        assert_eq!(book.cancel(404).reject, Some(RejectReason::UnknownOrderId));
+        assert_eq!(
+            cancel(&mut book, 404).reject,
+            Some(RejectReason::UnknownOrderId)
+        );
     }
 
     #[test]
@@ -567,7 +604,16 @@ mod tests {
         let mut book = book();
         rest(&mut book, 1, Side::Ask, 1_500, 5);
         rest(&mut book, 2, Side::Ask, 1_600, 5);
-        let outcome = book.submit(9, Side::Bid, 0, 8, TimeInForce::ImmediateOrCancel, true);
+        let mut outcome = Outcome::default();
+        book.submit_into(
+            &mut outcome,
+            9,
+            Side::Bid,
+            0,
+            8,
+            TimeInForce::ImmediateOrCancel,
+            true,
+        );
         assert_eq!(outcome.traded_quantity(), 8);
         assert_eq!(outcome.executions[0].price, 1_500, "best price first");
         assert_eq!(outcome.executions[1].price, 1_600);
