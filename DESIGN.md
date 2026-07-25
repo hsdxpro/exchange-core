@@ -4,7 +4,8 @@ Target: a production-shaped venue. Binary protocol, reliable UDP open to the pub
 internet, 1000+ symbols, replicated durability, deterministic crash recovery, hard memory
 bounds.
 
-This document is the plan. No code has been written against it yet.
+Every decision below is made. This document is the plan; no code has been written against
+it yet.
 
 ---
 
@@ -15,14 +16,14 @@ This document is the plan. No code has been written against it yet.
 | Order entry | Binary, over QUIC (public) and raw UDP or shared memory (colocated) |
 | Matching | Price-time FIFO, one writer per symbol shard, deterministic |
 | Accounts | Balance reservation before matching, sharded by account |
-| Market data | L2 book deltas, trades, BBO — sequenced, snapshot + delta, gap recovery |
+| Market data | L2 depth deltas, trades, BBO — sequenced, snapshot + delta, gap recovery |
 | Private data | Order updates, fills, balance changes, per account |
 | Durability | Replicated journal to quorum before ack |
 | Recovery | Event-sourced replay onto snapshot, deterministic |
 | Scale | 1000+ symbols, millions of messages/sec, bounded memory |
 
-**Not in this phase:** settlement and withdrawal, fee tiers, margin and liquidation,
-auctions, iceberg/hidden orders, cross-venue routing, KYC.
+**Not in this phase:** settlement and withdrawal, margin and liquidation, auctions,
+iceberg/hidden orders, cross-venue routing, KYC.
 
 ---
 
@@ -30,8 +31,9 @@ auctions, iceberg/hidden orders, cross-venue routing, KYC.
 
 Everything after the sequencer must be a deterministic function of the sequenced stream.
 That single rule is what makes replay, hot standby, and debugging possible. No wall-clock
-reads, no random numbers, no external calls, no map iteration order dependence downstream
-of the sequencer.
+reads, no random numbers, no external calls, no map-iteration-order dependence downstream
+of the sequencer. Timestamps are captured *before* sequencing and travel inside the
+command.
 
 ```
   clients
@@ -39,7 +41,7 @@ of the sequencer.
     ▼
 ┌─────────────────┐   stateless, N instances
 │    Gateway      │   decode, authenticate, rate limit, session state
-└────────┬────────┘
+└────────┬────────┘   stamps hardware ingress time
          │ commands
          ▼
 ┌─────────────────┐   single writer
@@ -58,7 +60,7 @@ of the sequencer.
          │
          ▼
 ┌─────────────────┐   sharded by symbol, single writer per shard
-│    Matching     │   the engine on `matching_engine` branch, extended
+│    Matching     │   the engine on `matching_engine`, with a windowed ladder
 └────────┬────────┘
          │ events: fills, book deltas, rejects
          ▼
@@ -90,24 +92,28 @@ recover disagrees with what thousands of clients believe they have resting. That
 reconciliation incident, not a performance tradeoff.
 
 **Journal format.** Append-only, fixed-size records, memory-mapped, one file per segment.
-Each record: `seq | timestamp | source | command`. Nothing else. The journal is the source
+Each record: `seq | ingress_ns | source | command`. Nothing else. The journal is the source
 of truth; every other piece of state is derived and therefore rebuildable.
 
-**Snapshots.** Periodically (every N million sequences, or T seconds) a shard serializes
-its full state and records the sequence it corresponds to. Snapshots are taken on a
-secondary that is replaying the same stream, so the primary never pauses.
+**Snapshots.** Every 100M sequences or 15 minutes, whichever comes first. A shard
+serializes its full state and records the sequence it corresponds to. Snapshots are taken
+on a secondary replaying the same stream, so the primary never pauses.
 
-**Recovery** is then: load the most recent snapshot, replay the journal from
-`snapshot.seq + 1` to the end, resume. Because every stage downstream of the sequencer is
-deterministic, the recovered state is bit-identical to the state that was lost. The
-existing engine already pins this property with a golden state hash over a 100,000-command
-replay; that check extends to cover the whole pipeline.
+**Recovery:** load the newest snapshot, replay the journal from `snapshot.seq + 1`, resume.
+Because every stage downstream of the sequencer is deterministic, recovered state is
+bit-identical to what was lost. The existing engine already pins this with a golden state
+hash over a 100,000-command replay; that check extends to cover the whole pipeline.
+
+**Retention.** Hot journal on local NVMe for 7 days, which covers replay for any realistic
+incident. Segments then compress and ship to S3, with a lifecycle rule to Glacier Deep
+Archive, total retention 7 years to satisfy trade-record obligations. Snapshots keep the
+last 24 hours hot, then follow the same path. Retention is a background job; it never
+touches the matching path.
 
 **Failover for the MVP is operator-assisted**, not automatic. Synchronous replication to
-two followers, manual promotion. Automatic leader election via Raft is phase 2. Writing
-consensus is the single easiest way to turn a working MVP into an unshippable one, and a
-venue that fails over in 30 seconds under human control beats one that split-brains
-automatically.
+two followers, manual promotion. Automatic leader election is phase 2. Writing consensus is
+the single easiest way to turn a working MVP into an unshippable one, and a venue that
+fails over in 30 seconds under human control beats one that split-brains on its own.
 
 ---
 
@@ -145,9 +151,9 @@ Almost entirely empty. This is the out-of-memory failure mode, and it is structu
 
 **The fix is a windowed ladder, and it doubles as a risk control.** Keep a dense ladder of
 4,096 ticks centred on the touch. Reject any order priced outside the window. Real venues
-already do this and call it price banding — an order 50% away from the touch is rejected
-on principle, not accepted and parked. So the memory bound and the fat-finger control are
-the same mechanism, which is the kind of coincidence worth taking.
+already do this and call it price banding — an order 50% away from the touch is rejected on
+principle, not accepted and parked. The memory bound and the fat-finger control become the
+same mechanism.
 
 | | Full domain | Windowed (4,096) |
 |---|---|---|
@@ -160,16 +166,49 @@ Re-centring when the touch moves is O(occupied levels), not O(window), because t
 already enumerates exactly the occupied ticks. The traversal properties the current engine
 is built on are unchanged.
 
+**`OrderSlot` grows to 32 bytes.** It must carry an owner ID for self-trade prevention and
+fill attribution, which the current 24-byte layout has no room for. At 32 bytes a slot no
+longer straddles cache lines, which the earlier A/B experiment suggested is worth
+something on random-access cancel — though that experiment was inconclusive on a noisy
+desktop and should be redone on the target hardware before anyone claims a number.
+
 **Everything else is capped and pre-allocated.** Order slots come from a per-shard arena
 sized at startup. Per-account and per-symbol order limits are hard. Subscriber replay
-buffers are fixed-size ring buffers that overwrite rather than grow. There is no unbounded
-queue anywhere; every backpressure path either blocks the producer or drops with an
-explicit, counted, observable policy. The system should be incapable of OOM by
-construction, not by tuning.
+buffers are fixed-size rings that overwrite rather than grow. There is no unbounded queue
+anywhere; every backpressure path either blocks the producer or drops with an explicit,
+counted, observable policy. The system should be incapable of OOM by construction, not by
+tuning.
 
 ---
 
-## 6. Transport and wire protocol
+## 6. Matching rules
+
+**Fees do not affect matching.** Matching is pure price-time priority on the raw limit
+price. The engine tags each fill with its maker or taker role; the fee schedule is applied
+downstream at settlement. Fee-adjusted matching would make the engine depend on account
+state — the taker's fee tier — which couples matching to accounts and breaks the rule that
+matching is a deterministic function of the sequenced stream alone. Not worth it.
+
+**Self-trade prevention: cancel-newest by default**, configurable per account to
+cancel-oldest or cancel-both. Cancel-newest protects resting liquidity: the maker who was
+there first keeps their queue position, and the incoming aggressor is the one cancelled.
+This matches CME's Self-Match Prevention default and Binance's `EXPIRE_TAKER`. STP runs
+inside the matching engine, because only the engine sees both sides of a potential match,
+and it is the reason `OrderSlot` carries an owner ID.
+
+**Market data is MBP publicly, MBO on the colo feed.** The public channel carries
+aggregated depth deltas. Order-by-order data, with anonymized per-session order IDs, is a
+separate channel for colocated subscribers. Two reasons: MBO leaks individual trading
+patterns and is a genuine competitive concern for market makers, and it is 10–100× the
+message volume, which matters when the fanout tier is serving millions of connections.
+
+**Price banding** rejects orders outside the ladder window, as above. This is a matching
+rule, not just a memory bound, and it is applied at the risk stage so a rejected order
+never reaches the engine.
+
+---
+
+## 7. Transport and wire protocol
 
 **One binary encoding everywhere.** Fixed-layout POD structs, little-endian, 8-byte
 aligned, version byte in the header. Zero-copy decode: cast the buffer, validate, use. No
@@ -186,25 +225,26 @@ Three carriers for the same bytes:
 **On UDP over the internet.** UDP/443 reaches 95–99% of networks. It fails on some
 corporate proxies and mobile carriers, which is why the TCP fallback exists and why every
 CDN keeps one. UDP also needs 10–20× more keepalive traffic than TCP to hold NAT bindings
-open, which is a real cost on mobile and is budgeted for, not wished away.
+open, a real cost on mobile that is budgeted for rather than wished away.
 
-**What we do not do:** UDP multicast. Classic exchange market data is multicast, but a
+**What we do not do: UDP multicast.** Classic exchange market data is multicast, but a
 normal AWS VPC has no usable multicast — only Transit Gateway multicast, which AWS
 themselves flag as unsuitable for latency-sensitive work and which measures ~0.4 ms within
-an AZ. Native L2/L3 multicast on AWS exists only on Outposts racks. If we ever move to
-Outposts or a real colo, multicast becomes available and the publisher grows a second
-backend behind the same trait.
+an AZ. Native L2/L3 multicast on AWS exists only on Outposts racks. If we move to Outposts
+or a real colo, multicast becomes available and the publisher grows a second backend behind
+the same trait.
 
 ---
 
-## 7. Subscription and gap recovery
+## 8. Subscription and gap recovery
 
 Channels are independently sequenced:
 
 ```
-book.{symbol}      L2 depth deltas
-trades.{symbol}    executions
-bbo.{symbol}       top of book only — cheapest, and what most retail wants
+book.{symbol}      L2 depth deltas          (public)
+trades.{symbol}    executions               (public)
+bbo.{symbol}       top of book only         (public, cheapest, what most retail wants)
+mbo.{symbol}       order-by-order           (colocated subscribers)
 orders.{account}   private: acks, rejects, status
 fills.{account}    private: executions
 balance.{account}  private: reservations and settlements
@@ -226,72 +266,113 @@ On reconnect or gap the client sends `RESUME {channel, last_seq}`:
 - within the publisher's ring buffer → replayed deltas, no snapshot needed
 - beyond it → fresh snapshot at the current sequence, then deltas
 
-The ring buffer is fixed size, sized for a few seconds of peak rate per channel. This is
-the MoldUDP64/ITCH pattern and it is what makes disconnection a non-event.
+The ring is fixed size, holding a few seconds of peak rate per channel. This is the
+MoldUDP64/ITCH pattern, and it is what makes disconnection a non-event.
 
 **Fanout.** 100M registered users is not 100M concurrent connections — expect low
 single-digit millions. Fanout nodes are stateless, consume the internal sequenced feed,
 hold per-connection subscription sets, and scale horizontally at roughly 100k connections
-each. They are the only tier that needs to scale with user count, and they are the only
-tier where losing a node costs nothing but reconnects.
+each. They are the only tier that scales with user count, and the only tier where losing a
+node costs nothing but reconnects.
 
 ---
 
-## 8. Stack
+## 9. Time
 
-Minimal by default. Every dependency below is one we would have to write otherwise, and
-each is isolated behind a trait so it can be replaced or compiled out.
+Solved by hardware, and better than expected on AWS.
+
+**Hardware packet timestamping** puts a 64-bit nanosecond timestamp on every inbound packet
+at the NIC, before the kernel, socket or application sees it. That is the true "exchange
+received" time, and it is immune to scheduling jitter in our own gateway. It is disciplined
+by the Amazon Time Sync PTP hardware clock, which runs off satellite-connected atomic
+references in each region.
+
+**Three timestamps travel with every order** and are published to clients:
+
+| | Source | Meaning |
+|---|---|---|
+| `ingress_ns` | NIC hardware timestamp | when the packet arrived at the venue |
+| `seq_ns` | sequencer, PTP-disciplined | when the order entered the official order |
+| `match_ns` | matching shard | when it executed or rested |
+
+**TSC is for us, not for clients.** `rdtsc` measures intra-process latency at ~20 cycles
+against ~25 ns for `clock_gettime`, but it is not traceable to a time standard. It never
+leaves the process and is never published.
+
+This configuration clears MiFID II's 100 µs traceability requirement for high-frequency
+activity without dedicated timing hardware, which used to be the expensive part.
+
+---
+
+## 10. Stack
+
+Minimal by default. Every dependency is one we would otherwise have to write, and each sits
+behind a trait so it can be replaced or compiled out.
+
+**The hot path has no async runtime at all.** Sequencer, journal, risk and matching run on
+pinned, busy-polling threads with SPSC ring buffers between them — the Disruptor pattern.
+An async runtime on the matching path buys nothing and costs scheduling jitter. Async lives
+only in the gateway and fanout tiers, where the problem is connection count rather than
+per-message latency.
 
 | Concern | Choice | Why |
 |---|---|---|
 | Language | Rust 1.97+, edition 2024 | already the engine's home |
-| Hot path threading | thread-per-core, pinned, busy-poll | no async runtime downstream of the gateway; the matching path must not yield |
-| QUIC | `s2n-quic` or `quinn` | both mature; `s2n-quic` is AWS's and fits the deployment |
-| Raw UDP | `std::net::UdpSocket`, `recvmmsg` | with an optional F-Stack backend behind the same trait, compile-time feature, off by default |
-| Inter-stage | SPSC ring buffers in shared memory | the Disruptor pattern; no locks, no allocation |
-| Journal | custom mmap append log | a few hundred lines, and we control the format and the fsync policy |
+| Matching path | pinned threads, busy-poll, no runtime | determinism and no scheduler involvement |
+| Inter-stage | SPSC ring buffers in shared memory | no locks, no allocation |
+| Gateway/fanout runtime | `tokio` | connection-bound tier; maturity beats micro-optimization, and `quinn` integrates natively |
+| QUIC | `quinn` | fastest Rust QUIC in published benchmarks under stable conditions, largest ecosystem. `s2n-quic` behind the same trait as fallback if we hit stability problems under loss |
+| Raw UDP | `std::net::UdpSocket` with `recvmmsg` | plus an optional F-Stack backend behind the same trait, compile-time feature, off by default |
+| Journal I/O | `io_uring` in SQPOLL mode | submission without syscalls on the write path |
 | Encoding | hand-rolled fixed-layout structs | zero-copy, versioned, no codegen step |
 | Metrics | HdrHistogram, sampled off the hot path | latency distributions are the only metric that matters here |
 | Consensus | none in MVP; `openraft` in phase 2 | synchronous replication with operator failover first |
 
+**Runtimes considered and rejected.** `monoio` is thread-per-core over io_uring but lags
+io_uring feature parity and shows little recent maintenance — not something to build a
+venue on. `glommio` has a genuinely interesting three-ring design with a dedicated latency
+ring, but its ecosystem is small and we do not want an async runtime on the hot path
+regardless. Both are worth revisiting for the fanout tier if tokio becomes the constraint.
+
 **Aeron is the road not taken, for now.** It is the mature answer for reliable UDP in
-trading — single-digit µs, 20M+ msg/sec, NAK-based retransmission, plus Archive for
+trading: single-digit µs, 20M+ msg/sec, NAK-based retransmission, plus Archive for
 journalling and Cluster for consensus. But its first-class clients are Java, C/C++ and
-.NET; Rust access is a third-party wrapper over the C API and needs a separate media
-driver process. That is heavy against the minimal-dependency requirement. Revisit if the
-custom transport becomes the bottleneck, which it may.
+.NET; Rust access is a third-party wrapper over the C API and needs a separate media driver
+process. Too heavy against the minimal-dependency requirement. Revisit if the custom
+transport becomes the bottleneck, which it may.
 
 ---
 
-## 9. Failure modes
+## 11. Failure modes
 
 | Failure | Behaviour |
 |---|---|
 | Gateway dies | clients reconnect to another; sessions re-established from `last_seq` |
 | Sequencer/primary dies | operator promotes a replica; replicas already hold the journal to the last acked sequence; zero acked orders lost |
 | Journal replica dies | quorum continues on the remaining replicas; degraded, alarmed |
-| Matching shard panics | the process aborts deliberately with a state dump; restarts from snapshot + replay |
+| Matching shard panics | deliberate abort with a state dump; restart from snapshot + replay |
 | Subscriber falls behind | ring buffer overwrites; subscriber detects the gap and re-snapshots |
 | Client floods | per-account rate limit at the gateway, before sequencing |
 | Order outside price band | rejected at the risk stage — this is also the memory bound |
+| Self-match | cancel-newest by default; the resting order survives |
 
 **Panics.** The current engine has bounds-checked indexing and one invariant `expect` on
-the matching path. In this system a panic on a matching thread is a deliberate abort with
-a state dump, followed by replay — never a caught-and-continued exception. A matching
-engine that continues after violating an invariant is worse than one that stops.
+the matching path. Here a panic on a matching thread is a deliberate abort with a state
+dump, followed by replay — never a caught-and-continued exception. A matching engine that
+continues after violating an invariant is worse than one that stops.
 
 ---
 
-## 10. Phasing
+## 12. Phasing
 
-1. **Windowed ladder.** Change the engine's memory model, keep every existing check
-   passing, extend the differential model to cover re-centring. Nothing else can be built
-   on a book that cannot hold 1000 symbols.
+1. **Windowed ladder, 32-byte slot with owner ID.** Change the memory model, keep every
+   existing check passing, extend the differential model to cover re-centring. Nothing else
+   can be built on a book that cannot hold 1000 symbols.
 2. **Event emission.** Book deltas and trades out of the engine, sequenced. The engine
    currently publishes only fills.
-3. **Sequencer, journal, replay.** Single node, no replication yet. Prove that replay
-   reproduces state bit-identically, extending the existing golden-hash check.
-4. **Accounts and reservation.** Account shards, balance reserve and release.
+3. **Sequencer, journal, replay.** Single node, no replication yet. Prove replay reproduces
+   state bit-identically, extending the existing golden-hash check.
+4. **Accounts and reservation.** Account shards, balance reserve and release, price banding.
 5. **Binary protocol and QUIC gateway.** One transport first, fallbacks after.
 6. **Subscriptions.** Snapshot, delta, resume, ring buffer.
 7. **Replication and quorum ack.** Synchronous followers, operator failover.
@@ -301,13 +382,3 @@ Each step ends with the system still runnable and still verifiable. The existing
 verification approach — differential tests against an independently written model, plus a
 golden replay hash — extends to every stage, and is the reason to keep the pipeline
 deterministic in the first place.
-
----
-
-## 11. Open questions
-
-- Fee model and whether fees affect matching or only settlement.
-- Self-trade prevention policy: cancel-newest, cancel-oldest, or cancel-both.
-- Whether market data carries order IDs (MBO) publicly or aggregated depth only (MBP).
-- Time source: PTP versus TSC, and what timestamp we publish to clients.
-- Retention: how far back the journal is kept, and where it goes after that.
