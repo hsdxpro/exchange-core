@@ -387,10 +387,17 @@ impl<S: LogStorage> Exchange<S> {
     ) {
         for execution in &outcome.executions {
             let quantity = u128::from(execution.quantity);
+            // Both of these are unreachable: entry validation bounds the
+            // notional, and a resting order always has a hold. Skipping either
+            // would drop the settlement of a trade the engine has already
+            // matched and published, so they are counted like any other broken
+            // invariant rather than passed over.
             let Some(notional) = instrument.notional(execution.price, execution.quantity) else {
+                Self::violation();
                 continue;
             };
             let Some(maker) = self.reservations.get(&execution.resting_order).copied() else {
+                Self::violation();
                 continue;
             };
 
@@ -441,8 +448,12 @@ impl<S: LogStorage> Exchange<S> {
     /// Notes an accounting operation that should have been impossible to fail.
     fn record<T>(result: Result<T, accounts::BalanceError>) {
         if result.is_err() {
-            VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+            Self::violation();
         }
+    }
+
+    fn violation() {
+        VIOLATIONS.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Reduces a hold because the asset left the account.
@@ -468,7 +479,7 @@ impl<S: LogStorage> Exchange<S> {
                 Side::Bid => instrument.quote,
                 Side::Ask => instrument.base,
             };
-            let _ = self.accounts.release(account, asset, amount);
+            Self::record(self.accounts.release(account, asset, amount));
         }
     }
 

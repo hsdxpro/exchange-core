@@ -102,7 +102,18 @@ Roughly 6M commands/sec on the mixed stream, up from 2M.
 
 These drift by 10-20% between sessions on this desktop even for an unchanged
 binary, which is why the benchmark reports the minimum of seven runs and why no
-change is kept on a single-digit-percent showing.
+change is kept on a single-digit-percent showing. Checked directly, by building
+the binary at three commits, confirming the three checksums differ, and running
+them interleaved:
+
+| commit | min | what it is |
+|---|---:|---|
+| `9104383` | 148 ns | current |
+| `fce3f32` | 146 ns | before the torn-write work |
+| `f8d2e78` | 154 ns | before the money fixes |
+
+A 5% spread, against the same binary reading 169 ns and 148 ns an hour apart.
+The correctness fixes cost nothing measurable, and nothing has regressed.
 
 Three changes got there. The first was the one asked for, the second was the
 one that mattered, and the third was a bug fix that happened to help:
@@ -214,6 +225,11 @@ These were argued out. Do not relitigate without new information.
 
 ### Things learned the hard way
 
+- **A swallowed error is how a money bug hides.** `settle` skipped an execution
+  with a bare `continue` when a value it needed was missing, which would drop
+  one side of a trade the engine had already matched and published. Every
+  accounting call that "cannot fail" now increments a counter the end-to-end
+  tests assert is zero.
 - **A journal that cannot recover from a torn write is not durable at all.**
   Replay stopped at the tear correctly, but the partial record was left in
   place, so the next append landed after it and every later record was
