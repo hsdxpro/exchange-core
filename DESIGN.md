@@ -1,384 +1,275 @@
 # Exchange with subscriptions — design
 
-Target: a production-shaped venue. Binary protocol, reliable UDP open to the public
-internet, 1000+ symbols, replicated durability, deterministic crash recovery, hard memory
-bounds.
+A venue built around the existing matching engine: binary protocol over the public
+internet, 1000+ symbols, replicated durability, automatic failover, deterministic recovery.
 
-Every decision below is made. This document is the plan; no code has been written against
-it yet.
+The guiding constraint is least code that meets the requirement. Where a number appears it
+is derived or measured, not chosen.
 
 ---
 
-## 1. What we are building
+## 1. Scope
 
-| | |
-|---|---|
-| Order entry | Binary, over QUIC (public) and raw UDP or shared memory (colocated) |
-| Matching | Price-time FIFO, one writer per symbol shard, deterministic |
-| Accounts | Balance reservation before matching, sharded by account |
-| Market data | L2 depth deltas, trades, BBO — sequenced, snapshot + delta, gap recovery |
-| Private data | Order updates, fills, balance changes, per account |
-| Durability | Replicated journal to quorum before ack |
-| Recovery | Event-sourced replay onto snapshot, deterministic |
-| Scale | 1000+ symbols, millions of messages/sec, bounded memory |
+**In:** order entry, matching, balance reservation, market data and private event
+subscriptions with gap recovery, replicated journal, automatic failover, crash recovery by
+replay.
 
-**Not in this phase:** settlement and withdrawal, margin and liquidation, auctions,
-iceberg/hidden orders, cross-venue routing, KYC.
+**Out:** settlement and withdrawal, margin and liquidation, auctions, hidden orders,
+cross-venue routing, KYC, fee tiers.
 
 ---
 
 ## 2. Pipeline
 
-Everything after the sequencer must be a deterministic function of the sequenced stream.
-That single rule is what makes replay, hot standby, and debugging possible. No wall-clock
-reads, no random numbers, no external calls, no map-iteration-order dependence downstream
-of the sequencer. Timestamps are captured *before* sequencing and travel inside the
-command.
-
 ```
-  clients
-    │  QUIC/443 binary  ·  raw UDP or shm (colo)  ·  TCP fallback
-    ▼
-┌─────────────────┐   stateless, N instances
-│    Gateway      │   decode, authenticate, rate limit, session state
-└────────┬────────┘   stamps hardware ingress time
-         │ commands
-         ▼
-┌─────────────────┐   single writer
-│   Sequencer     │   assigns global seq, the moment an order "exists"
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐   append-only, replicated to quorum
-│    Journal      │   ══► ACK RELEASED HERE ══►  client hears "received"
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐   sharded by account id, single writer per shard
-│  Risk / Account │   reserve balance, or reject
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐   sharded by symbol, single writer per shard
-│    Matching     │   the engine on `matching_engine`, with a windowed ladder
-└────────┬────────┘
-         │ events: fills, book deltas, rejects
-         ▼
-┌─────────────────┐   release/settle reservations from fills
-│  Risk (post)    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐   sequenced channels, ring-buffered for replay
-│   Publisher     │
-└────────┬────────┘
-         ▼
-   fanout tier ──► subscribers
+  clients ──QUIC──► Gateway ──► Sequencer ──► Journal ──► Risk ──► Matching ──► Publisher
+                    decode      assigns seq   replicated  balance   the engine   deltas,
+                    auth        single        3 nodes     reserve   unchanged    trades,
+                    rate limit  writer        ↓                                  private
+                                          ACK RELEASED
 ```
 
-**Two-stage client response.** The ack at the journal means *received and durable*, not
-*accepted*. The risk and matching outcome arrives after as a separate event: resting,
-filled, or rejected. This mirrors FIX, where an order is acknowledged and then reports its
-status, and it is what lets us ack in microseconds without ever acking a lie.
+One rule holds the whole thing together: **everything after the sequencer is a
+deterministic function of the sequenced stream.** No clock reads, no randomness, no
+external calls, no map-iteration-order dependence. Timestamps are captured before
+sequencing and travel inside the command.
+
+That rule is what makes replay, hot standby, and reproducible debugging possible. It is a
+constraint on every future feature.
+
+**The ack means "received and durable", not "accepted".** The matching outcome — resting,
+filled, rejected — follows as a separate event. This is how FIX already works, and it is
+what lets us confirm in microseconds without ever confirming something we might have to
+retract.
+
+Risk and matching are pipeline stages in one process, not network services. Accounts shard
+by account ID, books shard by symbol. An account's orders always pass through that
+account's shard first, so reserving balance across two symbols at once is atomic without a
+distributed lock.
 
 ---
 
-## 3. Durability and recovery
+## 3. Durability and failover
 
-**Ack after quorum.** An order is durable on a majority of journal replicas before the
-client is told anything. Budget 10–50 µs. The alternative — ack first, journal behind —
-means a crash leaves clients holding acks for orders we have no record of, and the book we
-recover disagrees with what thousands of clients believe they have resting. That is a
-reconciliation incident, not a performance tradeoff.
+**Ack once the order is on a majority of three journal nodes.** A crash then loses nothing
+a client was told we had.
 
-**Journal format.** Append-only, fixed-size records, memory-mapped, one file per segment.
-Each record: `seq | ingress_ns | source | command`. Nothing else. The journal is the source
-of truth; every other piece of state is derived and therefore rebuildable.
+**Consensus: `openraft`.** `raft-rs` entered maintenance mode; openraft is where new Rust
+work is pointed, and it is the consensus engine behind Databend in production.
 
-**Snapshots.** Every 100M sequences or 15 minutes, whichever comes first. A shard
-serializes its full state and records the sequence it corresponds to. Snapshots are taken
-on a secondary replaying the same stream, so the primary never pauses.
+The number that decides the design: openraft handles **33k writes/sec for a single writer
+but 5.6M/sec batched**. Unbatched it is far too slow for us; batched it is beyond what we
+need. The sequencer batches naturally, so this works — but **batching is mandatory, not an
+optimization**, and that has to be true from the first commit.
 
-**Recovery:** load the newest snapshot, replay the journal from `snapshot.seq + 1`, resume.
-Because every stage downstream of the sequencer is deterministic, recovered state is
-bit-identical to what was lost. The existing engine already pins this with a golden state
-hash over a 100,000-command replay; that check extends to cover the whole pipeline.
+**Known risk, to be measured before committing:** openraft is async and there is a reported
+40 ms blocking issue in its tracker. If our workload reproduces it, the fallback is the
+CORFU/Aeron-Cluster pattern — consensus for leader election and membership only, plain
+leader-to-follower replication on the data path with a fencing token. Election happens once
+per failure and can be slow; replication happens constantly and must not be. That is the
+escape hatch, not the plan; taking it before measuring would be premature.
 
-**Retention.** Hot journal on local NVMe for 7 days, which covers replay for any realistic
-incident. Segments then compress and ship to S3, with a lifecycle rule to Glacier Deep
-Archive, total retention 7 years to satisfy trade-record obligations. Snapshots keep the
-last 24 hours hot, then follow the same path. Retention is a background job; it never
-touches the matching path.
+**Recovery** is: load the newest snapshot, replay the journal from the next sequence,
+resume. Determinism means the recovered state is bit-identical to what was lost. The engine
+already pins this property with a golden state hash over a 100,000-command replay; the same
+check extends across the pipeline.
 
-**Failover for the MVP is operator-assisted**, not automatic. Synchronous replication to
-two followers, manual promotion. Automatic leader election is phase 2. Writing consensus is
-the single easiest way to turn a working MVP into an unshippable one, and a venue that
-fails over in 30 seconds under human control beats one that split-brains on its own.
+**Snapshot cadence is derived, not picked.** Choose a target recovery time, measure replay
+throughput, snapshot often enough that replay never exceeds it. If replay runs at 5M
+commands/sec and the target is 60 seconds, snapshot every 300M commands.
 
 ---
 
-## 4. Sharding
+## 4. Memory
 
-**Accounts shard by account ID. Books shard by symbol.** Both sit behind the same
-sequencer, as consecutive stages.
+**The engine is unchanged.** An earlier draft proposed a windowed ladder to cut memory. The
+arithmetic does not support it: 1000 symbols is about 2 GB of level tables, on a machine
+with 256 GB or more. That is under 1% of the box. Ten thousand symbols is 20 GB, still
+unremarkable. There was no memory problem to solve.
 
-This is what solves cross-symbol balance reservation. An account holding 100k USDT that
-sends a 50k BTC buy and a 60k ETH buy at the same moment must not have both accepted. If
-each symbol shard checked balances independently, both would pass. Because every order for
-an account passes through that account's shard first, and that shard is a single writer,
-the reservation is atomic with no distributed lock and no cross-shard coordination.
+What is worth doing:
 
-**Placement.** One primary plus two journal replicas in a single availability zone; a
-cross-AZ round trip is ~0.5 ms and would consume the entire ack budget on its own. An
-asynchronous replica in a second AZ covers zone loss with a documented RPO. Shards are
-pinned one per core, memory allocated on the local NUMA node.
+- **Hugepages** for the level tables, so sparse access does not thrash the TLB. A mount
+  option, not a redesign.
+- **One order-slot arena per shard**, shared across the symbols on that shard, rather than a
+  fixed per-book allocation. Total concurrent orders is the real bound, not orders × symbols.
+- **Hard caps** on orders per account and per symbol, sized at startup.
+- **Fixed-size ring buffers** for subscriber replay. They overwrite; they never grow.
 
----
-
-## 5. Memory: what has to change
-
-The engine on the `matching_engine` branch allocates a **fixed 2 MiB level table per
-book** — 65,536 ticks × 16 bytes × 2 sides — regardless of how many levels are live. That
-is the design decision its README highlights, and it does not survive this requirement:
-
-| Symbols | Level tables alone |
-|---|---|
-| 100 | 200 MB |
-| 1,000 | 2 GB |
-| 10,000 | 20 GB |
-
-Almost entirely empty. This is the out-of-memory failure mode, and it is structural.
-
-**The fix is a windowed ladder, and it doubles as a risk control.** Keep a dense ladder of
-4,096 ticks centred on the touch. Reject any order priced outside the window. Real venues
-already do this and call it price banding — an order 50% away from the touch is rejected on
-principle, not accepted and parked. The memory bound and the fat-finger control become the
-same mechanism.
-
-| | Full domain | Windowed (4,096) |
-|---|---|---|
-| Level table per book | 2 MiB | 128 KiB |
-| Occupancy bitmap per book | 16 KiB | 1 KiB |
-| 1,000 symbols | ~2 GB | **~130 MB** |
-| 10,000 symbols | ~20 GB | **~1.3 GB** |
-
-Re-centring when the touch moves is O(occupied levels), not O(window), because the bitmap
-already enumerates exactly the occupied ticks. The traversal properties the current engine
-is built on are unchanged.
-
-**`OrderSlot` grows to 32 bytes.** It must carry an owner ID for self-trade prevention and
-fill attribution, which the current 24-byte layout has no room for. At 32 bytes a slot no
-longer straddles cache lines, which the earlier A/B experiment suggested is worth
-something on random-access cancel — though that experiment was inconclusive on a noisy
-desktop and should be redone on the target hardware before anyone claims a number.
-
-**Everything else is capped and pre-allocated.** Order slots come from a per-shard arena
-sized at startup. Per-account and per-symbol order limits are hard. Subscriber replay
-buffers are fixed-size rings that overwrite rather than grow. There is no unbounded queue
-anywhere; every backpressure path either blocks the producer or drops with an explicit,
-counted, observable policy. The system should be incapable of OOM by construction, not by
-tuning.
+No unbounded queue anywhere. Every backpressure path either blocks the producer or drops
+with an explicit, counted, observable policy.
 
 ---
 
-## 6. Matching rules
+## 5. Risk checks
 
-**Fees do not affect matching.** Matching is pure price-time priority on the raw limit
-price. The engine tags each fill with its maker or taker role; the fee schedule is applied
-downstream at settlement. Fee-adjusted matching would make the engine depend on account
-state — the taker's fee tier — which couples matching to accounts and breaks the rule that
-matching is a deterministic function of the sequenced stream alone. Not worth it.
+Applied at the risk stage, before matching, in this order:
 
-**Self-trade prevention: cancel-newest by default**, configurable per account to
-cancel-oldest or cancel-both. Cancel-newest protects resting liquidity: the maker who was
-there first keeps their queue position, and the incoming aggressor is the one cancelled.
-This matches CME's Self-Match Prevention default and Binance's `EXPIRE_TAKER`. STP runs
-inside the matching engine, because only the engine sees both sides of a potential match,
-and it is the reason `OrderSlot` carries an owner ID.
+1. Account exists, session authorised.
+2. Order is inside the price band — a percentage either side of a reference price. This is
+   fat-finger protection. It is a range comparison, not a data structure.
+3. Sufficient free balance; reserve it.
+4. Per-account and per-symbol order count under cap.
 
-**Market data is MBP publicly, MBO on the colo feed.** The public channel carries
-aggregated depth deltas. Order-by-order data, with anonymized per-session order IDs, is a
-separate channel for colocated subscribers. Two reasons: MBO leaks individual trading
-patterns and is a genuine competitive concern for market makers, and it is 10–100× the
-message volume, which matters when the fanout tier is serving millions of connections.
+Self-trade prevention runs inside the matching engine, because only the engine sees both
+sides of a potential match. Default cancel-newest: the resting order survives and the
+incoming aggressor is cancelled, which protects the participant who was there first. This
+matches CME's Self-Match Prevention default and Binance's `EXPIRE_TAKER`.
 
-**Price banding** rejects orders outside the ladder window, as above. This is a matching
-rule, not just a memory bound, and it is applied at the risk stage so a rejected order
-never reaches the engine.
+Self-trade prevention needs an owner on the order, so `OrderSlot` grows from 24 to 32
+bytes. That is the whole justification; earlier drafts also claimed a cache-line benefit
+from an experiment that was inconclusive, and that claim is withdrawn.
+
+**Fees never touch matching.** Matching is price-time priority on the raw limit price. The
+engine tags each fill maker or taker; fees apply downstream. Fee-adjusted matching would
+make the engine depend on account state and break the determinism rule.
 
 ---
 
-## 7. Transport and wire protocol
+## 6. Transport
 
-**One binary encoding everywhere.** Fixed-layout POD structs, little-endian, 8-byte
-aligned, version byte in the header. Zero-copy decode: cast the buffer, validate, use. No
-serde, no allocation, no reflection on the hot path.
+**QUIC only.** One way in, for retail and professionals alike.
 
-Three carriers for the same bytes:
+QUIC runs over UDP, so it is fast, but re-sends anything lost, so nothing goes missing. It
+uses independent streams, so one lost packet does not stall everything behind it the way
+TCP does. It reconnects in a single round trip, and a client changing network keeps its
+session.
 
-| Carrier | Who | Notes |
-|---|---|---|
-| QUIC on UDP/443 | public internet | 0-RTT reconnect, per-stream flow control so one lost packet does not stall others, connection IDs survive NAT rebinding and wifi→5G handoff |
-| Raw UDP or shared memory | colocated | skips encryption and congestion control; single-digit µs |
-| TCP/WebSocket | fallback | for the 1–5% of networks that block UDP/443 |
+It reaches 95–99% of networks; the failures are some corporate proxies and mobile carriers
+that block UDP on port 443. A TCP fallback for those is a known, deferred piece of work,
+added when a customer actually hits it.
 
-**On UDP over the internet.** UDP/443 reaches 95–99% of networks. It fails on some
-corporate proxies and mobile carriers, which is why the TCP fallback exists and why every
-CDN keeps one. UDP also needs 10–20× more keepalive traffic than TCP to hold NAT bindings
-open, a real cost on mobile that is budgeted for rather than wished away.
+A raw UDP or shared-memory path for colocated clients sits behind the same trait and gets
+built when someone needs it. Building it now would mean two protocol implementations to
+keep in step for a benefit nobody has asked for yet.
 
-**What we do not do: UDP multicast.** Classic exchange market data is multicast, but a
-normal AWS VPC has no usable multicast — only Transit Gateway multicast, which AWS
-themselves flag as unsuitable for latency-sensitive work and which measures ~0.4 ms within
-an AZ. Native L2/L3 multicast on AWS exists only on Outposts racks. If we move to Outposts
-or a real colo, multicast becomes available and the publisher grows a second backend behind
-the same trait.
+**One binary encoding** on whatever carries it: fixed-layout structs, little-endian,
+version byte in the header, zero-copy decode. No serialization framework on the hot path.
 
 ---
 
-## 8. Subscription and gap recovery
-
-Channels are independently sequenced:
+## 7. Subscriptions and recovery
 
 ```
-book.{symbol}      L2 depth deltas          (public)
-trades.{symbol}    executions               (public)
-bbo.{symbol}       top of book only         (public, cheapest, what most retail wants)
-mbo.{symbol}       order-by-order           (colocated subscribers)
-orders.{account}   private: acks, rejects, status
-fills.{account}    private: executions
-balance.{account}  private: reservations and settlements
+book.{symbol}      depth deltas
+trades.{symbol}    executions
+bbo.{symbol}       top of book only — cheapest, and what most clients want
+orders.{account}   private
+fills.{account}    private
+balance.{account}  private
 ```
 
-**Every message carries `(channel, seq)`.** The client detects a gap by arithmetic, not by
-timeout.
+Every message carries `(channel, sequence)`, so a client detects a gap by arithmetic rather
+than by waiting for a timeout.
 
 ```
-  SUBSCRIBE  {channels, symbols, depth}
-      ──►  SNAPSHOT {channel, seq = S, state}
-      ──►  DELTA    {channel, seq = S+1}
-      ──►  DELTA    {channel, seq = S+2}
-           ...
+SUBSCRIBE {channels}  ──►  SNAPSHOT {seq = S}  ──►  DELTA {S+1}  ──►  DELTA {S+2} ...
 ```
 
-On reconnect or gap the client sends `RESUME {channel, last_seq}`:
+On reconnect the client sends `RESUME {channel, last_seq}`. If that sequence is still in
+the publisher's ring buffer it gets the missing deltas; if not, a fresh snapshot followed by
+deltas. The ring is fixed size, holding a few seconds of peak rate. This is the
+MoldUDP64/ITCH pattern and it makes disconnection a non-event.
 
-- within the publisher's ring buffer → replayed deltas, no snapshot needed
-- beyond it → fresh snapshot at the current sequence, then deltas
-
-The ring is fixed size, holding a few seconds of peak rate per channel. This is the
-MoldUDP64/ITCH pattern, and it is what makes disconnection a non-event.
-
-**Fanout.** 100M registered users is not 100M concurrent connections — expect low
-single-digit millions. Fanout nodes are stateless, consume the internal sequenced feed,
-hold per-connection subscription sets, and scale horizontally at roughly 100k connections
-each. They are the only tier that scales with user count, and the only tier where losing a
-node costs nothing but reconnects.
+The publisher and the connection fanout start as one process. They separate when connection
+count actually forces it, not before.
 
 ---
 
-## 9. Time
+## 8. Time
 
-Solved by hardware, and better than expected on AWS.
-
-**Hardware packet timestamping** puts a 64-bit nanosecond timestamp on every inbound packet
-at the NIC, before the kernel, socket or application sees it. That is the true "exchange
-received" time, and it is immune to scheduling jitter in our own gateway. It is disciplined
-by the Amazon Time Sync PTP hardware clock, which runs off satellite-connected atomic
-references in each region.
-
-**Three timestamps travel with every order** and are published to clients:
+Two timestamps travel with every order and are published:
 
 | | Source | Meaning |
 |---|---|---|
-| `ingress_ns` | NIC hardware timestamp | when the packet arrived at the venue |
-| `seq_ns` | sequencer, PTP-disciplined | when the order entered the official order |
+| `ingress_ns` | NIC hardware timestamp | when the packet reached the venue |
 | `match_ns` | matching shard | when it executed or rested |
 
-**TSC is for us, not for clients.** `rdtsc` measures intra-process latency at ~20 cycles
-against ~25 ns for `clock_gettime`, but it is not traceable to a time standard. It never
-leaves the process and is never published.
+AWS Nitro stamps every inbound packet with 64-bit nanoseconds **at the NIC, before the
+kernel or our process sees it**, disciplined by the Amazon Time Sync PTP hardware clock.
+That is the true arrival time and it is immune to jitter in our own gateway. This clears
+MiFID II's 100 µs traceability requirement without dedicated timing hardware, which used to
+be the expensive part.
 
-This configuration clears MiFID II's 100 µs traceability requirement for high-frequency
-activity without dedicated timing hardware, which used to be the expensive part.
-
----
-
-## 10. Stack
-
-Minimal by default. Every dependency is one we would otherwise have to write, and each sits
-behind a trait so it can be replaced or compiled out.
-
-**The hot path has no async runtime at all.** Sequencer, journal, risk and matching run on
-pinned, busy-polling threads with SPSC ring buffers between them — the Disruptor pattern.
-An async runtime on the matching path buys nothing and costs scheduling jitter. Async lives
-only in the gateway and fanout tiers, where the problem is connection count rather than
-per-message latency.
-
-| Concern | Choice | Why |
-|---|---|---|
-| Language | Rust 1.97+, edition 2024 | already the engine's home |
-| Matching path | pinned threads, busy-poll, no runtime | determinism and no scheduler involvement |
-| Inter-stage | SPSC ring buffers in shared memory | no locks, no allocation |
-| Gateway/fanout runtime | `tokio` | connection-bound tier; maturity beats micro-optimization, and `quinn` integrates natively |
-| QUIC | `quinn` | fastest Rust QUIC in published benchmarks under stable conditions, largest ecosystem. `s2n-quic` behind the same trait as fallback if we hit stability problems under loss |
-| Raw UDP | `std::net::UdpSocket` with `recvmmsg` | plus an optional F-Stack backend behind the same trait, compile-time feature, off by default |
-| Journal I/O | `io_uring` in SQPOLL mode | submission without syscalls on the write path |
-| Encoding | hand-rolled fixed-layout structs | zero-copy, versioned, no codegen step |
-| Metrics | HdrHistogram, sampled off the hot path | latency distributions are the only metric that matters here |
-| Consensus | none in MVP; `openraft` in phase 2 | synchronous replication with operator failover first |
-
-**Runtimes considered and rejected.** `monoio` is thread-per-core over io_uring but lags
-io_uring feature parity and shows little recent maintenance — not something to build a
-venue on. `glommio` has a genuinely interesting three-ring design with a dedicated latency
-ring, but its ecosystem is small and we do not want an async runtime on the hot path
-regardless. Both are worth revisiting for the fanout tier if tokio becomes the constraint.
-
-**Aeron is the road not taken, for now.** It is the mature answer for reliable UDP in
-trading: single-digit µs, 20M+ msg/sec, NAK-based retransmission, plus Archive for
-journalling and Cluster for consensus. But its first-class clients are Java, C/C++ and
-.NET; Rust access is a third-party wrapper over the C API and needs a separate media driver
-process. Too heavy against the minimal-dependency requirement. Revisit if the custom
-transport becomes the bottleneck, which it may.
+`rdtsc` is used for internal latency measurement only. It is fast but not traceable to a
+time standard, so it never leaves the process.
 
 ---
 
-## 11. Failure modes
+## 9. Stack
+
+**No async runtime on the matching path.** Sequencer, risk and matching run on pinned,
+busy-polling threads with single-producer single-consumer ring buffers between them. An
+async runtime there buys nothing and costs scheduling jitter. Async lives in the gateway,
+where the problem is connection count rather than per-message latency.
+
+| Concern | Choice |
+|---|---|
+| Language | Rust 1.97+, edition 2024 |
+| Matching path | pinned threads, busy-poll, no runtime |
+| Between stages | SPSC ring buffers |
+| Gateway | `tokio` + `quinn` |
+| Consensus | `openraft`, batched |
+| Journal I/O | `io_uring`, SQPOLL |
+| Encoding | hand-rolled fixed-layout structs |
+| Metrics | HdrHistogram, sampled off the hot path |
+
+**Considered and rejected.** `monoio` lags io_uring feature parity with little recent
+maintenance. `glommio` has an interesting dedicated latency ring but a small ecosystem, and
+we do not want async on the hot path regardless. **Aeron** is the mature answer for reliable
+UDP in trading, but its first-class clients are Java, C/C++ and .NET; Rust access is a
+third-party wrapper over the C API needing a separate media driver process. Revisit if the
+custom transport becomes the bottleneck.
+
+---
+
+## 10. Failure modes
 
 | Failure | Behaviour |
 |---|---|
-| Gateway dies | clients reconnect to another; sessions re-established from `last_seq` |
-| Sequencer/primary dies | operator promotes a replica; replicas already hold the journal to the last acked sequence; zero acked orders lost |
-| Journal replica dies | quorum continues on the remaining replicas; degraded, alarmed |
-| Matching shard panics | deliberate abort with a state dump; restart from snapshot + replay |
-| Subscriber falls behind | ring buffer overwrites; subscriber detects the gap and re-snapshots |
+| Gateway dies | clients reconnect elsewhere, resume from `last_seq` |
+| Leader dies | openraft elects a new one; the journal is already on a majority; no acked order lost |
+| One journal node dies | majority continues; degraded and alarmed |
+| Matching shard panics | deliberate abort with a state dump, restart from snapshot + replay |
+| Subscriber falls behind | ring overwrites, subscriber sees the gap and re-snapshots |
 | Client floods | per-account rate limit at the gateway, before sequencing |
-| Order outside price band | rejected at the risk stage — this is also the memory bound |
-| Self-match | cancel-newest by default; the resting order survives |
+| Order outside price band | rejected at the risk stage |
+| Self-match | cancel-newest; the resting order survives |
 
-**Panics.** The current engine has bounds-checked indexing and one invariant `expect` on
-the matching path. Here a panic on a matching thread is a deliberate abort with a state
-dump, followed by replay — never a caught-and-continued exception. A matching engine that
-continues after violating an invariant is worse than one that stops.
+A panic on a matching thread is a deliberate abort with a state dump, then replay — never a
+caught exception. An engine that continues after violating an invariant is worse than one
+that stops.
 
 ---
 
-## 12. Phasing
+## 11. Phasing
 
-1. **Windowed ladder, 32-byte slot with owner ID.** Change the memory model, keep every
-   existing check passing, extend the differential model to cover re-centring. Nothing else
-   can be built on a book that cannot hold 1000 symbols.
-2. **Event emission.** Book deltas and trades out of the engine, sequenced. The engine
-   currently publishes only fills.
-3. **Sequencer, journal, replay.** Single node, no replication yet. Prove replay reproduces
-   state bit-identically, extending the existing golden-hash check.
-4. **Accounts and reservation.** Account shards, balance reserve and release, price banding.
-5. **Binary protocol and QUIC gateway.** One transport first, fallbacks after.
-6. **Subscriptions.** Snapshot, delta, resume, ring buffer.
-7. **Replication and quorum ack.** Synchronous followers, operator failover.
-8. **Fanout tier.** Horizontal scale-out for the public feed.
+1. **Event emission.** Book deltas and trades out of the engine, sequenced. It currently
+   publishes only fills.
+2. **Sequencer, journal, replay, single node.** Prove replay reproduces state
+   bit-identically, extending the existing golden-hash check.
+3. **Accounts, reservation, risk checks.** Including the price band and the 32-byte slot.
+4. **QUIC gateway and binary protocol.**
+5. **Subscriptions.** Snapshot, delta, resume, ring buffer.
+6. **openraft replication and quorum ack.**
+7. **Scale-out.** Split fanout from publisher when connection count demands it.
 
-Each step ends with the system still runnable and still verifiable. The existing
-verification approach — differential tests against an independently written model, plus a
-golden replay hash — extends to every stage, and is the reason to keep the pipeline
-deterministic in the first place.
+Each step leaves the system runnable and verifiable. The existing approach — differential
+tests against an independently written model, plus a golden replay hash — extends to every
+stage. That is the payoff for keeping the pipeline deterministic.
+
+---
+
+## 12. To be measured before committing
+
+Design decisions that rest on assumptions rather than observation. Each is cheap to test
+and expensive to be wrong about.
+
+- **openraft under our batching pattern**, and whether the reported 40 ms blocking
+  reproduces. Decides whether consensus stays on the data path.
+- **Replay throughput**, which sets the snapshot cadence.
+- **QUIC overhead in-datacenter**, which decides whether a raw path for colocated clients is
+  ever worth building.
+- **Hugepage benefit** on the level tables at realistic symbol counts.
+- **32-byte versus 24-byte slot**, on the target hardware with a pinned core — the earlier
+  attempt on a loaded desktop could not resolve it and reversed sign between runs.
