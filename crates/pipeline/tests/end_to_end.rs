@@ -9,7 +9,7 @@
 
 use bx_journal::MemoryLog;
 use bx_pipeline::instrument::{AssetId, Instrument, Instruments};
-use bx_pipeline::{Exchange, limit_order, market_order};
+use bx_pipeline::{Exchange, accounting_violations, limit_order, market_order};
 use bx_protocol::{Command, CommandKind, Event, EventKind, RejectReason, Side, Ticks, TimeInForce};
 use std::collections::BTreeMap;
 
@@ -460,6 +460,11 @@ fn a_trading_session_keeps_the_feed_and_the_book_in_agreement() {
             subscriber.trades.len() > 10,
             "seed {seed}: session produced no trading"
         );
+        assert_eq!(
+            accounting_violations(),
+            0,
+            "seed {seed}: an accounting operation failed that should have been impossible"
+        );
     }
 }
 
@@ -560,5 +565,106 @@ fn a_crash_before_sync_loses_nothing_that_was_acknowledged() {
     assert_eq!(
         recovered.book(SYMBOL).unwrap().depth(Side::Bid, 1_000),
         bids
+    );
+}
+
+#[test]
+fn cancel_replace_of_an_unknown_order_must_not_create_one() {
+    let mut exchange = funded();
+
+    // Replace order 999, which does not exist. FIX semantics: the whole
+    // request is rejected. It must not leave a new order resting.
+    let mut request = Command::new(
+        CommandKind::CancelReplace,
+        1,
+        SYMBOL,
+        999,
+        Side::Bid,
+        10_100,
+        5,
+        TimeInForce::GoodTillCancel,
+    );
+    request.replacement_id = 1_000;
+    let events = exchange.submit(&mut request).unwrap().to_vec();
+
+    assert!(
+        exchange
+            .book(SYMBOL)
+            .unwrap()
+            .depth(Side::Bid, 10)
+            .is_empty(),
+        "a replace of a nonexistent order left something resting: {:?}",
+        exchange.book(SYMBOL).unwrap().depth(Side::Bid, 10)
+    );
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8),
+        "the request should be rejected"
+    );
+    assert_eq!(
+        exchange.accounts().balance(1, USD).reserved,
+        0,
+        "no balance should be held"
+    );
+}
+
+#[test]
+fn an_account_trading_with_itself_conserves_its_own_balances() {
+    let mut exchange = funded();
+    let usd_before = exchange.accounts().balance(1, USD).total();
+    let btc_before = exchange.accounts().balance(1, BTC).total();
+
+    // Same account on both sides. Self-trade prevention is not implemented
+    // yet, so this matches; the accounting must still balance.
+    let mut sell = limit_order(1, SYMBOL, 101, Side::Ask, 10_100, 5);
+    exchange.submit(&mut sell).unwrap();
+    let mut buy = limit_order(1, SYMBOL, 102, Side::Bid, 10_100, 5);
+    exchange.submit(&mut buy).unwrap();
+
+    assert_eq!(
+        exchange.accounts().balance(1, USD).total(),
+        usd_before,
+        "a self-trade changed the account's USD"
+    );
+    assert_eq!(
+        exchange.accounts().balance(1, BTC).total(),
+        btc_before,
+        "a self-trade changed the account's BTC"
+    );
+    assert_eq!(exchange.accounts().balance(1, USD).reserved, 0);
+    assert_eq!(exchange.accounts().balance(1, BTC).reserved, 0);
+}
+
+#[test]
+fn a_market_buy_cannot_spend_more_than_the_account_has() {
+    let mut exchange = venue();
+    // Seller has plenty of BTC.
+    exchange.deposit(2, BTC, 1_000);
+    // Buyer can afford exactly 1 unit at 10_100.
+    exchange.deposit(1, USD, 10_100);
+
+    let mut ask = limit_order(2, SYMBOL, 201, Side::Ask, 10_100, 100);
+    exchange.submit(&mut ask).unwrap();
+
+    let usd_supply = exchange.accounts().total_supply(USD);
+    let btc_supply = exchange.accounts().total_supply(BTC);
+
+    // Buy 100 units at market. The account can afford one.
+    let mut buy = market_order(1, SYMBOL, 101, Side::Bid, 100);
+    exchange.submit(&mut buy).unwrap();
+
+    assert_eq!(
+        exchange.accounts().total_supply(USD),
+        usd_supply,
+        "USD was created or destroyed by an unaffordable market buy"
+    );
+    assert_eq!(
+        exchange.accounts().total_supply(BTC),
+        btc_supply,
+        "BTC was created or destroyed by an unaffordable market buy"
+    );
+    assert!(
+        exchange.accounts().balance(1, BTC).total() <= 1,
+        "the buyer received {} BTC but could only afford 1",
+        exchange.accounts().balance(1, BTC).total()
     );
 }

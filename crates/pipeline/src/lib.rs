@@ -21,6 +21,18 @@ use bx_protocol::{
 use fastmap::FastMap;
 use instrument::{Instrument, Instruments};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Accounting operations that failed when they should have been impossible.
+/// Any non-zero value means value was created or destroyed; tests assert it
+/// stays at zero.
+static VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of impossible accounting failures observed since start.
+#[must_use]
+pub fn accounting_violations() -> u64 {
+    VIOLATIONS.load(Ordering::Relaxed)
+}
 
 /// Orders one book holds before rejecting for capacity.
 const DEFAULT_BOOK_CAPACITY: u32 = 65_535;
@@ -170,15 +182,20 @@ impl<S: LogStorage> Exchange<S> {
         };
         match kind {
             CommandKind::NewOrder => self.apply_new_order(&command),
-            CommandKind::Cancel => self.apply_cancel(&command),
+            CommandKind::Cancel => {
+                self.apply_cancel(&command);
+            }
             CommandKind::AmendDown => self.apply_amend(&command),
             CommandKind::CancelReplace => {
-                // Cancel first, so a replacement that fails leaves nothing
-                // resting, which is what clients expect from cancel/replace.
-                self.apply_cancel(&command);
-                let mut replacement = command;
-                replacement.order_id = command.replacement_id;
-                self.apply_new_order(&replacement);
+                // The replacement is only submitted if the original was
+                // actually cancelled. Replacing an order that does not exist
+                // must reject the whole request, not quietly create a new
+                // order the client never asked for.
+                if self.apply_cancel(&command) {
+                    let mut replacement = command;
+                    replacement.order_id = command.replacement_id;
+                    self.apply_new_order(&replacement);
+                }
             }
         }
     }
@@ -213,7 +230,23 @@ impl<S: LogStorage> Exchange<S> {
             Side::Bid => {
                 let quote = instrument.quote;
                 let amount = if market {
-                    self.accounts.balance(command.account, quote).free
+                    // The engine matches on quantity and knows nothing about
+                    // money, so the reservation has to cover the worst price
+                    // the ladder can represent. Reserving merely "whatever is
+                    // free" let a market buy sweep more than the account could
+                    // pay for, and the shortfall surfaced as a failed settle
+                    // after the trade had already happened.
+                    //
+                    // This is conservative: a proper affordability walk would
+                    // price the actual sweep, which needs an early-exit
+                    // traversal the engine does not expose today.
+                    let Some(amount) =
+                        instrument.notional(instrument.ceiling_ticks(), command.quantity)
+                    else {
+                        self.reject(command, RejectReason::QuantityTooLarge);
+                        return;
+                    };
+                    amount
                 } else {
                     let Some(amount) = instrument.notional(command.price, command.quantity) else {
                         self.reject(command, RejectReason::QuantityTooLarge);
@@ -280,23 +313,25 @@ impl<S: LogStorage> Exchange<S> {
         self.scratch = outcome;
     }
 
-    fn apply_cancel(&mut self, command: &Command) {
+    /// Returns whether the order was actually cancelled.
+    fn apply_cancel(&mut self, command: &Command) -> bool {
         let mut outcome = std::mem::take(&mut self.scratch);
         let Some(book) = self.books.get_mut(&command.symbol) else {
             self.scratch = outcome;
             self.reject(command, RejectReason::UnknownSymbol);
-            return;
+            return false;
         };
         book.cancel_into(&mut outcome, command.order_id);
         if let Some(reason) = outcome.reject {
             self.scratch = outcome;
             self.reject(command, reason);
-            return;
+            return false;
         }
         self.release_all(command.order_id);
         self.push(command, EventKind::Canceled, command.order_id, 0, 0, 0);
         self.emit_levels(command, &outcome);
         self.scratch = outcome;
+        true
     }
 
     fn apply_amend(&mut self, command: &Command) {
@@ -364,12 +399,18 @@ impl<S: LogStorage> Exchange<S> {
                 Side::Ask => (maker.account, command.account),
             };
 
-            // Buyer pays quote out of its hold and receives base.
-            let _ = self.accounts.settle_out(buyer, instrument.quote, notional);
-            let _ = self.accounts.settle_in(buyer, instrument.base, quantity);
-            // Seller gives base out of its hold and receives quote.
-            let _ = self.accounts.settle_out(seller, instrument.base, quantity);
-            let _ = self.accounts.settle_in(seller, instrument.quote, notional);
+            // Buyer pays quote out of its hold and receives base; seller gives
+            // base out of its hold and receives quote.
+            //
+            // None of these can fail if reservation was sized correctly, so a
+            // failure means an accounting invariant is broken. Swallowing it
+            // would move one side of a trade and not the other, which creates
+            // or destroys value silently. It is counted and asserted on in
+            // tests instead.
+            Self::record(self.accounts.settle_out(buyer, instrument.quote, notional));
+            Self::record(self.accounts.settle_in(buyer, instrument.base, quantity));
+            Self::record(self.accounts.settle_out(seller, instrument.base, quantity));
+            Self::record(self.accounts.settle_in(seller, instrument.quote, notional));
 
             let (taker_used, maker_used) = match side {
                 Side::Bid => (notional, quantity),
@@ -394,6 +435,13 @@ impl<S: LogStorage> Exchange<S> {
             if maker_gone {
                 self.release_all(execution.resting_order);
             }
+        }
+    }
+
+    /// Notes an accounting operation that should have been impossible to fail.
+    fn record<T>(result: Result<T, accounts::BalanceError>) {
+        if result.is_err() {
+            VIOLATIONS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
