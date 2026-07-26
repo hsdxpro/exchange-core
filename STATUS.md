@@ -232,6 +232,19 @@ These were argued out. Do not relitigate without new information.
   answers it in one lookup and never touches the book.
 - **MBP public, MBO colocated only.** MBO leaks trading patterns and is 10–100×
   the volume.
+- **A per-channel cost multiplies by the instrument list.** The retention window
+  is 64 bytes an event per channel and there are two public channels per symbol,
+  so the shipped default of 65,536 wanted 7.8 GiB across a thousand
+  instruments -- an out-of-memory kill, from following the example config. The
+  default is now 8,192 (1 GiB at a thousand symbols) and the configuration
+  refuses to start when the window times the instrument list exceeds a stated
+  budget.
+- **A dense table is only cheap if its index is bounded.** Instruments live in a
+  table indexed by symbol, which makes lookup a bounds check and an offset. It
+  also means one instrument numbered 4,294,967,295 asks for a four-billion-entry
+  table, about 171 GB, from a single mistyped configuration line. Symbol IDs are
+  venue-assigned, so numbering them densely from zero costs nothing;
+  `MAX_SYMBOL` makes that a refusal instead of a kill.
 - **Price levels and order slots are different things and must not share a
   number.** The book has 65,536 *price levels* because that is the bitmap
   ladder, and that is the design. It separately needs a pool of *resting order

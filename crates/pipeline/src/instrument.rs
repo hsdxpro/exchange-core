@@ -12,6 +12,19 @@ use bx_protocol::{Quantity, SymbolId, Ticks};
 /// Slots in the engine's ladder. Fixed by the engine's design.
 pub const LADDER_SLOTS: i64 = 65_536;
 
+/// Largest symbol ID a venue may assign.
+///
+/// Instruments are held in a table indexed by symbol, which is what makes
+/// lookup a bounds check and an offset on the command path. The cost is that the
+/// table is as long as the largest ID in it: numbering a single instrument
+/// 4,294,967,295 would ask for a table of four billion entries and exhaust
+/// memory before the venue accepted an order.
+///
+/// Symbol IDs are venue-assigned, so numbering them densely from zero costs
+/// nothing. This bound keeps the table under a few megabytes and turns a
+/// mistyped configuration into a refusal instead of an out-of-memory kill.
+pub const MAX_SYMBOL: SymbolId = 1 << 16;
+
 /// Largest resting-order pool the engine can address.
 ///
 /// One below `u32::MAX`, because the engine uses that value as its
@@ -135,7 +148,16 @@ impl Instruments {
         Self::default()
     }
 
+    /// # Panics
+    /// If the symbol is at or above [`MAX_SYMBOL`]. Callers that take a symbol
+    /// from outside the process must check first; [`crate::instrument::MAX_SYMBOL`]
+    /// is what the configuration validates against.
     pub fn insert(&mut self, instrument: Instrument) {
+        assert!(
+            instrument.symbol < MAX_SYMBOL,
+            "symbol {} is at or above the limit of {MAX_SYMBOL}",
+            instrument.symbol
+        );
         let index = instrument.symbol as usize;
         if self.by_symbol.len() <= index {
             self.by_symbol.resize(index + 1, None);

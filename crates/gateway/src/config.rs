@@ -18,7 +18,7 @@
 //!   empty instrument list should stop the venue before it accepts an order, not
 //!   surface as strange behaviour under load.
 
-use bx_pipeline::instrument::{Instrument, Instruments, MAX_OPEN_ORDERS_LIMIT};
+use bx_pipeline::instrument::{Instrument, Instruments, MAX_OPEN_ORDERS_LIMIT, MAX_SYMBOL};
 use bx_protocol::Ticks;
 use std::fmt;
 use std::path::PathBuf;
@@ -93,6 +93,16 @@ impl InstrumentDraft {
             .floor_ticks
             .ok_or_else(|| ConfigError::at(line, "instrument is missing floor_ticks"))?;
 
+        if symbol >= MAX_SYMBOL {
+            return Err(ConfigError::at(
+                line,
+                format!(
+                    "symbol {symbol} is at or above the limit of {MAX_SYMBOL}; \
+                     instruments are held in a table indexed by symbol, so number \
+                     them densely from zero"
+                ),
+            ));
+        }
         if base == quote {
             return Err(ConfigError::at(
                 line,
@@ -146,7 +156,23 @@ pub struct Config {
     pub replicas: Vec<String>,
     /// How long the leader waits for a follower to confirm.
     pub ack_timeout: Duration,
+    /// Ceiling on the memory the subscription feed may hold. Checked against
+    /// what the retention window actually costs, so a venue refuses to start
+    /// rather than being killed under load.
+    pub max_feed_memory: u64,
     pub instruments: Instruments,
+}
+
+/// Bytes the subscription feed can hold at most: every public channel for every
+/// listed instrument, at one retention window each.
+///
+/// Private channels are per connected account and are not counted here; they are
+/// bounded by concurrent connections rather than by the instrument list.
+#[must_use]
+pub fn feed_memory(retained_per_channel: usize, symbols: usize) -> u64 {
+    const PUBLIC_CHANNELS_PER_SYMBOL: u64 = 2; // book and trades
+    const EVENT_BYTES: u64 = 64;
+    retained_per_channel as u64 * symbols as u64 * PUBLIC_CHANNELS_PER_SYMBOL * EVENT_BYTES
 }
 
 impl Config {
@@ -161,6 +187,7 @@ impl Config {
         let mut retained = None;
         let mut max_records = None;
         let mut ack_timeout_ms = None;
+        let mut max_feed_memory_mb = None;
         let mut replicas = Vec::new();
         let mut drafts: Vec<InstrumentDraft> = Vec::new();
 
@@ -238,6 +265,7 @@ impl Config {
                 "retained_per_channel" => retained = Some(number("retained_per_channel")?),
                 "max_records_per_session" => max_records = Some(number("max_records_per_session")?),
                 "ack_timeout_ms" => ack_timeout_ms = Some(number("ack_timeout_ms")?),
+                "max_feed_memory_mb" => max_feed_memory_mb = Some(number("max_feed_memory_mb")?),
                 "replica" => replicas.push(value.to_string()),
                 // Not ignored. A key nobody reads means the venue is running
                 // with a value the operator thinks they set.
@@ -255,6 +283,7 @@ impl Config {
         let retained = required(retained, "retained_per_channel")?;
         let max_records = required(max_records, "max_records_per_session")?;
         let ack_timeout_ms = required(ack_timeout_ms, "ack_timeout_ms")?;
+        let max_feed_memory_mb = required(max_feed_memory_mb, "max_feed_memory_mb")?;
 
         if drafts.is_empty() {
             return Err(ConfigError::whole_file(
@@ -267,6 +296,7 @@ impl Config {
             (retained, "retained_per_channel"),
             (max_records, "max_records_per_session"),
             (ack_timeout_ms, "ack_timeout_ms"),
+            (max_feed_memory_mb, "max_feed_memory_mb"),
         ] {
             if value.0 == 0 {
                 return Err(ConfigError::whole_file(format!(
@@ -291,18 +321,37 @@ impl Config {
             instruments.insert(instrument);
         }
 
+        // The retention window is per channel, so its cost multiplies by the
+        // instrument list. At 65,536 events a channel and a thousand symbols that
+        // is 7.8 GiB, which is an out-of-memory kill rather than a slow venue --
+        // and it was the shipped default. Refusing here is the difference
+        // between a startup error and a venue that dies under load.
+        let retained = usize::try_from(retained)
+            .map_err(|_| ConfigError::whole_file("retained_per_channel is too large"))?;
+        let needed = feed_memory(retained, listed.len());
+        let budget = max_feed_memory_mb * 1024 * 1024;
+        if needed > budget {
+            return Err(ConfigError::whole_file(format!(
+                "the feed needs {} MiB for {} instruments at {retained} events a \
+                 channel, over the {max_feed_memory_mb} MiB budget; lower \
+                 retained_per_channel or raise max_feed_memory_mb",
+                needed / 1024 / 1024,
+                listed.len()
+            )));
+        }
+
         Ok(Self {
             listen: listen.unwrap_or_else(|| "127.0.0.1:7070".to_string()),
             journal,
             snapshot,
             target_recovery: Duration::from_millis(target_recovery_ms),
             replay_rate,
-            retained_per_channel: usize::try_from(retained)
-                .map_err(|_| ConfigError::whole_file("retained_per_channel is too large"))?,
+            retained_per_channel: retained,
             max_records_per_session: usize::try_from(max_records)
                 .map_err(|_| ConfigError::whole_file("max_records_per_session is too large"))?,
             replicas,
             ack_timeout: Duration::from_millis(ack_timeout_ms),
+            max_feed_memory: budget,
             instruments,
         })
     }
@@ -330,6 +379,7 @@ replay_rate = 7600000
 retained_per_channel = 65536
 max_records_per_session = 4096
 ack_timeout_ms = 250
+max_feed_memory_mb = 64
 replica = 10.0.0.2:7100
 replica = 10.0.0.3:7100
 
@@ -353,6 +403,7 @@ max_open_orders = 1000000
         assert_eq!(config.retained_per_channel, 65_536);
         assert_eq!(config.max_records_per_session, 4_096);
         assert_eq!(config.ack_timeout, Duration::from_millis(250));
+        assert_eq!(config.max_feed_memory, 64 * 1024 * 1024);
         assert_eq!(config.replicas, vec!["10.0.0.2:7100", "10.0.0.3:7100"]);
 
         let listed: Vec<u32> = config.instruments.iter().map(|i| i.symbol).collect();
@@ -404,6 +455,7 @@ max_open_orders = 1000000
             "retained_per_channel",
             "max_records_per_session",
             "ack_timeout_ms",
+            "max_feed_memory_mb",
         ] {
             let text = VALID
                 .lines()
@@ -422,6 +474,56 @@ max_open_orders = 1000000
                 "{setting}: got {error}"
             );
         }
+    }
+
+    #[test]
+    fn a_feed_that_would_not_fit_in_memory_is_refused_at_startup() {
+        // 65,536 events a channel over 1,000 symbols is 7.8 GiB. The venue must
+        // say so rather than be killed under load.
+        assert_eq!(feed_memory(65_536, 1_000) / 1024 / 1024, 8_000);
+
+        let text = VALID.replace("max_feed_memory_mb = 64", "max_feed_memory_mb = 1");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(
+            error.message.contains("over the 1 MiB budget"),
+            "got {error}"
+        );
+        assert!(
+            error.message.contains("lower retained_per_channel"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn the_budget_counts_every_listed_instrument() {
+        // One instrument at 65,536 events is 8 MiB, so a 9 MiB budget holds one
+        // and not two.
+        let one = VALID.replace("max_feed_memory_mb = 64", "max_feed_memory_mb = 9");
+        assert!(Config::parse(&one).is_ok());
+
+        let two = format!(
+            "{one}
+[instrument]
+symbol = 2
+base = 1
+quote = 3
+floor_ticks = 100
+max_quantity = 10
+max_open_orders = 10
+"
+        );
+        let error = Config::parse(&two).unwrap_err();
+        assert!(error.message.contains("2 instruments"), "got {error}");
+    }
+
+    #[test]
+    fn a_symbol_beyond_the_dense_tables_limit_is_refused() {
+        let text = VALID.replace("symbol = 1", "symbol = 4294967295");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(
+            error.message.contains("table indexed by symbol"),
+            "got {error}"
+        );
     }
 
     #[test]

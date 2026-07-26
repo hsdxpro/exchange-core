@@ -46,6 +46,7 @@ fn measurement_config() -> Config {
         max_records_per_session: 4_096,
         replicas: Vec::new(),
         ack_timeout: Duration::from_millis(250),
+        max_feed_memory: 64 * 1024 * 1024,
         instruments,
     }
 }
@@ -93,6 +94,12 @@ fn run<S: LogStorage>(config: &Config, storage: S, fresh: bool) -> std::io::Resu
         );
         server.snapshot_to(policy, path);
     }
+    let symbols = config.instruments.iter().count();
+    println!(
+        "feed retains {} events a channel: {} MiB across {symbols} instrument(s)",
+        config.retained_per_channel,
+        bx_gateway::config::feed_memory(config.retained_per_channel, symbols) / 1024 / 1024
+    );
     if !config.replicas.is_empty() {
         println!("replicating to {} follower(s)", config.replicas.len());
     }
