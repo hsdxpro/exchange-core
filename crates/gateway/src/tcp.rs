@@ -29,9 +29,13 @@ use crate::venue::Venue;
 use bx_journal::LogStorage;
 use bx_pipeline::hub::{Channel, Resume};
 use bx_pipeline::instrument::Instruments;
+use bx_pipeline::snapshot::Snapshot;
 use bx_protocol::{AccountId, Command, CommandKind, Event, Sequence};
+use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// One connected client.
 #[derive(Debug)]
@@ -136,6 +140,61 @@ impl Session {
     }
 }
 
+/// When to take the next snapshot.
+///
+/// Expressed as a recovery-time target rather than a cadence, because the
+/// cadence is not the thing anyone cares about: what matters is how long the
+/// venue is down after a crash, and that is set by how many commands have to be
+/// replayed. Replay was measured at roughly 6.5 million commands per second, so
+/// a target of a few seconds turns directly into a number of commands.
+///
+/// Snapshotting is not required for correctness. The journal remains the source
+/// of truth, and a venue that never snapshots recovers identically, only slower.
+#[derive(Clone, Copy, Debug)]
+pub struct SnapshotPolicy {
+    /// Commands allowed to accumulate before the next snapshot.
+    every: u64,
+    /// Sequence the next snapshot is due at.
+    due_at: Sequence,
+}
+
+impl SnapshotPolicy {
+    /// `replay_rate` is commands per second the venue replays at, and
+    /// `target_recovery` how long a restart may take. Measure the rate rather
+    /// than assuming it: it depends on the traffic mix.
+    ///
+    /// # Panics
+    /// If either argument is zero, which would ask for a snapshot per command
+    /// or one never.
+    #[must_use]
+    pub fn from_recovery_target(replay_rate: u64, target_recovery: Duration) -> Self {
+        assert!(replay_rate > 0, "replay rate must be positive");
+        let every = (replay_rate as f64 * target_recovery.as_secs_f64()) as u64;
+        assert!(
+            every > 0,
+            "the recovery target is shorter than a single command's replay"
+        );
+        Self {
+            every,
+            due_at: every,
+        }
+    }
+
+    /// Commands between snapshots.
+    #[must_use]
+    pub const fn interval(&self) -> u64 {
+        self.every
+    }
+
+    fn is_due(&self, sequence: Sequence) -> bool {
+        sequence >= self.due_at
+    }
+
+    fn taken_at(&mut self, sequence: Sequence) {
+        self.due_at = sequence.saturating_add(self.every);
+    }
+}
+
 /// The venue, listening.
 #[derive(Debug)]
 pub struct Server<S: LogStorage> {
@@ -146,6 +205,9 @@ pub struct Server<S: LogStorage> {
     /// rather than chosen: a session further behind than the window cannot be
     /// caught up whatever the venue does.
     max_outbox: usize,
+    /// Set to snapshot periodically. None means never, which is slower to
+    /// recover and no less correct.
+    snapshots: Option<(SnapshotPolicy, PathBuf)>,
     /// Reused across passes so a steady-state loop allocates nothing.
     inbound: Vec<Command>,
     outbound: Vec<Event>,
@@ -178,6 +240,7 @@ impl<S: LogStorage> Server<S> {
             outbound: Vec::new(),
             max_records_per_session,
             max_outbox: retained_per_channel * FRAME_LEN,
+            snapshots: None,
         };
         Ok(server)
     }
@@ -200,6 +263,70 @@ impl<S: LogStorage> Server<S> {
     #[must_use]
     pub fn sessions(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Writes a snapshot to `path` whenever `policy` says one is due.
+    ///
+    /// Written to a temporary file and renamed, so a crash midway leaves the
+    /// previous snapshot intact rather than a half-written one. A snapshot that
+    /// cannot be trusted is worse than none, because recovery would start from
+    /// it.
+    pub fn snapshot_to(&mut self, policy: SnapshotPolicy, path: PathBuf) {
+        self.snapshots = Some((policy, path));
+    }
+
+    /// Takes a snapshot now, if one is due. Returns the sequence it covers.
+    ///
+    /// # Errors
+    /// Fails if the snapshot cannot be written. The venue keeps trading: the
+    /// journal is still authoritative, so a failed snapshot costs recovery time
+    /// and nothing else.
+    pub fn snapshot_if_due(&mut self) -> io::Result<Option<Sequence>> {
+        let Some((policy, path)) = self.snapshots.as_mut() else {
+            return Ok(None);
+        };
+        let sequence = self.venue.exchange().next_sequence();
+        if !policy.is_due(sequence) {
+            return Ok(None);
+        }
+
+        let snapshot = self.venue.snapshot();
+        let staging = path.with_extension("writing");
+        {
+            let mut file = File::create(&staging)?;
+            snapshot
+                .write_to(&mut file)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            // Durable before the rename, or the rename could publish a file the
+            // filesystem has not finished writing.
+            file.sync_all()?;
+        }
+        std::fs::rename(&staging, &path)?;
+
+        policy.taken_at(sequence);
+        Ok(Some(sequence))
+    }
+
+    /// Loads a snapshot and replays the journal after it, or replays everything
+    /// if there is no snapshot to load.
+    ///
+    /// # Errors
+    /// Fails if the journal is unreadable. A snapshot that will not parse is
+    /// reported, not skipped: silently falling back to a full replay would hide
+    /// a corrupt snapshot for as long as the venue kept running.
+    pub fn recover(&mut self, snapshot_path: Option<&Path>) -> io::Result<u64> {
+        let loaded = match snapshot_path {
+            Some(path) if path.exists() => Some(
+                Snapshot::read_from(&mut File::open(path)?)
+                    .map_err(|e| io::Error::other(e.to_string()))?,
+            ),
+            _ => None,
+        };
+        let replayed = match loaded {
+            Some(snapshot) => self.venue.recover_from(&snapshot),
+            None => self.venue.recover(),
+        };
+        replayed.map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// One pass: accept, read, apply as a group, commit, write.

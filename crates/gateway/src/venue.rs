@@ -14,6 +14,7 @@
 use bx_journal::{LogStorage, Result};
 use bx_pipeline::hub::{Channel, Hub, Resume};
 use bx_pipeline::instrument::Instruments;
+use bx_pipeline::snapshot::Snapshot;
 use bx_pipeline::{Exchange, book::Book};
 use bx_protocol::{Command, Event, Sequence, SymbolId};
 
@@ -71,6 +72,20 @@ impl<S: LogStorage> Venue<S> {
         amount: u64,
     ) -> Result<()> {
         self.exchange.deposit(account, asset, amount)
+    }
+
+    /// Captures state as of the current journal position.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        self.exchange.snapshot()
+    }
+
+    /// Restores a snapshot and replays only the journal after it.
+    ///
+    /// # Errors
+    /// Fails if the journal is unreadable, corrupt, or has a gap.
+    pub fn recover_from(&mut self, snapshot: &Snapshot) -> Result<u64> {
+        self.exchange.recover_from(snapshot)
     }
 
     /// Replays the journal, rebuilding state after a restart.
