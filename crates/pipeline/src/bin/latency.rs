@@ -579,7 +579,7 @@ fn replicated(sink: &mut u64, batch: usize) -> Vec<f64> {
         ));
         let local = FileLog::open(&path).unwrap();
         let log =
-            ReplicatedLog::connect(local, std::slice::from_ref(&address), ACK_TIMEOUT).unwrap();
+            ReplicatedLog::connect(local, std::slice::from_ref(&address), ACK_TIMEOUT, 1).unwrap();
         let mut exchange = Exchange::new(log, instruments).unwrap();
         for account in 1..=16 {
             exchange.deposit(account, USD, u64::MAX).unwrap();

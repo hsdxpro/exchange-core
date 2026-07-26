@@ -159,6 +159,10 @@ pub struct Config {
     pub replicas: Vec<String>,
     /// How long the leader waits for a follower to confirm.
     pub ack_timeout: Duration,
+    /// This leader's term. Must increase every time leadership moves: followers
+    /// refuse an older one, which is what stops a replaced leader writing.
+    /// Whatever performs the promotion owns this number.
+    pub term: u64,
     /// Ceiling on the memory the subscription feed may hold. Checked against
     /// what the retention window actually costs, so a venue refuses to start
     /// rather than being killed under load.
@@ -191,6 +195,7 @@ impl Config {
         let mut max_records = None;
         let mut max_sessions = None;
         let mut ack_timeout_ms = None;
+        let mut term = None;
         let mut max_feed_memory_mb = None;
         let mut replicas = Vec::new();
         let mut drafts: Vec<InstrumentDraft> = Vec::new();
@@ -270,6 +275,7 @@ impl Config {
                 "max_records_per_session" => max_records = Some(number("max_records_per_session")?),
                 "max_sessions" => max_sessions = Some(number("max_sessions")?),
                 "ack_timeout_ms" => ack_timeout_ms = Some(number("ack_timeout_ms")?),
+                "term" => term = Some(number("term")?),
                 "max_feed_memory_mb" => max_feed_memory_mb = Some(number("max_feed_memory_mb")?),
                 "replica" => replicas.push(value.to_string()),
                 // Not ignored. A key nobody reads means the venue is running
@@ -360,6 +366,9 @@ impl Config {
                 .map_err(|_| ConfigError::whole_file("max_sessions is too large"))?,
             replicas,
             ack_timeout: Duration::from_millis(ack_timeout_ms),
+            // Defaults to one: a lone leader that never fails over still has a
+            // term, and it is the same every restart.
+            term: term.unwrap_or(1),
             max_feed_memory: budget,
             instruments,
         })
@@ -414,6 +423,7 @@ max_open_orders = 1000000
         assert_eq!(config.max_records_per_session, 4_096);
         assert_eq!(config.max_sessions, 4_096);
         assert_eq!(config.ack_timeout, Duration::from_millis(250));
+        assert_eq!(config.term, 1, "a term is not required of a lone leader");
         assert_eq!(config.max_feed_memory, 64 * 1024 * 1024);
         assert_eq!(config.replicas, vec!["10.0.0.2:7100", "10.0.0.3:7100"]);
 

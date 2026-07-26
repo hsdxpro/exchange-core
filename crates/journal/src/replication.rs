@@ -19,14 +19,28 @@
 //! `openraft` rather than a few hundred lines written here. What this does give
 //! is the durability and throughput half — the part the measurement showed
 //! matters — with an explicit boundary where the election belongs.
+//!
+//! It does, however, **fence**. Every group carries the leader's term, and a
+//! follower refuses anything from a term older than the highest it has seen. That
+//! is what makes a promotion safe whoever performs it: a leader that has been
+//! replaced cannot keep writing, so two leaders cannot acknowledge orders into
+//! divergent logs. Without it, election would be the *second* thing missing and
+//! the first would be silent corruption -- a partitioned leader appending happily
+//! to followers that already have a newer one.
 
 use crate::{LogStorage, RECORD_LEN};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-/// A follower's reply: how many bytes it now holds.
-const ACK_LEN: usize = size_of::<u64>();
+/// A follower's reply: the highest term it has seen, then the bytes it holds.
+///
+/// The term comes back so a deposed leader finds out. It asked for a quorum and
+/// is told, by the followers themselves, that someone newer has taken over.
+const ACK_LEN: usize = 2 * size_of::<u64>();
+
+/// A group's header: the leader's term, then the byte count.
+const HEADER_LEN: usize = size_of::<u64>() + size_of::<u32>();
 
 /// One follower, as the leader sees it.
 #[derive(Debug)]
@@ -50,6 +64,12 @@ pub struct ReplicatedLog<L: LogStorage> {
     quorum: usize,
     /// Bytes appended since the last sync, awaiting replication.
     pending: Vec<u8>,
+    /// This leader's term. Monotonic across promotions, and the only thing that
+    /// lets a follower tell a current leader from a replaced one.
+    term: u64,
+    /// Set once a follower reports a newer term. A deposed leader stops
+    /// acknowledging rather than continuing to write.
+    deposed: bool,
 }
 
 impl<L: LogStorage> ReplicatedLog<L> {
@@ -70,9 +90,17 @@ impl<L: LogStorage> ReplicatedLog<L> {
     /// the cluster actually runs on; a value below the real round trip turns
     /// healthy followers into dead ones.
     ///
+    /// `term` must increase every time leadership moves. Whatever performs the
+    /// promotion owns that number; this only enforces it.
+    ///
     /// # Errors
     /// Fails if a follower cannot be reached.
-    pub fn connect(local: L, addresses: &[String], ack_timeout: Duration) -> io::Result<Self> {
+    pub fn connect(
+        local: L,
+        addresses: &[String],
+        ack_timeout: Duration,
+        term: u64,
+    ) -> io::Result<Self> {
         let mut followers = Vec::with_capacity(addresses.len());
         for address in addresses {
             let stream = TcpStream::connect(address)?;
@@ -88,6 +116,8 @@ impl<L: LogStorage> ReplicatedLog<L> {
             followers,
             quorum,
             pending: Vec::new(),
+            term,
+            deposed: false,
         })
     }
 
@@ -103,14 +133,35 @@ impl<L: LogStorage> ReplicatedLog<L> {
         self.followers.iter().filter(|f| f.live).count()
     }
 
+    /// True once a follower has reported a newer term.
+    ///
+    /// A deposed leader must stop: it cannot reach a quorum any more, and
+    /// pretending otherwise would acknowledge orders the cluster has not kept.
+    #[must_use]
+    pub const fn deposed(&self) -> bool {
+        self.deposed
+    }
+
+    #[must_use]
+    pub const fn term(&self) -> u64 {
+        self.term
+    }
+
     /// Sends the pending bytes to every live follower and waits for a quorum.
     fn replicate(&mut self) -> io::Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        if self.deposed {
+            return Err(io::Error::other(
+                "this leader has been replaced by a newer term and cannot acknowledge",
+            ));
+        }
         let length = u32::try_from(self.pending.len())
             .map_err(|_| io::Error::other("replication group too large"))?;
-        let header = length.to_le_bytes();
+        let mut header = [0_u8; HEADER_LEN];
+        header[..8].copy_from_slice(&self.term.to_le_bytes());
+        header[8..].copy_from_slice(&length.to_le_bytes());
 
         for follower in self.followers.iter_mut().filter(|f| f.live) {
             if follower.stream.write_all(&header).is_err()
@@ -128,10 +179,24 @@ impl<L: LogStorage> ReplicatedLog<L> {
             // the live set, and counted as a missing confirmation rather than
             // waited on.
             if follower.stream.read_exact(&mut ack).is_ok() {
-                confirmed += 1;
+                let seen = u64::from_le_bytes(ack[..8].try_into().unwrap_or_default());
+                if seen > self.term {
+                    // A follower has a newer leader. This one is finished, and
+                    // saying so is the whole point of fencing.
+                    self.deposed = true;
+                    follower.live = false;
+                } else {
+                    confirmed += 1;
+                }
             } else {
                 follower.live = false;
             }
+        }
+
+        if self.deposed {
+            return Err(io::Error::other(
+                "a follower reported a newer term; this leader has been replaced",
+            ));
         }
 
         if confirmed < self.quorum {
@@ -173,7 +238,10 @@ impl<L: LogStorage> LogStorage for ReplicatedLog<L> {
 /// The follower side: accept a leader, append what it sends, confirm.
 #[derive(Debug)]
 pub struct Replica<L: LogStorage> {
-    log: L,
+    pub(crate) log: L,
+    /// Highest leader term this follower has accepted. Anything older is refused,
+    /// which is what stops a replaced leader appending over a newer one's data.
+    highest_term: u64,
     /// Set when the follower should also flush before confirming. Off by
     /// default: a quorum in memory on separate machines is what the leader is
     /// buying, and making each follower wait on its own disk hands back exactly
@@ -188,6 +256,7 @@ impl<L: LogStorage> Replica<L> {
     pub const fn new(log: L, flush_before_ack: bool) -> Self {
         Self {
             log,
+            highest_term: 0,
             flush_before_ack,
             held: 0,
         }
@@ -199,13 +268,19 @@ impl<L: LogStorage> Replica<L> {
         self.held
     }
 
+    /// Highest leader term accepted.
+    #[must_use]
+    pub const fn highest_term(&self) -> u64 {
+        self.highest_term
+    }
+
     /// Serves one leader until it disconnects.
     ///
     /// # Errors
     /// Fails on an I/O error that is not the leader simply going away.
     pub fn serve(&mut self, stream: &mut TcpStream) -> io::Result<()> {
         stream.set_nodelay(true)?;
-        let mut header = [0_u8; size_of::<u32>()];
+        let mut header = [0_u8; HEADER_LEN];
         let mut group = Vec::new();
 
         loop {
@@ -214,7 +289,24 @@ impl<L: LogStorage> Replica<L> {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e),
             }
-            let length = u32::from_le_bytes(header) as usize;
+            let term = u64::from_le_bytes(header[..8].try_into().unwrap_or_default());
+            let length = u32::from_le_bytes(header[8..].try_into().unwrap_or_default()) as usize;
+
+            if term < self.highest_term {
+                // A leader that has been replaced. Refusing loudly rather than
+                // ignoring it: the connection ends, and the reply tells it which
+                // term won so it learns why.
+                let mut reply = [0_u8; ACK_LEN];
+                reply[..8].copy_from_slice(&self.highest_term.to_le_bytes());
+                reply[8..].copy_from_slice(&self.held.to_le_bytes());
+                let _ = stream.write_all(&reply);
+                return Err(io::Error::other(format!(
+                    "leader term {term} is older than {}, refusing",
+                    self.highest_term
+                )));
+            }
+            self.highest_term = term;
+
             if length == 0 || !length.is_multiple_of(RECORD_LEN) {
                 return Err(io::Error::other(
                     "leader sent a group that is not whole records",
@@ -228,7 +320,11 @@ impl<L: LogStorage> Replica<L> {
                 self.log.sync()?;
             }
             self.held += length as u64;
-            stream.write_all(&self.held.to_le_bytes())?;
+
+            let mut reply = [0_u8; ACK_LEN];
+            reply[..8].copy_from_slice(&self.highest_term.to_le_bytes());
+            reply[8..].copy_from_slice(&self.held.to_le_bytes());
+            stream.write_all(&reply)?;
         }
     }
 
@@ -252,6 +348,8 @@ mod tests {
     /// Generous for loopback, short enough that the hung-follower test does not
     /// slow the suite down.
     const ACK_TIMEOUT: Duration = Duration::from_millis(250);
+    /// Any term will do for the tests that are not about fencing.
+    const TERM: u64 = 7;
 
     fn command(order_id: u64) -> Command {
         Command::new(
@@ -305,6 +403,7 @@ mod tests {
             MemoryLog::new(),
             std::slice::from_ref(&replica.address),
             ACK_TIMEOUT,
+            TERM,
         )
         .unwrap();
         // Two machines: a majority of two is two, so the one follower must
@@ -332,6 +431,7 @@ mod tests {
             MemoryLog::new(),
             std::slice::from_ref(&replica.address),
             ACK_TIMEOUT,
+            TERM,
         )
         .unwrap();
         let mut journal = Journal::open(log).unwrap();
@@ -354,6 +454,7 @@ mod tests {
             MemoryLog::new(),
             &[first.address.clone(), second.address.clone()],
             ACK_TIMEOUT,
+            TERM,
         )
         .unwrap();
         // Three machines: a majority is two, so one confirmation besides the
@@ -374,7 +475,7 @@ mod tests {
 
     #[test]
     fn a_lone_leader_needs_no_confirmations() {
-        let log = ReplicatedLog::connect(MemoryLog::new(), &[], ACK_TIMEOUT).unwrap();
+        let log = ReplicatedLog::connect(MemoryLog::new(), &[], ACK_TIMEOUT, TERM).unwrap();
         assert_eq!(log.quorum(), 0);
         assert_eq!(log.live_followers(), 0);
         let mut journal = Journal::open(log).unwrap();
@@ -390,15 +491,18 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         let follower = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut header = [0_u8; size_of::<u32>()];
+            let mut header = [0_u8; HEADER_LEN];
             stream.read_exact(&mut header).unwrap();
-            let length = u32::from_le_bytes(header) as usize;
+            let length = u32::from_le_bytes(header[8..].try_into().unwrap()) as usize;
             let mut group = vec![0_u8; length];
             stream.read_exact(&mut group).unwrap();
-            stream.write_all(&(length as u64).to_le_bytes()).unwrap();
+            let mut reply = [0_u8; ACK_LEN];
+            reply[..8].copy_from_slice(&TERM.to_le_bytes());
+            reply[8..].copy_from_slice(&(length as u64).to_le_bytes());
+            stream.write_all(&reply).unwrap();
         });
 
-        let log = ReplicatedLog::connect(MemoryLog::new(), &[address], ACK_TIMEOUT).unwrap();
+        let log = ReplicatedLog::connect(MemoryLog::new(), &[address], ACK_TIMEOUT, TERM).unwrap();
         let mut journal = Journal::open(log).unwrap();
         journal.append(&mut command(1)).unwrap();
         journal.sync().unwrap();
@@ -426,7 +530,7 @@ mod tests {
             drop(stream);
         });
 
-        let log = ReplicatedLog::connect(MemoryLog::new(), &[address], ACK_TIMEOUT).unwrap();
+        let log = ReplicatedLog::connect(MemoryLog::new(), &[address], ACK_TIMEOUT, TERM).unwrap();
         let mut journal = Journal::open(log).unwrap();
         journal.append(&mut command(1)).unwrap();
 
@@ -446,6 +550,85 @@ mod tests {
     }
 
     #[test]
+    fn a_replaced_leader_is_refused_and_learns_that_it_was() {
+        // The failure fencing exists to prevent: a leader that has been replaced
+        // keeps writing, and followers accept it, so two leaders acknowledge
+        // orders into logs that diverge. Election is not built yet, but a
+        // promotion performed by any means has to be safe.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let follower = thread::spawn(move || {
+            let mut replica = Replica::new(MemoryLog::new(), false);
+            // Two leaders in turn: term 9 takes over, then term 4 tries.
+            let _ = replica.serve_one(&listener);
+            let result = replica.serve_one(&listener);
+            (result.is_err(), replica.highest_term(), replica.held())
+        });
+
+        // The newer leader writes first and is accepted.
+        {
+            let log = ReplicatedLog::connect(
+                MemoryLog::new(),
+                std::slice::from_ref(&address),
+                ACK_TIMEOUT,
+                9,
+            )
+            .unwrap();
+            let mut journal = Journal::open(log).unwrap();
+            journal.append(&mut command(1)).unwrap();
+            journal.sync().unwrap();
+        }
+
+        // The stale one reconnects and must be turned away.
+        let stale = ReplicatedLog::connect(MemoryLog::new(), &[address], ACK_TIMEOUT, 4).unwrap();
+        let mut journal = Journal::open(stale).unwrap();
+        journal.append(&mut command(2)).unwrap();
+        let outcome = journal.sync();
+
+        let (refused, highest, held) = follower.join().unwrap();
+        assert!(refused, "the follower accepted a replaced leader");
+        assert!(
+            outcome.is_err(),
+            "a replaced leader acknowledged a group anyway"
+        );
+        assert_eq!(highest, 9, "the follower forgot which term won");
+        assert_eq!(
+            held, RECORD_LEN as u64,
+            "the stale leader's write reached the follower's log"
+        );
+    }
+
+    #[test]
+    fn a_newer_term_takes_over_from_an_older_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let follower = thread::spawn(move || {
+            let mut replica = Replica::new(MemoryLog::new(), false);
+            let _ = replica.serve_one(&listener);
+            let _ = replica.serve_one(&listener);
+            (replica.highest_term(), replica.held())
+        });
+
+        for term in [3_u64, 8] {
+            let log = ReplicatedLog::connect(
+                MemoryLog::new(),
+                std::slice::from_ref(&address),
+                ACK_TIMEOUT,
+                term,
+            )
+            .unwrap();
+            assert_eq!(log.term(), term);
+            let mut journal = Journal::open(log).unwrap();
+            journal.append(&mut command(term)).unwrap();
+            journal.sync().unwrap();
+        }
+
+        let (highest, held) = follower.join().unwrap();
+        assert_eq!(highest, 8, "the follower did not adopt the newer term");
+        assert_eq!(held, 2 * RECORD_LEN as u64, "both leaders' groups are held");
+    }
+
+    #[test]
     fn the_replica_refuses_a_group_that_is_not_whole_records() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -457,6 +640,7 @@ mod tests {
         let mut leader = TcpStream::connect(address).unwrap();
         // A length that is not a whole number of records: corruption, or a peer
         // speaking a different protocol version.
+        leader.write_all(&TERM.to_le_bytes()).unwrap();
         leader.write_all(&30_u32.to_le_bytes()).unwrap();
         leader.write_all(&[0_u8; 30]).unwrap();
         drop(leader);
@@ -474,6 +658,7 @@ mod tests {
             MemoryLog::new(),
             std::slice::from_ref(&replica.address),
             ACK_TIMEOUT,
+            TERM,
         )
         .unwrap();
         let mut journal = Journal::open(log).unwrap();

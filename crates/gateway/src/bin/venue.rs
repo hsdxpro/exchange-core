@@ -47,6 +47,7 @@ fn measurement_config() -> Config {
         max_sessions: 4_096,
         replicas: Vec::new(),
         ack_timeout: Duration::from_millis(250),
+        term: 1,
         max_feed_memory: 64 * 1024 * 1024,
         instruments,
     }
@@ -137,7 +138,7 @@ fn start(config: &Config) -> std::io::Result<()> {
             } else {
                 run(
                     config,
-                    ReplicatedLog::connect(log, &config.replicas, config.ack_timeout)?,
+                    ReplicatedLog::connect(log, &config.replicas, config.ack_timeout, config.term)?,
                     fresh,
                 )
             }
@@ -145,7 +146,12 @@ fn start(config: &Config) -> std::io::Result<()> {
         None if config.replicas.is_empty() => run(config, MemoryLog::new(), true),
         None => run(
             config,
-            ReplicatedLog::connect(MemoryLog::new(), &config.replicas, config.ack_timeout)?,
+            ReplicatedLog::connect(
+                MemoryLog::new(),
+                &config.replicas,
+                config.ack_timeout,
+                config.term,
+            )?,
             true,
         ),
     }
