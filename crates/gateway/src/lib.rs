@@ -6,9 +6,11 @@
 //! what a socket is.
 
 pub mod codec;
+pub mod config;
 pub mod tcp;
 pub mod venue;
 
 pub use codec::{Decoder, FRAME_LEN, encode};
+pub use config::Config;
 pub use tcp::Server;
 pub use venue::Venue;

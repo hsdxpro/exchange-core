@@ -1,0 +1,505 @@
+//! Deployment configuration.
+//!
+//! Everything a deployment needs to change without a recompile: what to listen
+//! on, where the journal and snapshot live, how long a restart may take, how
+//! much feed to retain, and which instruments are listed.
+//!
+//! Parsed by hand rather than with `serde`. The format is `key = value` lines
+//! and `[instrument]` blocks, which is a hundred lines of parser against a
+//! dependency tree of a few hundred crates, and this project has exactly one
+//! dependency. If the format ever needs to nest, that trade changes.
+//!
+//! Two rules the parser follows that matter more than the format:
+//!
+//! - **An unknown key is an error.** A misspelled key that is silently ignored
+//!   means the venue runs with a default nobody chose, and the operator has no
+//!   way to tell. That is a classic outage.
+//! - **Every value is validated at startup.** A zero retention window or an
+//!   empty instrument list should stop the venue before it accepts an order, not
+//!   surface as strange behaviour under load.
+
+use bx_pipeline::instrument::{Instrument, Instruments, MAX_OPEN_ORDERS_LIMIT};
+use bx_protocol::Ticks;
+use std::fmt;
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ConfigError {
+    /// Line the problem is on, 1-based. Zero for a problem with the file as a
+    /// whole, such as a missing setting.
+    pub line: usize,
+    pub message: String,
+}
+
+impl ConfigError {
+    fn at(line: usize, message: impl Into<String>) -> Self {
+        Self {
+            line,
+            message: message.into(),
+        }
+    }
+
+    fn whole_file(message: impl Into<String>) -> Self {
+        Self::at(0, message)
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.line == 0 {
+            write!(f, "config: {}", self.message)
+        } else {
+            write!(f, "config line {}: {}", self.line, self.message)
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+type Result<T> = std::result::Result<T, ConfigError>;
+
+/// One listed instrument, before validation.
+#[derive(Debug, Default)]
+struct InstrumentDraft {
+    line: usize,
+    symbol: Option<u32>,
+    base: Option<u32>,
+    quote: Option<u32>,
+    floor_ticks: Option<Ticks>,
+    max_quantity: Option<u64>,
+    max_open_orders: Option<u32>,
+}
+
+impl InstrumentDraft {
+    fn finish(self) -> Result<Instrument> {
+        let line = self.line;
+        let need = |value: Option<u64>, name: &str| -> Result<u64> {
+            value.ok_or_else(|| ConfigError::at(line, format!("instrument is missing {name}")))
+        };
+        let symbol = u32::try_from(need(self.symbol.map(u64::from), "symbol")?)
+            .map_err(|_| ConfigError::at(line, "symbol is out of range"))?;
+        let base = u32::try_from(need(self.base.map(u64::from), "base")?)
+            .map_err(|_| ConfigError::at(line, "base is out of range"))?;
+        let quote = u32::try_from(need(self.quote.map(u64::from), "quote")?)
+            .map_err(|_| ConfigError::at(line, "quote is out of range"))?;
+        let max_quantity = need(self.max_quantity, "max_quantity")?;
+        let max_open_orders = u32::try_from(need(
+            self.max_open_orders.map(u64::from),
+            "max_open_orders",
+        )?)
+        .map_err(|_| ConfigError::at(line, "max_open_orders is out of range"))?;
+        let floor_ticks = self
+            .floor_ticks
+            .ok_or_else(|| ConfigError::at(line, "instrument is missing floor_ticks"))?;
+
+        if base == quote {
+            return Err(ConfigError::at(
+                line,
+                "base and quote are the same asset, so the instrument trades nothing",
+            ));
+        }
+        if max_quantity == 0 {
+            return Err(ConfigError::at(
+                line,
+                "max_quantity of zero rejects every order",
+            ));
+        }
+        if max_open_orders == 0 {
+            return Err(ConfigError::at(
+                line,
+                "max_open_orders of zero rejects every order",
+            ));
+        }
+        if max_open_orders > MAX_OPEN_ORDERS_LIMIT {
+            return Err(ConfigError::at(
+                line,
+                format!("max_open_orders exceeds the engine's limit of {MAX_OPEN_ORDERS_LIMIT}"),
+            ));
+        }
+        Ok(Instrument::new(
+            symbol,
+            base,
+            quote,
+            floor_ticks,
+            max_quantity,
+            max_open_orders,
+        ))
+    }
+}
+
+/// A validated deployment configuration.
+#[derive(Debug)]
+pub struct Config {
+    pub listen: String,
+    /// None keeps the journal in memory, which is for measurement only.
+    pub journal: Option<PathBuf>,
+    pub snapshot: Option<PathBuf>,
+    /// How long a restart may take. Turned into a snapshot cadence with the
+    /// measured replay rate.
+    pub target_recovery: Duration,
+    /// Commands a second this machine replays at. Measured, not assumed.
+    pub replay_rate: u64,
+    pub retained_per_channel: usize,
+    pub max_records_per_session: usize,
+    /// Followers to replicate to. Empty means a lone leader.
+    pub replicas: Vec<String>,
+    /// How long the leader waits for a follower to confirm.
+    pub ack_timeout: Duration,
+    pub instruments: Instruments,
+}
+
+impl Config {
+    /// # Errors
+    /// Reports the first problem found, with the line it is on.
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut listen = None;
+        let mut journal = None;
+        let mut snapshot = None;
+        let mut target_recovery_ms = None;
+        let mut replay_rate = None;
+        let mut retained = None;
+        let mut max_records = None;
+        let mut ack_timeout_ms = None;
+        let mut replicas = Vec::new();
+        let mut drafts: Vec<InstrumentDraft> = Vec::new();
+
+        for (index, raw) in text.lines().enumerate() {
+            let line = index + 1;
+            let content = raw.split('#').next().unwrap_or("").trim();
+            if content.is_empty() {
+                continue;
+            }
+            if content == "[instrument]" {
+                drafts.push(InstrumentDraft {
+                    line,
+                    ..InstrumentDraft::default()
+                });
+                continue;
+            }
+
+            let Some((key, value)) = content.split_once('=') else {
+                return Err(ConfigError::at(line, "expected `key = value`"));
+            };
+            let key = key.trim();
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(ConfigError::at(line, format!("{key} has no value")));
+            }
+
+            let number = |name: &str| -> Result<u64> {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::at(line, format!("{name} must be a whole number")))
+            };
+
+            // Inside an instrument block, instrument keys win.
+            if let Some(draft) = drafts.last_mut() {
+                let claimed = match key {
+                    "symbol" => {
+                        draft.symbol = Some(number("symbol")? as u32);
+                        true
+                    }
+                    "base" => {
+                        draft.base = Some(number("base")? as u32);
+                        true
+                    }
+                    "quote" => {
+                        draft.quote = Some(number("quote")? as u32);
+                        true
+                    }
+                    "floor_ticks" => {
+                        draft.floor_ticks = Some(value.parse::<Ticks>().map_err(|_| {
+                            ConfigError::at(line, "floor_ticks must be a whole number")
+                        })?);
+                        true
+                    }
+                    "max_quantity" => {
+                        draft.max_quantity = Some(number("max_quantity")?);
+                        true
+                    }
+                    "max_open_orders" => {
+                        draft.max_open_orders = Some(number("max_open_orders")? as u32);
+                        true
+                    }
+                    _ => false,
+                };
+                if claimed {
+                    continue;
+                }
+            }
+
+            match key {
+                "listen" => listen = Some(value.to_string()),
+                "journal" => journal = Some(PathBuf::from(value)),
+                "snapshot" => snapshot = Some(PathBuf::from(value)),
+                "target_recovery_ms" => target_recovery_ms = Some(number("target_recovery_ms")?),
+                "replay_rate" => replay_rate = Some(number("replay_rate")?),
+                "retained_per_channel" => retained = Some(number("retained_per_channel")?),
+                "max_records_per_session" => max_records = Some(number("max_records_per_session")?),
+                "ack_timeout_ms" => ack_timeout_ms = Some(number("ack_timeout_ms")?),
+                "replica" => replicas.push(value.to_string()),
+                // Not ignored. A key nobody reads means the venue is running
+                // with a value the operator thinks they set.
+                other => {
+                    return Err(ConfigError::at(line, format!("unknown setting `{other}`")));
+                }
+            }
+        }
+
+        let required = |value: Option<u64>, name: &str| -> Result<u64> {
+            value.ok_or_else(|| ConfigError::whole_file(format!("{name} is not set")))
+        };
+        let target_recovery_ms = required(target_recovery_ms, "target_recovery_ms")?;
+        let replay_rate = required(replay_rate, "replay_rate")?;
+        let retained = required(retained, "retained_per_channel")?;
+        let max_records = required(max_records, "max_records_per_session")?;
+        let ack_timeout_ms = required(ack_timeout_ms, "ack_timeout_ms")?;
+
+        if drafts.is_empty() {
+            return Err(ConfigError::whole_file(
+                "no instruments listed, so the venue would accept nothing",
+            ));
+        }
+        for value in [
+            (target_recovery_ms, "target_recovery_ms"),
+            (replay_rate, "replay_rate"),
+            (retained, "retained_per_channel"),
+            (max_records, "max_records_per_session"),
+            (ack_timeout_ms, "ack_timeout_ms"),
+        ] {
+            if value.0 == 0 {
+                return Err(ConfigError::whole_file(format!(
+                    "{} must not be zero",
+                    value.1
+                )));
+            }
+        }
+
+        let mut instruments = Instruments::new();
+        let mut listed: Vec<u32> = Vec::new();
+        for draft in drafts {
+            let line = draft.line;
+            let instrument = draft.finish()?;
+            if listed.contains(&instrument.symbol) {
+                return Err(ConfigError::at(
+                    line,
+                    format!("symbol {} is listed twice", instrument.symbol),
+                ));
+            }
+            listed.push(instrument.symbol);
+            instruments.insert(instrument);
+        }
+
+        Ok(Self {
+            listen: listen.unwrap_or_else(|| "127.0.0.1:7070".to_string()),
+            journal,
+            snapshot,
+            target_recovery: Duration::from_millis(target_recovery_ms),
+            replay_rate,
+            retained_per_channel: usize::try_from(retained)
+                .map_err(|_| ConfigError::whole_file("retained_per_channel is too large"))?,
+            max_records_per_session: usize::try_from(max_records)
+                .map_err(|_| ConfigError::whole_file("max_records_per_session is too large"))?,
+            replicas,
+            ack_timeout: Duration::from_millis(ack_timeout_ms),
+            instruments,
+        })
+    }
+
+    /// # Errors
+    /// Fails if the file cannot be read, or is not a valid configuration.
+    pub fn read(path: &std::path::Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::whole_file(format!("cannot read {}: {e}", path.display())))?;
+        Self::parse(&text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID: &str = "\
+# The venue.
+listen = 127.0.0.1:7070
+journal = venue.log
+snapshot = venue.snap
+target_recovery_ms = 2000
+replay_rate = 7600000
+retained_per_channel = 65536
+max_records_per_session = 4096
+ack_timeout_ms = 250
+replica = 10.0.0.2:7100
+replica = 10.0.0.3:7100
+
+[instrument]
+symbol = 1
+base = 1
+quote = 2
+floor_ticks = 10000
+max_quantity = 1000000
+max_open_orders = 1000000
+";
+
+    #[test]
+    fn a_valid_configuration_parses_completely() {
+        let config = Config::parse(VALID).unwrap();
+        assert_eq!(config.listen, "127.0.0.1:7070");
+        assert_eq!(config.journal, Some(PathBuf::from("venue.log")));
+        assert_eq!(config.snapshot, Some(PathBuf::from("venue.snap")));
+        assert_eq!(config.target_recovery, Duration::from_secs(2));
+        assert_eq!(config.replay_rate, 7_600_000);
+        assert_eq!(config.retained_per_channel, 65_536);
+        assert_eq!(config.max_records_per_session, 4_096);
+        assert_eq!(config.ack_timeout, Duration::from_millis(250));
+        assert_eq!(config.replicas, vec!["10.0.0.2:7100", "10.0.0.3:7100"]);
+
+        let listed: Vec<u32> = config.instruments.iter().map(|i| i.symbol).collect();
+        assert_eq!(listed, vec![1]);
+        let instrument = config.instruments.get(1).unwrap();
+        assert_eq!(instrument.floor_ticks, 10_000);
+        assert_eq!(instrument.max_open_orders, 1_000_000);
+    }
+
+    #[test]
+    fn comments_and_blank_lines_are_ignored() {
+        let text = format!("{VALID}\n# trailing comment\n\n   \n");
+        assert!(Config::parse(&text).is_ok());
+    }
+
+    #[test]
+    fn a_misspelled_setting_is_refused_rather_than_ignored() {
+        // Silently ignoring this means the venue runs with a retention window
+        // the operator believes they changed.
+        let text = VALID.replace("retained_per_channel", "retained_per_chanel");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(error.message.contains("unknown setting"), "got {error}");
+        assert!(error.line > 0, "the error should name the line");
+    }
+
+    #[test]
+    fn a_missing_setting_names_itself() {
+        let text = VALID
+            .lines()
+            .filter(|l| !l.starts_with("ack_timeout_ms"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = Config::parse(&text).unwrap_err();
+        assert_eq!(error.message, "ack_timeout_ms is not set");
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_number_is_refused() {
+        let text = VALID.replace("replay_rate = 7600000", "replay_rate = fast");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(error.message.contains("whole number"), "got {error}");
+    }
+
+    #[test]
+    fn zero_is_refused_where_it_would_break_the_venue() {
+        for setting in [
+            "target_recovery_ms",
+            "replay_rate",
+            "retained_per_channel",
+            "max_records_per_session",
+            "ack_timeout_ms",
+        ] {
+            let text = VALID
+                .lines()
+                .map(|line| {
+                    if line.starts_with(setting) {
+                        format!("{setting} = 0")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let error = Config::parse(&text).unwrap_err();
+            assert!(
+                error.message.contains("must not be zero"),
+                "{setting}: got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_venue_with_no_instruments_is_refused() {
+        let text: String = VALID
+            .lines()
+            .take_while(|l| !l.starts_with("[instrument]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(error.message.contains("no instruments"), "got {error}");
+    }
+
+    #[test]
+    fn the_same_symbol_listed_twice_is_refused() {
+        let text = format!(
+            "{VALID}
+[instrument]
+symbol = 1
+base = 3
+quote = 4
+floor_ticks = 500
+max_quantity = 10
+max_open_orders = 10
+"
+        );
+        let error = Config::parse(&text).unwrap_err();
+        assert!(error.message.contains("listed twice"), "got {error}");
+    }
+
+    #[test]
+    fn an_instrument_that_trades_an_asset_against_itself_is_refused() {
+        let text = VALID.replace("quote = 2", "quote = 1");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(error.message.contains("same asset"), "got {error}");
+    }
+
+    #[test]
+    fn an_incomplete_instrument_names_what_is_missing() {
+        let text = VALID
+            .lines()
+            .filter(|l| !l.starts_with("floor_ticks"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(error.message.contains("floor_ticks"), "got {error}");
+    }
+
+    #[test]
+    fn an_order_pool_beyond_the_engines_limit_is_refused() {
+        let text = VALID.replace("max_open_orders = 1000000", "max_open_orders = 4294967295");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(error.message.contains("engine's limit"), "got {error}");
+    }
+
+    #[test]
+    fn a_negative_floor_price_is_allowed_because_prices_are_signed() {
+        let text = VALID.replace("floor_ticks = 10000", "floor_ticks = -5000");
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.instruments.get(1).unwrap().floor_ticks, -5_000);
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_setting_is_refused() {
+        let text = format!("{VALID}\nthis is not a setting\n");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(error.message.contains("key = value"), "got {error}");
+    }
+
+    #[test]
+    fn an_in_memory_journal_is_expressed_by_leaving_it_out() {
+        let text = VALID
+            .lines()
+            .filter(|l| !l.starts_with("journal") && !l.starts_with("snapshot"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = Config::parse(&text).unwrap();
+        assert!(config.journal.is_none());
+        assert!(config.snapshot.is_none());
+    }
+}
