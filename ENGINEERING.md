@@ -12,7 +12,7 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**302 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**307 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
@@ -28,7 +28,8 @@ timing is not evidence of anything.
 | over sockets | 17 | Real TCP: split records, disconnects, bursts, selective subscription, top-of-book. |
 | top of book | 13 | What the cheap feed does not send, which is the whole point of it. |
 | venue snapshots | 7 | Cadence from a recovery target, atomic replace, corrupt snapshot refused. |
-| failover | 2 | Real processes: promotion recovers acked records, no majority means no service. |
+| failover | 3 | Real processes: a cluster elects its own leader and replaces it when it dies with nobody editing a file, promotion recovers acked records, no majority means no service. |
+| `bx-election` | 4 | Three nodes electing one leader, a higher term after a death, a minority electing nobody, and a vote that survives a restart. |
 | idle cost | 2 | An idle connection stays under 120 ns a pass. |
 | many clients | 1 | A million accounts, and the memory that costs. |
 | admission | 20 | Real sockets: an unproven order never reaches the book, a captured proof does not open the next connection, a flood is cut to its allowance, a refusal is counted against its reason, an acknowledgement carries when the venue saw the order. |
@@ -58,19 +59,21 @@ command: sequence, journal append, durability, reserve, match, emit.
 
 | Path | ns |
 |---|---:|
-| passive limit order | 157 |
-| crossing order, one fill | 159 |
-| crossing, self-match check running | 162 |
-| cancel by order id | 75 |
-| mixed stream | 161 |
-| mixed stream, three subscribers attached | 160 |
-| mixed stream, batch 64 | 142 |
+| passive limit order | 188 |
+| crossing order, one fill | 224 |
+| crossing, self-match check running | 187 |
+| cancel by order id | 106 |
+| mixed stream | 171 |
+| mixed stream, three subscribers attached | 182 |
+| mixed stream, batch 64 | 171 |
 
-Two of those are worth reading twice. **Fan-out to three channels is free** at
-this resolution -- 160 against 161 -- because publishing is a bounded ring write
-and nothing else. And **self-match prevention costs 3 ns** on the crossing path,
-because an account with nothing resting answers the question in one hash lookup
-and never touches the book.
+The crossing and cancel rows read **3,036 ns and 447 ns** until the per-account
+open-order index stopped being searched linearly; the table above is after.
+
+**Fan-out to three channels costs 11 ns**, because publishing is a bounded ring
+write and nothing else. An earlier version of this table reported it as free,
+which was true only at the resolution of a noisier machine — it is small, not
+absent, and saying "free" invites somebody to attach a thousand.
 
 These figures drift 2-3x on a loaded machine. The numbers above are from a quiet
 one; anything measured while a build is running is worthless.
@@ -79,15 +82,15 @@ one; anything measured while a build is running is worthless.
 
 | group | local fsync | quorum on loopback |
 |---|---:|---:|
-| 1 | 318 cmd/sec | 19,644 cmd/sec |
-| 16 | 5,128 | 274,296 |
-| 256 | 78,471 | 1,974,452 |
-| 4,096 | 1,080,376 | 5,299,407 |
-| 16,384 | **2,975,883** | **6,222,727** |
+| 1 | 321 cmd/sec | 15,596 cmd/sec |
+| 16 | 4,779 | 237,830 |
+| 256 | 77,989 | 1,477,527 |
+| 4,096 | 957,952 | 5,390,966 |
+| 16,384 | **2,344,665** | **4,646,905** |
 
 **Millions per second, durably, is reached.** At a group of 16,384 the quorum path
-costs 161 ns per command, which *is* the compute cost from the table above:
-durability has become free, and the venue is bound by matching again.
+costs 215 ns per command, which is roughly the compute cost from the table above:
+durability has become nearly free, and the venue is bound by matching again.
 
 Getting there needed a fix, not a bigger batch. Group commit was half-done: one
 sync per group, but `FileLog::append` still issued one `write` syscall per
@@ -105,32 +108,37 @@ and falls to one when the venue is idle and latency does.
 
 `venue` and `load` as separate processes over loopback TCP.
 
-| | one pipelined client | 32 concurrent clients |
+All three durability shapes, 200,000 orders each, measured in one sitting so the
+rows are comparable with each other rather than with an earlier machine.
+
+| durability | round trip, one in flight | pipelined |
 |---|---:|---:|
-| durable file journal | 662,951 orders/sec | **928,943 orders/sec** |
-| in-memory journal | 2,962,954 orders/sec | 1,745,152 orders/sec |
+| in-memory journal | 11.4 us | 1,796,009/sec |
+| durable file journal | 357 us | 1,560,998/sec |
+| quorum of two followers | **66.7 us** | **1,785,257/sec** |
 
-Concurrency helps exactly where there is a sync to amortise and costs where
-there is not. On the durable path more clients mean larger groups per pass, so
-32 of them beat one pipelined client by 1.4x. With the journal in memory there
-is nothing to amortise and 32 sockets only add syscalls, so the same test runs
-at 0.6x. That is the group-commit design working, and it is the reason nothing
-in the code picks a batch size.
+The round-trip column is where the design's argument lives: with one order in
+flight there is nothing to amortise a sync over, and reaching two other processes
+is 5.4x faster than reaching the platter. The pipelined column is where it stops
+mattering — once the group is thousands of orders the sync is shared by all of
+them and every row converges on what matching costs.
 
-Round trip, one order in flight: **9.0 us** in memory, **3,066 us** against a
-real file. The second is one fsync and matches the durability table above. The
-first is **not a durable number** and must not be quoted as one; the durable
-answer for a single order in flight is quorum, at 51 us.
+The in-memory round trip is **not a durable number** and must not be quoted as
+one; the durable answer for a single order in flight is the quorum, at 66.7 us.
+
+With eight concurrent clients against the replicated cluster: 1,532,482
+orders/sec, with the leader intact — the same load that used to stop it before a
+dropped follower could rejoin.
 
 ### Restart time
 
 | | |
 |---|---:|
-| replay all 100,000 commands | 12.0 ms |
-| snapshot + replay the last 5,000 | **1.3 ms** |
+| replay all 100,000 commands | 12.8 ms |
+| snapshot + replay the last 5,000 | **2.0 ms** |
 
-A 9x saving with 2,002 orders in the snapshot. What it saves depends entirely on
-the ratio between the journal and the resting book, since restoring costs one
+A 6.4x saving with 2,002 orders in the snapshot. What it saves depends entirely
+on the ratio between the journal and the resting book, since restoring costs one
 insert per resting order: a journal where nothing is ever cancelled saturates the
 book and the snapshot saves almost nothing.
 
@@ -202,7 +210,7 @@ planned cannot be checked against the code.
 | Between stages | one process, direct calls | SPSC ring buffers |
 | Encoding | hand-rolled fixed-layout structs via `zerocopy` | — |
 | Transport | TCP, unencrypted | raw UDP or shm for colo |
-| Consensus | quorum + term fencing, no election | `openraft`, **batching mandatory** — 33k writes/sec unbatched, 5.6M batched |
+| Consensus | quorum + term fencing on the data path, `openraft` electing the leader | — |
 | Journal I/O | buffered `std`, one write and one sync per group | `io_uring`, SQPOLL |
 
 QUIC was in this table's Built column while the code had none, which is the
@@ -371,33 +379,9 @@ Ordered by how much it matters.
 
 ## What is left
 
-Two, and both are their own piece of work rather than an afternoon.
+One, and it is its own piece of work rather than an afternoon.
 
-1. **Leader election.** Everything around it is built and tested by real
-   processes: a group is acknowledged once a majority holds it, a promoted node
-   catches up to the longest log a majority holds *before* it serves, and a
-   follower refuses a term older than the highest it has seen. What is missing
-   is only the half that notices a dead leader and picks the replacement.
-
-   That half is consensus and `openraft` should do it, because the failure mode
-   is two nodes each believing they lead, both acknowledging orders into logs
-   that never agree again. It was started and stopped deliberately: openraft
-   0.9.24 resolves and its type macro compiles against the leadership types, but
-   `RaftLogStorage` and `RaftStateMachine` together want fifteen methods, and
-   `RaftLogReader`, `RaftSnapshotBuilder`, `RaftNetworkFactory` and `RaftNetwork`
-   want eight more. On top of the traits it needs a log that holds
-   variable-length entries — `FileLog` is fixed 64-byte records and cannot back
-   it — an RPC transport for openraft's own message types, and a `tokio`
-   runtime.
-
-   The shape is settled and should not be rediscovered. openraft runs a
-   **separate leadership log** whose state machine holds one fact: who leads,
-   under what term. The command log stays exactly as it is, because routing it
-   through openraft would cost the fixed record and with it the zero-copy replay
-   and O(1) sequence seek. The elected term feeds the fencing that already
-   exists, and the new leader calls `catch_up` before serving.
-
-2. **Sharding across cores.** One book is single-writer by nature, so the
+1. **Sharding across cores.** One book is single-writer by nature, so the
    parallelism is across symbols -- but an account trading two of them shares
    one balance, which needs a two-stage account/symbol split rather than a lock.
    It touches replay determinism, snapshots and the golden hash, so it is a

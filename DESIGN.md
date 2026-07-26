@@ -65,9 +65,9 @@ distributed lock.
 **Ack once the order is on a majority of three journal nodes.** A crash then loses nothing
 a client was told we had.
 
-**Consensus: `openraft` — intended, not built.** What exists is quorum durability with term fencing: a group is acknowledged once a majority holds it, measured 59x faster than a local fsync, and a follower refuses a group from a replaced leader. So no acknowledged order is lost when a leader dies and no two leaders can diverge; what is missing is noticing and promoting automatically.
+**Consensus: `openraft`, built.** A node serves only while the cluster has elected it and stops the moment it has not, so a promotion needs no person. It runs a *separate* leadership log whose state machine holds one fact — who leads — and the command log never enters it: an openraft entry is variable-length and heterogeneous, so routing orders through it would cost the fixed 64-byte record and with it the zero-copy replay and O(1) sequence seek. What crosses the boundary is the term, which Raft already guarantees is unique per leader and is therefore a fencing token by construction. This is the CORFU and Aeron Cluster shape: consensus for leadership, plain leader-to-follower replication on the data path.
 
-**Why openraft when it is built.** `raft-rs` entered maintenance mode; openraft is where new Rust
+**Why openraft.** `raft-rs` entered maintenance mode; openraft is where new Rust
 work is pointed, and it is the consensus engine behind Databend in production.
 
 The number that decides the design: openraft handles **33k writes/sec for a single writer
@@ -272,7 +272,7 @@ reality.
 | Transport | TCP, unencrypted, `mio` readiness | raw UDP or shm for colo |
 | Gateway | sessions, framing, group commit, HMAC challenge, per-account rate limits | — |
 | Durability | group commit; quorum to followers, fenced by term | — |
-| Consensus | none: safe promotion, but no election | `openraft`, on a leadership log |
+| Consensus | `openraft`, on a separate leadership log | — |
 | Journal I/O | buffered `std`, one write and one sync per group | `io_uring`, SQPOLL |
 | Timestamps | `ingress_ns` journalled, `match_ns` on the ack | NIC hardware stamping |
 | Metrics | log-linear histograms, sampled every 64th pass | export to a scrape endpoint |
@@ -304,7 +304,7 @@ custom transport becomes the bottleneck.
 | Failure | Behaviour |
 |---|---|
 | Gateway dies | clients reconnect elsewhere, resume from `last_seq` |
-| Leader dies | The journal is already on a majority, so no acknowledged order is lost, and term fencing stops the old leader writing if it returns. Promotion is manual until election is built |
+| Leader dies | The cluster elects a replacement in about a second. The journal is already on a majority so no acknowledged order is lost, the new leader catches up to the longest log a majority holds before serving, and term fencing stops the old one writing if it returns |
 | One journal node dies | majority continues; degraded and alarmed |
 | Matching shard panics | deliberate abort with a state dump, restart from snapshot + replay |
 | Subscriber falls behind | ring overwrites, subscriber sees the gap and re-snapshots |

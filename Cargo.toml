@@ -6,6 +6,7 @@ members = [
     "crates/journal",
     "crates/pipeline",
     "crates/gateway",
+    "crates/election",
     "xtask",
 ]
 

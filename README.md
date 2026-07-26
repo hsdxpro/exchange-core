@@ -134,14 +134,20 @@ crates/protocol/   wire records: fixed 64-byte layouts, asserted at compile time
 crates/journal/    append-only log, replay, replication with term fencing.
 crates/pipeline/   sequencer, accounts, books, events, snapshots.
 crates/gateway/    framing, sessions, admission, group commit, the TCP server, config.
+crates/election/   leader election, on a leadership log the orders never touch.
 xtask/             the task runner.
 ```
 
-Thirty-three crates in the lockfile, and the engine has none of them: it forbids
-`unsafe` and depends on nothing. `protocol`, `journal` and `pipeline` use only
-`zerocopy` for fixed-layout casts. Everything else — `mio` for readiness, and
-`hmac`/`sha2`/`getrandom` for the challenge — is in `gateway` alone, so nothing
-on the matching path can reach a dependency.
+The engine has no dependencies at all: it forbids `unsafe` and stands alone.
+`protocol`, `journal` and `pipeline` use only `zerocopy` for fixed-layout casts.
+`mio` for readiness and `hmac`/`sha2`/`getrandom` for the challenge are in
+`gateway` alone, so nothing on the matching path can reach a dependency.
+
+The lockfile holds 156 crates and 123 of them arrived with one decision:
+`openraft` and `tokio`, in `crates/election`, which the `venue` binary uses and
+the gateway library does not. That is a real cost and it was paid on purpose —
+consensus is worth a hundred crates, and writing it is not. None of it can reach
+an order, because an order never enters it.
 
 [`DESIGN.md`](DESIGN.md) is the architecture. [`ENGINEERING.md`](ENGINEERING.md)
 is the decisions, what was rejected and why, and the bugs worth remembering.
@@ -208,19 +214,19 @@ resume from.
 than the highest it has seen, so a leader that has been replaced cannot keep
 writing and two leaders cannot acknowledge into logs that diverge.
 
+**Failover needs no person.** A node serves only while the cluster has elected
+it, and stops the moment it has not. Consensus is `openraft` rather than
+anything written here, because the failure mode is two nodes each believing they
+lead — but it runs a *separate* leadership log holding one fact, and the command
+log never goes near it. An openraft entry is variable-length and heterogeneous;
+routing orders through it would cost the fixed 64-byte record and with it the
+zero-copy replay and O(1) seek. What crosses the boundary is the term, which
+Raft already guarantees is unique per leader and therefore *is* a fencing token.
+
 ## What is deliberately not here
 
 Scope boundaries, with reasons rather than apologies:
 
-- **Automatic leader election.** Quorum durability is built and measured, and
-  fencing makes a promotion safe however it is performed — but detecting a dead
-  leader and promoting a replacement needs consensus, and that means `openraft`.
-  It belongs on a *separate* leadership log: an openraft entry is variable-length
-  and heterogeneous, so putting the command log through it would cost the
-  zero-copy replay and the O(1) seek that make a 2.0 ms restart possible. Started
-  and stopped deliberately: its storage and network traits want twenty-three
-  methods, a log for variable-length entries, and a `tokio` runtime, and a
-  half-built consensus layer is worse than none.
 - **Sharding across cores.** One book is single-writer by nature. Different
   symbols could run as independent engines, but an account trading two of them
   shares one balance, so that needs a two-stage account/symbol split rather than
@@ -241,7 +247,7 @@ Scope boundaries, with reasons rather than apologies:
 
 ## Correctness
 
-302 tests. The ones worth looking at:
+307 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed

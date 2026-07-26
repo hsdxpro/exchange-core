@@ -1,0 +1,20 @@
+[package]
+name = "bx-election"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Leader election, so a promotion needs no person"
+
+[dependencies]
+# Consensus, not written here. Electing a leader is the one place in this system
+# where being subtly wrong loses money quietly: the failure is two nodes each
+# believing they lead, both acknowledging orders, into logs that never agree
+# again. That is what a reviewed implementation exists to prevent.
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

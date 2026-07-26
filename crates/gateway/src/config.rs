@@ -190,10 +190,27 @@ pub struct Config {
     pub replicas: Vec<String>,
     /// How long the leader waits for a follower to confirm.
     pub ack_timeout: Duration,
-    /// This leader's term. Must increase every time leadership moves: followers
-    /// refuse an older one, which is what stops a replaced leader writing.
-    /// Whatever performs the promotion owns this number.
+    /// This leader's term, when nobody is electing one. Must increase every time
+    /// leadership moves: followers refuse an older one, which is what stops a
+    /// replaced leader writing.
+    ///
+    /// Ignored once `peers` is set, because then the term comes from the
+    /// election — which is the point of having one. A number a person types into
+    /// a file is a promotion that waits for a person.
     pub term: u64,
+    /// This node's identity in the leadership cluster.
+    pub node_id: u64,
+    /// Every node that may lead, this one included, as `id@address`.
+    ///
+    /// Empty means no election: the venue leads unconditionally on the `term`
+    /// above, which is the single-node and measurement shape. Non-empty means a
+    /// node serves only while it holds the leadership, and stops the moment it
+    /// does not.
+    pub peers: Vec<(u64, String)>,
+    /// Where this node's leadership state lives. Required when `peers` is set,
+    /// because a vote that does not survive a restart is a vote that can be cast
+    /// twice.
+    pub leadership_state: Option<PathBuf>,
     /// Ceiling on the memory the subscription feed may hold. Checked against
     /// what the retention window actually costs, so a venue refuses to start
     /// rather than being killed under load.
@@ -242,6 +259,9 @@ impl Config {
         let mut term = None;
         let mut max_feed_memory_mb = None;
         let mut authentication = None;
+        let mut node_id = None;
+        let mut leadership_state = None;
+        let mut peers: Vec<(u64, String)> = Vec::new();
         let mut timestamps = None;
         let mut rate = None;
         let mut burst = None;
@@ -360,6 +380,20 @@ impl Config {
                 "ack_timeout_ms" => ack_timeout_ms = Some(number("ack_timeout_ms")?),
                 "term" => term = Some(number("term")?),
                 "max_feed_memory_mb" => max_feed_memory_mb = Some(number("max_feed_memory_mb")?),
+                "node_id" => node_id = Some(number("node_id")?),
+                "leadership_state" => leadership_state = Some(PathBuf::from(value)),
+                "peer" => {
+                    let Some((id, address)) = value.split_once('@') else {
+                        return Err(ConfigError::at(
+                            line,
+                            "a peer is `id@address`, so a majority is counted over \n                             identities rather than over whoever happens to answer",
+                        ));
+                    };
+                    let id = id.trim().parse::<u64>().map_err(|_| {
+                        ConfigError::at(line, "a peer identity must be a whole number")
+                    })?;
+                    peers.push((id, address.trim().to_string()));
+                }
                 "replica" => replicas.push(value.to_string()),
                 "authentication" => {
                     authentication = Some(match value {
@@ -489,6 +523,37 @@ impl Config {
             ));
         }
 
+        // A cluster that cannot say which node it is, or where its vote is kept,
+        // is one that would either wait forever or forget what it voted.
+        if !peers.is_empty() {
+            let me = node_id.ok_or_else(|| {
+                ConfigError::whole_file("peers are listed but node_id is not set")
+            })?;
+            if !peers.iter().any(|(id, _)| *id == me) {
+                return Err(ConfigError::whole_file(format!(
+                    "node_id {me} is not among the peers, so this node could never \
+                     be elected and would wait forever"
+                )));
+            }
+            if leadership_state.is_none() {
+                return Err(ConfigError::whole_file(
+                    "peers are listed but leadership_state is not set; a vote that \
+                     does not survive a restart is a vote that can be cast twice, \
+                     and two leaders in one term is what an election exists to \
+                     prevent",
+                ));
+            }
+            let mut listed: Vec<u64> = peers.iter().map(|(id, _)| *id).collect();
+            listed.sort_unstable();
+            let duplicates = listed.len();
+            listed.dedup();
+            if listed.len() != duplicates {
+                return Err(ConfigError::whole_file(
+                    "two peers share an identity, so a majority could be counted twice",
+                ));
+            }
+        }
+
         // Both or neither: a rate without a burst refuses the opening quotes
         // every market maker sends, and a burst without a rate never refills.
         let rate_limit = match (rate, burst) {
@@ -539,6 +604,9 @@ impl Config {
             // Defaults to one: a lone leader that never fails over still has a
             // term, and it is the same every restart.
             term: term.unwrap_or(1),
+            node_id: node_id.unwrap_or(1),
+            peers,
+            leadership_state,
             max_feed_memory: budget,
             instruments,
         })

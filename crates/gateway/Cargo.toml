@@ -10,6 +10,10 @@ description = "Session handling, wire framing, and the group-commit loop"
 bx-protocol = { path = "../protocol" }
 bx-journal = { path = "../journal" }
 bx-pipeline = { path = "../pipeline" }
+# Used by the `venue` binary only, never by this library: it brings a consensus
+# implementation and an async runtime, and neither may come anywhere near the
+# matching path. The separation is enforced by the library not importing it.
+bx-election = { path = "../election" }
 zerocopy = { version = "0.8", features = ["derive"] }
 # Readiness notification: epoll on Linux, IOCP on Windows, kqueue on the BSDs.
 # Without it the loop reads every session every pass, which measured 428 ns per

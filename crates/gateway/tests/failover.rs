@@ -97,6 +97,20 @@ impl Process {
         false
     }
 
+    /// The term this node said it was elected under, if it said so.
+    ///
+    /// Read out of what the process printed rather than asked of it, because the
+    /// point is that the number came from an election the test did not arrange.
+    fn term_announced(&self) -> Option<u64> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line.strip_prefix("elected leader for term "))
+            .filter_map(|term| term.trim().parse().ok())
+            .next_back()
+    }
+
     fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -341,5 +355,184 @@ fn a_node_that_cannot_reach_a_majority_refuses_to_start() {
     assert!(
         node.exited_with_failure(Duration::from_secs(30)),
         "it should have exited with a failure rather than lingering"
+    );
+}
+
+/// A node in a cluster that elects its own leader: no term in the file, no
+/// person deciding who is next.
+fn write_elected_config(
+    path: &Path,
+    journal: &Path,
+    leadership: &Path,
+    follower: &str,
+    id: u64,
+    peers: &[(u64, u16)],
+) -> PathBuf {
+    let mut text = format!(
+        "listen = 127.0.0.1:0\n\
+         journal = {}\n\
+         leadership_state = {}\n\
+         node_id = {id}\n\
+         target_recovery_ms = 2000\n\
+         replay_rate = 7600000\n\
+         retained_per_channel = 4096\n\
+         max_records_per_session = 256\n\
+         max_sessions = 64\n\
+         ack_timeout_ms = 1000\n\
+         max_feed_memory_mb = 64\n\
+         authentication = open\n\
+         replica = {follower}\n",
+        journal.display(),
+        leadership.display()
+    );
+    for (peer, port) in peers {
+        text.push_str(&format!("peer = {peer}@127.0.0.1:{port}\n"));
+    }
+    text.push_str(
+        "\n[instrument]\n\
+         symbol = 1\n\
+         base = 1\n\
+         quote = 2\n\
+         floor_ticks = 10000\n\
+         max_quantity = 1000000\n\
+         max_open_orders = 100000\n",
+    );
+    std::fs::write(path, text).unwrap();
+    path.to_path_buf()
+}
+
+#[test]
+fn a_cluster_elects_its_own_leader_and_replaces_it_without_a_person() {
+    // The property that removes the operator from the failover path. Everything
+    // else about failover was already safe: a quorum holds every acknowledged
+    // group, a promoted node catches up before serving, and a follower refuses a
+    // stale term. What needed a person was noticing the leader had died and
+    // deciding who was next -- someone editing a higher term into a file.
+    //
+    // Nothing in this test edits anything. Three venue processes are started
+    // with identical peer lists, one of them wins an election, and when it is
+    // killed another takes over and serves orders.
+    const ORDERS: u64 = 200;
+    let scratch = Scratch::new("elected");
+
+    let replica = Process::start(
+        env!("CARGO_BIN_EXE_replica"),
+        &[
+            "127.0.0.1:7451",
+            "--file",
+            scratch.file("follower.log").to_str().unwrap(),
+        ],
+    );
+    assert!(
+        replica.wait_for("replica listening", Duration::from_secs(10)),
+        "the follower never came up"
+    );
+
+    let peers: Vec<(u64, u16)> = vec![(1, 7461), (2, 7462), (3, 7463)];
+    let client_ports = [7471_u16, 7472, 7473];
+    let mut nodes: Vec<Process> = Vec::new();
+    for (index, (id, _)) in peers.iter().enumerate() {
+        let config = write_elected_config(
+            &scratch.file(&format!("node{id}.conf")),
+            &scratch.file(&format!("node{id}.log")),
+            &scratch.file(&format!("node{id}.raft")),
+            "127.0.0.1:7451",
+            *id,
+            &peers,
+        );
+        nodes.push(Process::start(
+            env!("CARGO_BIN_EXE_venue"),
+            &[
+                "--config",
+                config.to_str().unwrap(),
+                "--listen",
+                &format!("127.0.0.1:{}", client_ports[index]),
+            ],
+        ));
+    }
+
+    // Which node is serving, by asking each in turn. A standby has not bound its
+    // client port at all, so connecting is the question.
+    let serving = |nodes: &[Process], within: Duration| -> Option<usize> {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            for (index, node) in nodes.iter().enumerate() {
+                if node.wait_for("listening 127.0.0.1", Duration::from_millis(10))
+                    && TcpStream::connect(format!("127.0.0.1:{}", client_ports[index])).is_ok()
+                {
+                    return Some(index);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        None
+    };
+
+    let leader = serving(&nodes, Duration::from_secs(60)).expect("no node was ever elected");
+    assert!(
+        nodes[leader].wait_for("elected leader for term", Duration::from_secs(5)),
+        "a node started serving without saying it had been elected, so the port \
+         opening is not evidence an election happened"
+    );
+    let first_term = nodes[leader]
+        .term_announced()
+        .expect("the leader never named its term");
+    assert!(first_term > 0, "elected under term zero");
+
+    assert_eq!(
+        trade(&format!("127.0.0.1:{}", client_ports[leader]), ORDERS),
+        ORDERS,
+        "the elected leader did not acknowledge every order"
+    );
+
+    // Kill it, as a machine failure would. Nobody tells the others.
+    nodes[leader].stop();
+    let dead_port = client_ports[leader];
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut replacement = None;
+    while Instant::now() < deadline && replacement.is_none() {
+        for (index, _) in nodes.iter().enumerate() {
+            if index == leader {
+                continue;
+            }
+            let address = format!("127.0.0.1:{}", client_ports[index]);
+            if TcpStream::connect(&address).is_ok() {
+                replacement = Some(index);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let replacement = replacement.expect(
+        "no replacement started serving after the leader was killed, so failover \
+         still needs a person",
+    );
+    assert_ne!(
+        client_ports[replacement], dead_port,
+        "the dead node came back rather than a replacement taking over"
+    );
+
+    // Elected, not merely started. And under a higher term, because a fencing
+    // token that does not increase fences nothing: the old leader's writes have
+    // to be refusable by the followers that outlived it.
+    assert!(
+        nodes[replacement].wait_for("elected leader for term", Duration::from_secs(5)),
+        "the replacement is serving without having been elected"
+    );
+    let second_term = nodes[replacement]
+        .term_announced()
+        .expect("the replacement never named its term");
+    assert!(
+        second_term > first_term,
+        "the replacement leads under term {second_term}, not above the dead \
+         leader's {first_term}"
+    );
+
+    // And it is a working venue, not merely a process that opened a port.
+    assert_eq!(
+        trade(&format!("127.0.0.1:{}", client_ports[replacement]), 50),
+        50,
+        "the replacement does not accept orders"
     );
 }

@@ -17,6 +17,7 @@
 //! instrument. That is a measurement setup, not a deployment: an in-memory log
 //! measures the venue, a real file measures the disk.
 
+use bx_election::Leadership;
 use bx_gateway::auth::{Credentials, Mode as AuthMode};
 use bx_gateway::config::Config;
 use bx_gateway::tcp::{Server, SnapshotPolicy};
@@ -39,6 +40,10 @@ const PROMOTION_WINDOW: Duration = Duration::from_secs(15);
 /// says nothing and the loop never reads a clock on its account.
 const REPORT_EVERY: u64 = 1_000_000;
 
+/// How long a standby waits to be elected before saying so and waiting again.
+/// Not a failure -- a standby that is never elected is a standby doing its job.
+const ELECTION_PATIENCE: Duration = Duration::from_secs(30);
+
 /// What the venue runs as when no configuration file is given: one instrument,
 /// journal in memory. Enough to point the load harness at, and not a deployment.
 fn measurement_config() -> Config {
@@ -58,6 +63,11 @@ fn measurement_config() -> Config {
         replicas: Vec::new(),
         ack_timeout: Duration::from_millis(250),
         term: 1,
+        // No election: one node, leading unconditionally. An election needs a
+        // majority, and a majority of one is a formality with a cost.
+        node_id: 1,
+        peers: Vec::new(),
+        leadership_state: None,
         max_feed_memory: 64 * 1024 * 1024,
         // Open, and said out loud at startup. This mode exists to point the load
         // harness at, and a measurement run has no secrets to distribute.
@@ -79,7 +89,12 @@ fn listed(config: &Config) -> Instruments {
     instruments
 }
 
-fn run<S: LogStorage>(config: &Config, storage: S, fresh: bool) -> std::io::Result<()> {
+fn run<S: LogStorage>(
+    config: &Config,
+    storage: S,
+    fresh: bool,
+    leadership: Option<&Leadership>,
+) -> std::io::Result<()> {
     let mut server = Server::bind(
         &config.listen,
         storage,
@@ -161,6 +176,14 @@ fn run<S: LogStorage>(config: &Config, storage: S, fresh: bool) -> std::io::Resu
     println!("listening {}", server.address()?);
     let mut reported_at = 0_u64;
     loop {
+        // Checked before every pass, because a deposed leader must stop taking
+        // orders rather than discover on its next commit that a majority has
+        // moved on without it. One relaxed load; it does not show up against a
+        // pass measured in hundreds of nanoseconds.
+        if leadership.is_some_and(|held| !held.is_leader()) {
+            println!("no longer the leader; closing the door");
+            return Ok(());
+        }
         if let Err(e) = server.poll() {
             eprintln!("venue stopped: {e}");
             return Err(std::io::Error::other(e.to_string()));
@@ -193,7 +216,7 @@ fn run<S: LogStorage>(config: &Config, storage: S, fresh: bool) -> std::io::Resu
 
 /// Opens the journal the configuration asks for, wrapped in replication when
 /// followers are listed.
-fn start(config: &Config) -> std::io::Result<()> {
+fn start(config: &Config, term: u64, leadership: Option<&Leadership>) -> std::io::Result<()> {
     let other = |e: JournalError| std::io::Error::other(e.to_string());
 
     match config.journal.as_deref() {
@@ -201,13 +224,62 @@ fn start(config: &Config) -> std::io::Result<()> {
             let fresh = !path.exists();
             let log = FileLog::open(path).map_err(other)?;
             if config.replicas.is_empty() {
-                run(config, log, fresh)
+                run(config, log, fresh, leadership)
             } else {
-                run(config, promoted(config, log)?, fresh)
+                run(config, promoted(config, log, term)?, fresh, leadership)
             }
         }
-        None if config.replicas.is_empty() => run(config, MemoryLog::new(), true),
-        None => run(config, promoted(config, MemoryLog::new())?, true),
+        None if config.replicas.is_empty() => run(config, MemoryLog::new(), true, leadership),
+        None => run(
+            config,
+            promoted(config, MemoryLog::new(), term)?,
+            true,
+            leadership,
+        ),
+    }
+}
+
+/// Serves for as long as this node is the leader, and no longer.
+///
+/// This is the loop that removes the person. Before it, a promotion meant
+/// someone noticing a dead venue, editing a higher term into a file, and
+/// starting a process. Now the node waits until the cluster elects it, proves it
+/// can still reach a majority, catches its log up to what any majority holds,
+/// serves — and stops the instant it is no longer the leader, because the node
+/// that replaced it holds a higher term and every write this one made would be
+/// refused anyway.
+///
+/// Everything is rebuilt on each promotion rather than kept warm. That is not
+/// laziness: a node that has been out of the leadership does not know what it
+/// missed, and the only honest way to find out is to catch up and replay. Doing
+/// it any other way would mean serving from state whose provenance nobody can
+/// state.
+fn lead(config: &Config, leadership: &Leadership) -> std::io::Result<()> {
+    loop {
+        println!("standing for election as node {}", leadership.id());
+        let Some(term) = leadership.await_leadership(ELECTION_PATIENCE) else {
+            // Not an error. Another node holds it, and this one is a standby
+            // doing exactly what a standby should: nothing.
+            continue;
+        };
+        println!("elected leader for term {term}");
+
+        // Proves the node can still reach a majority *before* it takes an
+        // order, rather than discovering it could not on the first commit.
+        if let Err(e) = leadership.announce() {
+            eprintln!("elected but could not reach a majority to announce: {e}");
+            continue;
+        }
+
+        match start(config, term, Some(leadership)) {
+            Ok(()) => println!("stepped down from term {term}; standing by"),
+            Err(e) => {
+                // A leader that cannot commit must stop leading, but the process
+                // stays up: it is a perfectly good standby, and exiting would
+                // shrink the cluster that has to elect its replacement.
+                eprintln!("stopped serving term {term}: {e}");
+            }
+        }
     }
 }
 
@@ -218,9 +290,12 @@ fn start(config: &Config) -> std::io::Result<()> {
 /// so the two intersect: whatever a client was told is on at least one node that
 /// answers, and the longest log recovers all of it. A node that cannot reach a
 /// majority refuses to start rather than serving without knowing what it missed.
-fn promoted<S: LogStorage>(config: &Config, storage: S) -> std::io::Result<ReplicatedLog<S>> {
-    let mut log =
-        ReplicatedLog::connect(storage, &config.replicas, config.ack_timeout, config.term)?;
+fn promoted<S: LogStorage>(
+    config: &Config,
+    storage: S,
+    term: u64,
+) -> std::io::Result<ReplicatedLog<S>> {
+    let mut log = ReplicatedLog::connect(storage, &config.replicas, config.ack_timeout, term)?;
     // Retried against a deadline: at the moment of a promotion a follower may
     // still be finishing with the leader that just died.
     let recovered = log.catch_up(PROMOTION_WINDOW)?;
@@ -258,5 +333,23 @@ fn main() -> std::io::Result<()> {
         config.listen = address;
     }
 
-    start(&config)
+    if config.peers.is_empty() {
+        // No election configured: this node leads unconditionally, on the term
+        // in the file. The single-node and measurement shape, and the one a
+        // person still has to promote.
+        return start(&config, config.term, None);
+    }
+
+    let state = config
+        .leadership_state
+        .clone()
+        .ok_or_else(|| std::io::Error::other("peers are listed but leadership_state is not"))?;
+    let leadership = Leadership::join(config.node_id, &config.peers, &state)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    println!(
+        "joined a leadership cluster of {} as node {}",
+        config.peers.len(),
+        config.node_id
+    );
+    lead(&config, &leadership)
 }
