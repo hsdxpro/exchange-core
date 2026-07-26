@@ -22,6 +22,12 @@ Everything below is measured on the machine it was developed on, not estimated.
 "Full path" means sequence, journal, balance reservation, match, and event
 emission — not the book in isolation.
 
+A large order eating through a thin book is its own shape, and nothing measured
+it until it was looked for: a market order sweeping 2,000 distinct price levels
+cost **562 ns per level** and now costs **176 ns** — interleaved against a
+checksummed binary, three runs. The per-level bookkeeping deduplicated touched
+prices by searching the list, which is quadratic in the levels crossed.
+
 The crossing and cancel figures were **3,036 ns and 447 ns** until the index that
 answers "what does this account have working" stopped being searched linearly.
 It is the same index that makes self-match prevention one lookup, and taking an
@@ -262,7 +268,7 @@ Scope boundaries, with reasons rather than apologies:
 
 ## Correctness
 
-311 tests. The ones worth looking at:
+312 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed

@@ -69,6 +69,58 @@ fn report_throughput(name: &str, per_op_ns: &mut [f64]) {
     println!("{name:<38}{best:>12.0} ns{:>16.0} cmd/sec", per_second);
 }
 
+/// One order eating through many distinct price levels.
+///
+/// The crossing benchmark above puts every maker at a single price, so it
+/// measures the fill loop and nothing about *breadth*. A market order sweeping a
+/// thousand levels is the shape that matters here — it is what a large order into
+/// a thin book does, and it is where per-level bookkeeping that looks free at one
+/// level stops being free.
+///
+/// Reported per level rather than per order, because that is the number that has
+/// to stay flat: if it grows with the depth swept, something in the path is
+/// quadratic.
+fn sweeping_orders(sink: &mut u64) -> Vec<f64> {
+    const LEVELS: u64 = 2_000;
+    const SWEEPS: u64 = 20;
+    let mut samples = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut exchange = venue();
+        let mut next_id = 1_u64;
+        let started = Instant::now();
+        for _ in 0..SWEEPS {
+            // A fresh wall of asks, one order at each of many prices.
+            for level in 0..LEVELS {
+                let mut maker = limit_order(
+                    1,
+                    SYMBOL,
+                    next_id,
+                    Side::Ask,
+                    FLOOR + 1_000 + level as Ticks,
+                    1,
+                );
+                next_id += 1;
+                exchange.submit(&mut maker).unwrap();
+            }
+            // And one order that takes the lot, crossing every level.
+            let mut taker = market_order(2, SYMBOL, next_id, Side::Bid, LEVELS);
+            next_id += 1;
+            let events = exchange.submit(&mut taker).unwrap();
+            *sink = sink.wrapping_add(events.len() as u64);
+        }
+        // Divided by the levels swept, not by the orders sent, so the figure is
+        // per unit of work and comparable across depths.
+        samples.push(started.elapsed().as_secs_f64() * 1e9 / (SWEEPS * LEVELS) as f64);
+        assert_eq!(
+            exchange.open_orders(),
+            0,
+            "the sweeps did not consume the book, so this measured something else"
+        );
+        black_box(&exchange);
+    }
+    samples
+}
+
 /// A venue listing `symbols` instruments, numbered densely from one.
 ///
 /// The pool is divided among them, so the total memory is what a one-symbol run
@@ -691,6 +743,11 @@ fn main() {
         "crossing, self-match check runs",
         &mut crossing_with_self_check(&mut sink),
         "per order",
+    );
+    report(
+        "market order sweeping 2000 levels",
+        &mut sweeping_orders(&mut sink),
+        "per level",
     );
     report("cancel by order id", &mut cancels(&mut sink), "per cancel");
     report("mixed stream", &mut mixed_stream(&mut sink), "per command");

@@ -417,8 +417,18 @@ impl Book {
             engine_quantity,
             engine_tif(tif),
             |fill| {
+                // Compared against the last entry rather than searched. This
+                // runs once per *fill*, so a scan made a sweep quadratic in the
+                // number of distinct prices it crossed: a thousand levels is
+                // half a million comparisons for one order.
+                //
+                // The last entry is enough because the engine sweeps best-first
+                // and exhausts each level before moving on, so a repeat is
+                // always adjacent. And if that ever stopped being true the cost
+                // would be a duplicate level restatement, which a subscriber
+                // applies to the same effect as one — wasteful, never wrong.
                 let key = (side.opposite(), fill.price);
-                if !touched.contains(&key) {
+                if touched.last() != Some(&key) {
                     touched.push(key);
                 }
                 executions.push(Execution {
@@ -524,8 +534,18 @@ impl Book {
     /// stayed empty yields a zero delta, which is harmless and far cheaper than
     /// tracking prior state.
     fn resolve_levels(&self, out: &mut Outcome) {
+        let best = [self.best_slot(Side::Bid), self.best_slot(Side::Ask)];
+        // Noticed while the touched prices are already being walked, rather than
+        // searched for afterwards. Asking "was the best price among them" with a
+        // scan cost a second pass over the list for each side, which on a sweep
+        // across a thousand levels is two thousand comparisons for an answer
+        // that was available for free on the way past.
+        let mut best_touched = [false; 2];
         for index in 0..out.touched.len() {
             let (side, slot) = out.touched[index];
+            if i32::from(slot) == best[side as usize] {
+                best_touched[side as usize] = true;
+            }
             out.level_changes.push(LevelChange {
                 side,
                 price: self.instrument.to_price(slot),
@@ -533,14 +553,11 @@ impl Book {
             });
         }
         for side in [Side::Bid, Side::Ask] {
-            let best = self.best_slot(side);
             // Either the best price moved, or it held and the level standing
             // there was one of the ones this command changed. Nothing else can
             // move the top, so nothing else is looked at.
-            let moved = best != out.top_before[side as usize];
-            let resized =
-                !moved && u16::try_from(best).is_ok_and(|slot| out.touched.contains(&(side, slot)));
-            if !moved && !resized {
+            let moved = best[side as usize] != out.top_before[side as usize];
+            if !moved && !best_touched[side as usize] {
                 continue;
             }
             let (price, quantity) = self.top(side);
@@ -639,6 +656,79 @@ mod tests {
         Book::new(Instrument::new(1, 10, 20, 1_000, 1_000_000, POOL))
     }
 
+    #[test]
+    fn a_sweep_reports_each_price_it_crossed_exactly_once() {
+        // The deduplication of touched prices compares against the last entry
+        // rather than searching the list, because searching made a sweep
+        // quadratic in the levels it crossed -- 562 ns a level against 176.
+        //
+        // That is only correct because the engine sweeps best-first and finishes
+        // each level before moving on, so a repeat is always adjacent. This is
+        // the test that holds that assumption still: if fills ever arrived out of
+        // price order, a level would be reported twice and this would say so.
+        //
+        // A duplicate would be wasteful rather than wrong -- a subscriber applies
+        // the same restatement to the same effect -- which is exactly why it
+        // needs a test rather than showing up as a broken book somewhere.
+        const LEVELS: u16 = 100;
+        // Several orders at each price, so one level produces several fills.
+        // With one order per level there is nothing to deduplicate and the test
+        // passes whether or not the deduplication works at all.
+        const DEEP: u64 = 4;
+        let mut book = book();
+        let mut out = Outcome::default();
+
+        let mut id = 1_u64;
+        for level in 0..LEVELS {
+            for _ in 0..DEEP {
+                book.submit_into(
+                    &mut out,
+                    id,
+                    Side::Ask,
+                    1_000 + i64::from(level),
+                    1,
+                    TimeInForce::GoodTillCancel,
+                    false,
+                );
+                assert!(out.reject.is_none(), "a maker was refused at level {level}");
+                id += 1;
+            }
+        }
+
+        // One order takes every level.
+        book.submit_into(
+            &mut out,
+            9_999,
+            Side::Bid,
+            0,
+            u64::from(LEVELS) * DEEP,
+            TimeInForce::ImmediateOrCancel,
+            true,
+        );
+        assert!(out.reject.is_none(), "the sweep was refused");
+        assert_eq!(
+            out.executions.len(),
+            LEVELS as usize * DEEP as usize,
+            "the sweep did not cross every level"
+        );
+
+        let mut reported: Vec<(Side, Ticks)> = out
+            .level_changes
+            .iter()
+            .map(|change| (change.side, change.price))
+            .collect();
+        let before = reported.len();
+        reported.sort_by_key(|(side, price)| (*side as u8, *price));
+        reported.dedup();
+        assert_eq!(
+            before,
+            reported.len(),
+            "a sweep across {LEVELS} levels reported {before} level changes for \
+             {} distinct prices, so the same price was restated more than once \
+             and the adjacency the deduplication relies on does not hold",
+            reported.len()
+        );
+    }
     #[test]
     fn a_slot_costs_what_the_sizing_guidance_says_it_does() {
         // Instrument::max_open_orders documents 40 bytes per slot plus a flat

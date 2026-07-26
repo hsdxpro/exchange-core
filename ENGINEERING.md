@@ -12,14 +12,14 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**311 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**312 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
 | `bx-engine` | 44 | The engine's own suite. |
 | `bx-protocol` | 12 | Record layout, discriminants, order type, subscription channels. |
 | `bx-journal` | 31 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
-| `bx-pipeline` | 56 | Prices, balances, engine adapter, deltas, hashing, snapshots, and the crossable walk's complexity. |
+| `bx-pipeline` | 57 | Prices, balances, engine adapter, deltas, hashing, snapshots, and the crossable walk's complexity. |
 | `bx-gateway` | 56 | Framing, the group-commit loop, the HMAC challenge, token buckets, histogram buckets, config parsing and validation. |
 | end-to-end | 22 | Full path with simulated traders and a subscriber, and the open-order index under scrambled cancellation. |
 | subscription | 7 | Channels, resume after disconnect, lagging out of the window. |
@@ -69,6 +69,18 @@ command: sequence, journal append, durability, reserve, match, emit.
 
 The crossing and cancel rows read **3,036 ns and 447 ns** until the per-account
 open-order index stopped being searched linearly; the table above is after.
+
+A row worth adding on its own: **a market order sweeping 2,000 distinct levels
+cost 562 ns a level and now costs 176**, measured interleaved across three runs.
+Every crossing benchmark before it put its makers at a *single* price, so it
+measured the fill loop and nothing about breadth — and breadth is where per-level
+bookkeeping that looks free at one level stops being free. The touched-price list
+was deduplicated by searching it, once per fill, which is quadratic in the levels
+crossed. It now compares against the last entry, which is sufficient because the
+engine sweeps best-first and finishes each level before moving on. That
+assumption has its own test, because breaking it would produce a duplicate
+restatement rather than a wrong book — wasteful, invisible, and exactly the kind
+of thing that survives a green suite.
 
 **Fan-out to three channels costs 11 ns**, because publishing is a bounded ring
 write and nothing else. An earlier version of this table reported it as free,
