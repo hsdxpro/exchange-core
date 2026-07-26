@@ -92,7 +92,7 @@ Requires `rustup` and nothing else. There is no CI; `xtask` is the task runner.
 cargo x
 ```
 
-That is format, `clippy -D warnings`, and all 223 tests. Also:
+That is format, `clippy -D warnings`, and the whole test suite. Also:
 
 ```bash
 cargo x latency
@@ -211,7 +211,7 @@ Scope boundaries, with reasons rather than apologies:
 
 ## Correctness
 
-223 tests. The ones worth looking at:
+227 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed

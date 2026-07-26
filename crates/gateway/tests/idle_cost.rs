@@ -36,7 +36,7 @@ fn instruments() -> Instruments {
 
 /// Median nanoseconds one `poll` costs with `idle` connections attached and
 /// nothing to do.
-fn idle_poll_cost(idle: usize, subscribed: bool) -> f64 {
+fn idle_poll_cost(idle: usize) -> f64 {
     let mut server = Server::bind(
         "127.0.0.1:0",
         MemoryLog::new(),
@@ -54,14 +54,12 @@ fn idle_poll_cost(idle: usize, subscribed: bool) -> f64 {
     for _ in 0..idle {
         let mut stream = TcpStream::connect(address).unwrap();
         stream.set_nodelay(true).unwrap();
-        // Every session sends one message so it is attributed an account, and
-        // optionally subscribes, since a cursor per channel is part of the cost.
+        // One message so the session is attributed an account, then the public
+        // feeds, because a cursor per channel is part of what a pass costs.
         let mut bytes = Vec::new();
         encode(&limit_order(1, SYMBOL, 1, Side::Bid, 10_000, 1), &mut bytes);
-        if subscribed {
-            encode(&subscribe(1, SYMBOL, ChannelKind::Book), &mut bytes);
-            encode(&subscribe(1, SYMBOL, ChannelKind::Trades), &mut bytes);
-        }
+        encode(&subscribe(1, SYMBOL, ChannelKind::Book), &mut bytes);
+        encode(&subscribe(1, SYMBOL, ChannelKind::Trades), &mut bytes);
         stream.write_all(&bytes).unwrap();
         clients.push(stream);
         // Accept as we go. Opening hundreds of sockets without accepting
@@ -93,7 +91,7 @@ fn an_idle_connection_costs_almost_nothing() {
     // Reported rather than merely asserted: the shape of this curve is the point.
     let mut measured = Vec::new();
     for idle in [1_usize, 16, 64, 256] {
-        let cost = idle_poll_cost(idle, true);
+        let cost = idle_poll_cost(idle);
         measured.push((idle, cost));
         println!(
             "{idle:>4} idle sessions: {cost:>9.0} ns per pass, {:>7.0} ns each",

@@ -86,8 +86,12 @@ impl Decoder {
     }
 
     /// Bytes held that do not yet form a record.
-    #[must_use]
-    pub const fn partial(&self) -> usize {
+    ///
+    /// Only the framing tests read this, and a private method used solely from
+    /// test code counts as dead in a normal build, so it is gated rather than
+    /// made public for a caller that does not exist.
+    #[cfg(test)]
+    const fn partial(&self) -> usize {
         self.filled % FRAME_LEN
     }
 }
