@@ -64,6 +64,9 @@ fn measurement_config() -> Config {
         authentication: AuthMode::Open,
         credentials: Credentials::new(),
         rate_limit: None,
+        // Off for measurement: two wall-clock readings a pass would show up in
+        // the very numbers this configuration exists to produce.
+        timestamps: false,
         instruments,
     }
 }
@@ -99,6 +102,10 @@ fn run<S: LogStorage>(config: &Config, storage: S, fresh: bool) -> std::io::Resu
         AuthMode::Open => {
             println!("AUTHENTICATION OFF: any session may act for any account");
         }
+    }
+    server.stamp_times(config.timestamps);
+    if config.timestamps {
+        println!("stamping arrival and match times");
     }
     if let Some(limit) = config.rate_limit {
         server.rate_limit(limit);

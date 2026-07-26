@@ -97,6 +97,15 @@ pub struct Exchange<S: LogStorage> {
     /// Orders refused, by reason. A fixed array indexed by the discriminant, so
     /// counting one costs an increment and nothing on the path that accepts.
     rejects: [u64; REJECT_REASONS],
+    /// When the group now being applied began matching, supplied from outside.
+    ///
+    /// An *input*, never a clock reading taken here. Everything after the
+    /// sequencer has to be a function of the sequenced stream, so the pipeline
+    /// is handed the time rather than asking for it — the same rule that keeps
+    /// authentication and rate limiting in the gateway. Zero when the venue runs
+    /// without timestamps, and zero on replay, which is why it is published as a
+    /// measurement of the run rather than a fact about the order.
+    matched_ns: u64,
     /// Which orders each account has resting on each symbol.
     ///
     /// Serves two callers that would otherwise each want their own index.
@@ -136,6 +145,7 @@ impl<S: LogStorage> Exchange<S> {
             books,
             reservations: FastMap::default(),
             rejects: [0; REJECT_REASONS],
+            matched_ns: 0,
             resting_per_account: FastMap::default(),
             events: Vec::new(),
             released: true,
@@ -847,7 +857,16 @@ impl<S: LogStorage> Exchange<S> {
     }
 
     fn emit_outcome(&mut self, command: &Command, side: Side, outcome: &Outcome) {
-        self.push(command, EventKind::Received, command.order_id, 0, 0, 0);
+        // The acknowledgement carries the timing, because it is the one event
+        // every command produces and these two fields are otherwise zero on it.
+        self.push(
+            command,
+            EventKind::Received,
+            command.order_id,
+            command.ingress_ns,
+            self.matched_ns as i64,
+            0,
+        );
         for execution in &outcome.executions {
             self.push_fill(command, side, execution);
         }
@@ -985,6 +1004,16 @@ impl<S: LogStorage> Exchange<S> {
             0,
             reason as u8,
         );
+    }
+
+    /// Tells the pipeline when the group about to be applied began matching.
+    ///
+    /// Called by whatever owns the clock — the gateway — once per group, never
+    /// per command, and never from inside the deterministic path. Leaving it
+    /// unset means the venue publishes no match time, which is what a
+    /// measurement run and a replay both do.
+    pub const fn matching_now(&mut self, ns: u64) {
+        self.matched_ns = ns;
     }
 
     /// How many orders each reason has refused, indexed by

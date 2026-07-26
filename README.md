@@ -238,7 +238,7 @@ Scope boundaries, with reasons rather than apologies:
 
 ## Correctness
 
-298 tests. The ones worth looking at:
+302 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed

@@ -120,6 +120,17 @@ struct Allowance {
 /// The listener's token. Sessions take `index + 1`, so zero is never a session.
 const LISTENER: Token = Token(0);
 
+/// Nanoseconds since the Unix epoch.
+///
+/// A wall clock rather than a monotonic one, deliberately: this number leaves
+/// the venue and has to mean something to a client comparing it with its own
+/// records, which `Instant` cannot do. It is read in the gateway only.
+fn wall_clock_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64)
+}
+
 /// Tells one client its command was refused before the venue ever saw it.
 ///
 /// No sequence, because it never entered the stream: this is the gateway
@@ -381,6 +392,14 @@ pub struct Server<S: LogStorage> {
     /// What the venue is doing, counted as it does it. Timings are sampled every
     /// sixty-fourth pass so the clock reading does not land on the order path.
     metrics: Metrics,
+    /// Whether to stamp arrival and match times onto commands and events.
+    ///
+    /// Off costs nothing and is what the benchmarks run with. On costs two
+    /// wall-clock readings a pass — about 50 ns, shared by every command in the
+    /// group, so it disappears under load and is worth roughly a quarter of a
+    /// pass when the group is one. A venue that owes anybody a traceable
+    /// timestamp pays it; one being measured does not.
+    timestamps: bool,
     /// Reused across passes so a steady-state loop allocates nothing.
     inbound: Vec<Command>,
     outbound: Vec<Event>,
@@ -450,6 +469,7 @@ impl<S: LogStorage> Server<S> {
             rate: None,
             allowances: FastMap::default(),
             metrics: Metrics::default(),
+            timestamps: false,
         };
         Ok(server)
     }
@@ -467,6 +487,11 @@ impl<S: LogStorage> Server<S> {
     /// Bounds how fast one session may send. Unset means unlimited.
     pub const fn rate_limit(&mut self, limit: RateLimit) {
         self.rate = Some(limit);
+    }
+
+    /// Stamps arrival and match times onto commands and acknowledgements.
+    pub const fn stamp_times(&mut self, on: bool) {
+        self.timestamps = on;
     }
 
     /// Sessions dropped for failing to prove who they are.
@@ -615,6 +640,10 @@ impl<S: LogStorage> Server<S> {
         // against this one `Instant::now()`; the per-command cost is a compare
         // and a decrement. Skipped entirely when nothing is rate limited.
         let now = self.rate.map(|_| Instant::now());
+        // Likewise for arrival: every command in this group came off its socket
+        // in this pass, so the resolution is the pass. Per-packet accuracy has
+        // to come from the NIC, not from here.
+        let ingress_ns = self.timestamps.then(wall_clock_ns).unwrap_or_default();
         for index in ready {
             let start = self.inbound.len();
             let Some(session) = self.sessions.get_mut(index).and_then(Option::as_mut) else {
@@ -683,6 +712,12 @@ impl<S: LogStorage> Server<S> {
 
         let applied = self.inbound.len();
         if applied > 0 {
+            if self.timestamps {
+                for command in &mut self.inbound {
+                    command.ingress_ns = ingress_ns;
+                }
+                self.venue.exchange_mut().matching_now(wall_clock_ns());
+            }
             let started = timing.map(|_| Instant::now());
             let mut group = std::mem::take(&mut self.inbound);
             let result = self.venue.accept(&mut group);

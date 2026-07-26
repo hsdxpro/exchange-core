@@ -210,17 +210,37 @@ count actually forces it, not before.
 
 ## 8. Time
 
-**Intended, not built.** Two timestamps should travel with every order and be published:
+Two timestamps travel with every order and are published on its acknowledgement:
 
-| | Source | Meaning | State |
+| | Source | Meaning | Journalled |
 |---|---|---|---|
-| `ingress_ns` | NIC hardware timestamp | when the packet reached the venue | field exists, always zero |
-| `match_ns` | matching shard | when it executed or rested | not present |
+| `ingress_ns` | gateway, before sequencing | when the venue read the command off the wire | yes |
+| `match_ns` | gateway, at group commit | when the group began matching | no |
 
-The field is reserved in the record rather than populated, because the value has to come
-from the NIC to be worth anything: a timestamp taken in the gateway measures our own
-scheduling jitter, not arrival. Filling it in with `Instant::now()` would look like the
-feature and be a lie a regulator could read.
+Both are read in the gateway and handed *in* to the pipeline. Neither is a clock reading
+taken on the deterministic path — that is the same rule that puts authentication and rate
+limiting ahead of the sequencer, and it is what lets a replay reproduce `ingress_ns` rather
+than invent a new one.
+
+`match_ns` is not journalled, because a 64-byte command has no room for it and widening the
+record would cost a cache line on every order the venue ever writes. A recovered venue
+therefore re-emits it as zero, which is the honest answer: it is a measurement of the run,
+not a fact about the order.
+
+They ride on the `Received` event, whose `quantity` and `price` are otherwise zero. Giving
+them fields of their own would mean a 72-byte event, and an event that no longer fits a
+cache line costs every subscriber on every message to carry a number most never read.
+
+**Resolution is the pass, not the packet.** The clock is read once per group rather than
+once per command, so two orders from the same write share an arrival time. True per-packet
+arrival has to come from the NIC — `SO_TIMESTAMPING`, or the AWS Nitro hardware stamp
+described below — because a reading taken in the gateway measures our own scheduling as
+well as the network. The field is where that value goes when the deployment can supply it.
+
+Off by default in the measurement configuration and on by default in a deployed one: two
+wall-clock readings a pass vanish under load and are worth about a quarter of a pass when
+the group is one, and the numbers in the README exist to measure matching rather than
+`SystemTime`.
 
 AWS Nitro stamps every inbound packet with 64-bit nanoseconds **at the NIC, before the
 kernel or our process sees it**, disciplined by the Amazon Time Sync PTP hardware clock.
@@ -254,7 +274,7 @@ reality.
 | Durability | group commit; quorum to followers, fenced by term | — |
 | Consensus | none: safe promotion, but no election | `openraft`, on a leadership log |
 | Journal I/O | buffered `std`, one write and one sync per group | `io_uring`, SQPOLL |
-| Timestamps | none published | `ingress_ns` from the NIC, `match_ns` from the shard |
+| Timestamps | `ingress_ns` journalled, `match_ns` on the ack | NIC hardware stamping |
 | Metrics | log-linear histograms, sampled every 64th pass | export to a scrape endpoint |
 
 Dependencies sit at the edge deliberately. The engine has none, `protocol`/`journal`/

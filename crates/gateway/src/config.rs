@@ -207,6 +207,10 @@ pub struct Config {
     pub credentials: Credentials,
     /// How fast one account may send. None means unlimited, and costs nothing.
     pub rate_limit: Option<RateLimit>,
+    /// Whether to stamp arrival and match times. Two wall-clock readings a
+    /// pass, shared by the whole group, so it vanishes under load and is worth
+    /// about a quarter of a pass when the group is one.
+    pub timestamps: bool,
     pub instruments: Instruments,
 }
 
@@ -238,6 +242,7 @@ impl Config {
         let mut term = None;
         let mut max_feed_memory_mb = None;
         let mut authentication = None;
+        let mut timestamps = None;
         let mut rate = None;
         let mut burst = None;
         let mut replicas = Vec::new();
@@ -364,6 +369,18 @@ impl Config {
                             return Err(ConfigError::at(
                                 line,
                                 format!("authentication is `required` or `open`, not `{other}`"),
+                            ));
+                        }
+                    });
+                }
+                "timestamps" => {
+                    timestamps = Some(match value {
+                        "on" => true,
+                        "off" => false,
+                        other => {
+                            return Err(ConfigError::at(
+                                line,
+                                format!("timestamps is `on` or `off`, not `{other}`"),
                             ));
                         }
                     });
@@ -505,6 +522,9 @@ impl Config {
             authentication,
             credentials,
             rate_limit,
+            // On unless a deployment says otherwise: a venue that owes anybody a
+            // traceable timestamp should not have to remember to ask for one.
+            timestamps: timestamps.unwrap_or(true),
             journal,
             snapshot,
             target_recovery: Duration::from_millis(target_recovery_ms),

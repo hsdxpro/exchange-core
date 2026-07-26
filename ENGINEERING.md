@@ -12,13 +12,13 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**298 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**302 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
 | `bx-engine` | 44 | The engine's own suite. |
 | `bx-protocol` | 12 | Record layout, discriminants, order type, subscription channels. |
-| `bx-journal` | 30 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
+| `bx-journal` | 31 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
 | `bx-pipeline` | 56 | Prices, balances, engine adapter, deltas, hashing, snapshots, and the crossable walk's complexity. |
 | `bx-gateway` | 56 | Framing, the group-commit loop, the HMAC challenge, token buckets, histogram buckets, config parsing and validation. |
 | end-to-end | 22 | Full path with simulated traders and a subscriber, and the open-order index under scrambled cancellation. |
@@ -31,7 +31,7 @@ timing is not evidence of anything.
 | failover | 2 | Real processes: promotion recovers acked records, no majority means no service. |
 | idle cost | 2 | An idle connection stays under 120 ns a pass. |
 | many clients | 1 | A million accounts, and the memory that costs. |
-| admission | 17 | Real sockets: an unproven order never reaches the book, a captured proof does not open the next connection, a flood is cut to its allowance, a refusal is counted against its reason. |
+| admission | 20 | Real sockets: an unproven order never reaches the book, a captured proof does not open the next connection, a flood is cut to its allowance, a refusal is counted against its reason, an acknowledgement carries when the venue saw the order. |
 
 ### The end-to-end tests matter most
 
@@ -358,10 +358,12 @@ Ordered by how much it matters.
    `Authenticated` is the kind of word a reader assumes means more than it does.
 2. **`CancelReplace` is cancel-then-submit** and emits both sets of events. It
    works, but a client sees a `Canceled` it did not ask for.
-3. **`ingress_ns` is a reserved field that is always zero**, and there is no
-   `match_ns`. Deliberate: a timestamp taken in the gateway measures our own
-   scheduling jitter rather than arrival, so filling it in would look like the
-   feature and be a lie.
+3. **Timestamps are stamped in the gateway, not at the NIC.** So they measure
+   our own scheduling as well as the network, and the resolution is the group
+   rather than the packet. `SO_TIMESTAMPING` is where the real value comes from
+   and the field is already the right shape for it. `match_ns` is also not
+   journalled -- a 64-byte command has no room -- so a replay re-emits it as
+   zero.
 4. **openraft's reported 40 ms blocking issue is unverified** against our
    batching pattern. Measure before committing to it on the data path.
 

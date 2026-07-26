@@ -44,8 +44,25 @@ struct Running {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Nanoseconds since the epoch, the same clock the venue stamps with.
+fn wall_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64)
+}
+
 impl Running {
+    /// A venue that stamps arrival and match times, which a deployment does and
+    /// a measurement run does not.
+    fn start_stamped() -> Self {
+        Self::configured(false, None, true)
+    }
+
     fn start(authenticated: bool, rate: Option<RateLimit>) -> Self {
+        Self::configured(authenticated, rate, false)
+    }
+
+    fn configured(authenticated: bool, rate: Option<RateLimit>, timestamps: bool) -> Self {
         let mut instruments = Instruments::new();
         instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000, 65_536));
         let mut server = Server::bind("127.0.0.1:0", MemoryLog::new(), instruments, 4_096, 256, 64)
@@ -60,6 +77,7 @@ impl Running {
         if let Some(rate) = rate {
             server.rate_limit(rate);
         }
+        server.stamp_times(timestamps);
         for account in [ALICE, BOB] {
             for asset in [USD, BTC] {
                 server
@@ -739,5 +757,96 @@ fn a_refusal_is_counted_against_the_reason_it_was_refused() {
     assert!(
         reaches(&venue.duplicate_rejects, 1) >= 1,
         "a duplicate order ID was refused but not counted as such"
+    );
+}
+
+// -------------------------------------------------------------- timestamps
+
+#[test]
+fn an_acknowledgement_carries_when_the_venue_saw_the_order() {
+    // The field spent its first life as a reserved zero. What makes it real is
+    // that it is stamped before sequencing and travels inside the command, so a
+    // replay reproduces it instead of reading a clock.
+    let venue = Running::start_stamped();
+    let mut client = venue.connect();
+
+    let before = wall_ns();
+    send(&mut client, &[order(ALICE, 1, 10_500)]);
+    let events = collect_until(&mut client, Duration::from_secs(3), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Received as u8)
+    });
+    let after = wall_ns();
+
+    let ack = events
+        .iter()
+        .find(|e| e.kind == EventKind::Received as u8)
+        .expect("no acknowledgement");
+    let ingress = ack.ingress_ns();
+    let matched = ack.match_ns();
+
+    assert!(
+        (before..=after).contains(&ingress),
+        "arrival stamped {ingress}, outside the {before}..{after} the test spanned"
+    );
+    assert!(
+        (before..=after).contains(&matched),
+        "match stamped {matched}, outside the {before}..{after} the test spanned"
+    );
+    assert!(
+        matched >= ingress,
+        "the venue matched an order {} ns before it arrived",
+        ingress - matched
+    );
+}
+
+#[test]
+fn a_venue_without_timestamps_stamps_nothing_rather_than_guessing() {
+    // The measurement configuration, and the one every benchmark runs. A zero
+    // here is a stated absence; a plausible-looking number would be a lie that
+    // survives into somebody's compliance report.
+    let venue = Running::start(false, None);
+    let mut client = venue.connect();
+    send(&mut client, &[order(ALICE, 1, 10_500)]);
+    let events = collect_until(&mut client, Duration::from_secs(3), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Received as u8)
+    });
+    let ack = events
+        .iter()
+        .find(|e| e.kind == EventKind::Received as u8)
+        .expect("no acknowledgement");
+    assert_eq!(ack.ingress_ns(), 0);
+    assert_eq!(ack.match_ns(), 0);
+}
+
+#[test]
+fn every_order_in_one_group_shares_an_arrival_time() {
+    // Stated rather than accidental: the clock is read once a pass, so the
+    // resolution is the pass. A client comparing two orders from one write must
+    // not read a difference into stamps that were never measured apart.
+    let venue = Running::start_stamped();
+    let mut client = venue.connect();
+    let batch: Vec<Command> = (1..=32).map(|id| order(ALICE, id, 10_500)).collect();
+    send(&mut client, &batch);
+
+    let events = collect_until(&mut client, Duration::from_secs(3), |seen| {
+        answered(seen) >= 32
+    });
+    let stamps: std::collections::BTreeSet<u64> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Received as u8)
+        .map(Event::ingress_ns)
+        .collect();
+    assert!(!stamps.is_empty(), "nothing was acknowledged");
+    assert!(
+        stamps.iter().all(|stamp| *stamp > 0),
+        "an order was acknowledged with no arrival time"
+    );
+    // A pass reads one buffer per session, so 32 orders may span a few passes;
+    // what matters is that it is a handful of readings, not thirty-two.
+    assert!(
+        stamps.len() <= 8,
+        "32 orders produced {} distinct arrival times, so the clock is being \
+         read per command rather than per pass",
+        stamps.len()
     );
 }

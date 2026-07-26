@@ -130,6 +130,13 @@ impl<S: LogStorage> Venue<S> {
         &self.exchange
     }
 
+    /// The exchange, mutably. For the few things the gateway hands *in* rather
+    /// than asks for — the clock reading a group is stamped with, which the
+    /// deterministic path must never take for itself.
+    pub const fn exchange_mut(&mut self) -> &mut Exchange<S> {
+        &mut self.exchange
+    }
+
     #[must_use]
     pub const fn hub(&self) -> &Hub {
         &self.hub

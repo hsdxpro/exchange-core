@@ -547,6 +547,27 @@ mod tests {
     }
 
     #[test]
+    fn an_arrival_time_survives_the_journal() {
+        // The whole reason the stamp goes on the command rather than on the
+        // event: a replayed venue reproduces when each order arrived instead of
+        // re-reading a clock, which would make recovery a different run.
+        let mut journal = Journal::open(MemoryLog::new()).unwrap();
+        for id in 0..8_u64 {
+            let mut record = command(id);
+            record.ingress_ns = 1_700_000_000_000_000_000 + id;
+            journal.append(&mut record).unwrap();
+        }
+        let replayed = journal.replay().collect_all().unwrap();
+        for (id, record) in replayed.iter().enumerate() {
+            assert_eq!(
+                record.ingress_ns,
+                1_700_000_000_000_000_000 + id as u64,
+                "the arrival time did not survive replay"
+            );
+        }
+    }
+
+    #[test]
     fn replay_can_start_from_a_snapshot_sequence() {
         let journal = journal_with(100);
         let tail = journal

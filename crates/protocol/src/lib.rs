@@ -235,6 +235,13 @@ impl fmt::Display for RejectReason {
 #[repr(u8)]
 pub enum EventKind {
     /// Durable and sequenced. Not yet matched.
+    ///
+    /// Carries the two timestamps, because it is the one event every command
+    /// produces and its `quantity` and `price` would otherwise be zero: see
+    /// [`Event::ingress_ns`] and [`Event::match_ns`]. Putting them in a field of
+    /// their own would mean a 72-byte event, and an event that no longer fits a
+    /// cache line costs every subscriber on every message to carry a number most
+    /// of them never read.
     Received = 0,
     Rejected = 1,
     Resting = 2,
@@ -356,6 +363,36 @@ impl Event {
             11 => Some(EventKind::Bbo),
             _ => None,
         }
+    }
+
+    /// When the venue read this command off the wire, in nanoseconds since the
+    /// Unix epoch. Meaningful only on [`EventKind::Received`].
+    ///
+    /// Journalled inside the command, so a replay reproduces it rather than
+    /// re-reading a clock — which is what keeps recovery deterministic. Zero
+    /// when the venue was configured without timestamps.
+    ///
+    /// Taken once per pass rather than once per command: every command in a
+    /// group was read from its socket in the same pass, so the resolution is the
+    /// pass and not the packet. True per-packet arrival has to come from the NIC
+    /// (`SO_TIMESTAMPING`); a reading taken in the gateway measures our own
+    /// scheduling as well as the network, and pretending otherwise is the lie
+    /// this field spent its first life telling by being always zero.
+    #[must_use]
+    pub const fn ingress_ns(&self) -> u64 {
+        self.quantity
+    }
+
+    /// When the group containing this command began matching. Meaningful only on
+    /// [`EventKind::Received`].
+    ///
+    /// **Not journalled**, and so not reproduced by replay: a recovered venue
+    /// re-emits these as zero. It is a measurement of the run, not a fact about
+    /// the order, and journalling it would need a field the 64-byte command
+    /// record does not have.
+    #[must_use]
+    pub const fn match_ns(&self) -> u64 {
+        self.price as u64
     }
 
     /// The nonce carried by an [`EventKind::Challenge`]. Meaningless for any
