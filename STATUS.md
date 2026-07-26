@@ -214,9 +214,12 @@ These were argued out. Do not relitigate without new information.
 - **Fees never touch matching.** Price-time priority on the raw limit price;
   fees apply at settlement. Fee-adjusted matching would couple the engine to
   account state and break determinism.
-- **Self-trade prevention: cancel-newest** by default. Protects resting
-  liquidity. Matches CME SMP and Binance `EXPIRE_TAKER`. Needs an owner on the
-  order — **not yet implemented.**
+- **Self-trade prevention: cancel-newest.** Protects resting liquidity; matches
+  CME SMP and Binance `EXPIRE_TAKER`. Implemented without widening the engine's
+  order record: the pipeline already knows every resting order owner, so the
+  question is answered above the engine. Guarded by a per-(account, symbol)
+  resting count, so an account with nothing resting -- almost every taker --
+  answers it in one lookup and never touches the book.
 - **MBP public, MBO colocated only.** MBO leaks trading patterns and is 10–100×
   the volume.
 - **Price levels and order slots are different things and must not share a
@@ -280,8 +283,6 @@ These were argued out. Do not relitigate without new information.
 
 Ordered by how much it matters.
 
-1. **No owner on the order**, so self-trade prevention cannot be implemented.
-   Requires `OrderSlot` to grow from 24 to 32 bytes in the engine.
 4. **`CancelReplace` is cancel-then-submit** and emits both sets of events. It
    works, but a client sees a `Canceled` it did not ask for.
 7. **openraft's reported 40 ms blocking issue is unverified** against our

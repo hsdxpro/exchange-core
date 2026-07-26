@@ -215,6 +215,47 @@ impl Book {
         out
     }
 
+    /// Walks the resting orders an incoming order would trade against, best
+    /// price first, stopping at the first level it cannot reach.
+    ///
+    /// `market` orders reach every level, since they carry no limit. `visitor`
+    /// returns false to stop, so a caller that only needs the first few orders
+    /// pays for the first few rather than for the whole book.
+    pub fn for_each_crossable(
+        &self,
+        side: Side,
+        limit: Ticks,
+        market: bool,
+        mut visitor: impl FnMut(Resting) -> bool,
+    ) {
+        let resting_side = side.opposite();
+        let engine_side = engine_side(resting_side);
+        let mut walking = true;
+        self.engine.for_each_level_while(engine_side, |slot, _| {
+            let price = self.instrument.to_price(slot);
+            // A bid reaches prices at or below its limit; an ask at or above.
+            let reachable = market
+                || match side {
+                    Side::Bid => price <= limit,
+                    Side::Ask => price >= limit,
+                };
+            if !reachable {
+                return false;
+            }
+            self.engine
+                .for_each_order_at_level_while(engine_side, slot, |view| {
+                    walking = visitor(Resting {
+                        order: self.slots.order_of(view.id),
+                        side: resting_side,
+                        price,
+                        quantity: u64::from(view.quantity),
+                    });
+                    walking
+                });
+            walking
+        });
+    }
+
     /// Walks every resting order in price-then-time priority.
     ///
     /// That is exactly the order they have to be restored in, so a snapshot

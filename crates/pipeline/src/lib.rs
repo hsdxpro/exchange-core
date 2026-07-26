@@ -60,6 +60,15 @@ pub struct Exchange<S: LogStorage> {
     /// several times per command and nothing iterates it, so ordering is not
     /// needed and O(log n) tree descents are pure cost.
     reservations: FastMap<OrderId, Reservation>,
+    /// How many orders each account has resting on each symbol.
+    ///
+    /// Exists so self-match prevention can answer "could this possibly trade
+    /// against itself" in one lookup. An account with nothing resting on the
+    /// symbol cannot self-match, which is the overwhelming majority of orders,
+    /// and they skip the check entirely. One entry per account that is actually
+    /// resting something, so the memory is bounded by open orders rather than by
+    /// how many accounts exist.
+    resting_per_account: FastMap<(AccountId, SymbolId), u32>,
     events: Vec<Event>,
     /// Set once [`Self::commit`] has handed the current batch's events out, so
     /// the next enqueue knows to start a fresh batch rather than append to one
@@ -85,6 +94,7 @@ impl<S: LogStorage> Exchange<S> {
             instruments,
             books,
             reservations: FastMap::default(),
+            resting_per_account: FastMap::default(),
             events: Vec::new(),
             released: true,
             event_sequence: 0,
@@ -305,7 +315,7 @@ impl<S: LogStorage> Exchange<S> {
                 Self::violation();
                 continue;
             }
-            self.reservations.insert(
+            self.hold(
                 record.order_id,
                 Reservation {
                     account: record.account,
@@ -370,6 +380,22 @@ impl<S: LogStorage> Exchange<S> {
             return;
         }
 
+        // Self-match prevention, cancel-newest: an order that would trade
+        // against its own account is refused, and the resting side is left
+        // alone. Protecting resting liquidity is the point -- the alternative,
+        // cancelling the resting order, lets anyone destroy their own queue
+        // position by accident and is worse for the book. This matches CME's
+        // self-match protection and Binance's EXPIRE_TAKER.
+        //
+        // Checked before matching rather than during it. The engine knows
+        // nothing about accounts, and the pipeline already knows every resting
+        // order's owner, so the ownership question is answerable here without
+        // widening the engine's order record.
+        if self.would_self_match(command, side) {
+            self.reject(command, RejectReason::SelfMatchPrevented);
+            return;
+        }
+
         let market = command.is_market();
 
         let (asset, amount) = match side {
@@ -405,7 +431,7 @@ impl<S: LogStorage> Exchange<S> {
             self.reject(command, RejectReason::InsufficientBalance);
             return;
         }
-        self.reservations.insert(
+        self.hold(
             command.order_id,
             Reservation {
                 account: command.account,
@@ -448,6 +474,48 @@ impl<S: LogStorage> Exchange<S> {
         }
         self.emit_outcome(command, side, &outcome);
         self.scratch = outcome;
+    }
+
+    /// Whether this order would actually trade against its own account.
+    ///
+    /// Walks the resting orders in the order the engine would consume them and
+    /// stops once this order's quantity is exhausted. Asking merely "does this
+    /// account own anything I could reach" is not the same question and gets
+    /// the answer wrong: a market order reaches every level, so an account with
+    /// any resting order at all would never be able to take liquidity again,
+    /// even when it would be filled several levels before meeting itself.
+    ///
+    /// Stops at the first order it owns, so an order that crosses nothing pays
+    /// for nothing and an aggressive one pays only for what it would sweep.
+    fn would_self_match(&self, command: &Command, side: Side) -> bool {
+        // One lookup, and almost every order stops here: an account with nothing
+        // resting on this symbol cannot possibly trade against itself, so the
+        // common case never touches the book at all.
+        if !self
+            .resting_per_account
+            .contains_key(&(command.account, command.symbol))
+        {
+            return false;
+        }
+        let Some(book) = self.books.get(&command.symbol) else {
+            return false;
+        };
+        let mut remaining = command.quantity;
+        let mut ours = false;
+        book.for_each_crossable(side, command.price, command.is_market(), |resting| {
+            if self
+                .reservations
+                .get(&resting.order)
+                .is_some_and(|held| held.account == command.account)
+            {
+                ours = true;
+                return false;
+            }
+            remaining = remaining.saturating_sub(resting.quantity);
+            // Everything past this point is beyond what the order can fill.
+            remaining > 0
+        });
+        ours
     }
 
     /// Returns whether the order was actually cancelled.
@@ -624,10 +692,27 @@ impl<S: LogStorage> Exchange<S> {
         }
     }
 
+    /// Records a hold, and that the account now has one more order resting.
+    fn hold(&mut self, order: OrderId, reservation: Reservation) {
+        let key = (reservation.account, reservation.symbol);
+        if self.reservations.insert(order, reservation).is_none() {
+            *self.resting_per_account.entry(key).or_insert(0) += 1;
+        }
+    }
+
     fn release_all(&mut self, order: OrderId) {
         if let Some(reservation) = self.reservations.get(&order).copied() {
             self.release(order, reservation.remaining);
             self.reservations.remove(&order);
+            let key = (reservation.account, reservation.symbol);
+            if let Some(count) = self.resting_per_account.get_mut(&key) {
+                *count -= 1;
+                // Dropped rather than left at zero, so the map stays the size of
+                // what is actually resting.
+                if *count == 0 {
+                    self.resting_per_account.remove(&key);
+                }
+            }
         }
     }
 

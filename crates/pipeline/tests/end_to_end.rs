@@ -584,30 +584,98 @@ fn cancel_replace_of_an_unknown_order_must_not_create_one() {
 }
 
 #[test]
-fn an_account_trading_with_itself_conserves_its_own_balances() {
+fn an_order_that_would_trade_with_itself_is_refused_and_the_resting_side_kept() {
     let mut exchange = funded();
-    let usd_before = exchange.accounts().balance(1, USD).total();
-    let btc_before = exchange.accounts().balance(1, BTC).total();
 
-    // Same account on both sides. Self-trade prevention is not implemented
-    // yet, so this matches; the accounting must still balance.
+    // Account 1 rests an ask, then tries to buy it back.
     let mut sell = limit_order(1, SYMBOL, 101, Side::Ask, 10_100, 5);
     exchange.submit(&mut sell).unwrap();
     let mut buy = limit_order(1, SYMBOL, 102, Side::Bid, 10_100, 5);
-    exchange.submit(&mut buy).unwrap();
+    let events = exchange.submit(&mut buy).unwrap().to_vec();
 
     assert_eq!(
-        exchange.accounts().balance(1, USD).total(),
-        usd_before,
-        "a self-trade changed the account's USD"
+        events
+            .iter()
+            .find(|e| e.kind == EventKind::Rejected as u8)
+            .map(|e| e.reject_reason),
+        Some(RejectReason::SelfMatchPrevented as u8),
+        "the self-match was allowed: {events:?}"
     );
+    // Cancel-newest: the incoming order is the one refused, and the resting
+    // liquidity is untouched.
     assert_eq!(
-        exchange.accounts().balance(1, BTC).total(),
-        btc_before,
-        "a self-trade changed the account's BTC"
+        exchange.book(SYMBOL).unwrap().depth(Side::Ask, 10),
+        vec![(10_100, 5)],
+        "the resting order was destroyed instead of the incoming one"
     );
+    assert!(
+        exchange
+            .book(SYMBOL)
+            .unwrap()
+            .depth(Side::Bid, 10)
+            .is_empty(),
+        "the refused order rested anyway"
+    );
+    // And it left no hold behind.
     assert_eq!(exchange.accounts().balance(1, USD).reserved, 0);
-    assert_eq!(exchange.accounts().balance(1, BTC).reserved, 0);
+}
+
+#[test]
+fn an_order_that_is_filled_before_meeting_itself_still_trades() {
+    let mut exchange = funded();
+
+    // Account 2 is best; account 1 is behind it at a worse price.
+    let mut theirs = limit_order(2, SYMBOL, 201, Side::Ask, 10_100, 5);
+    exchange.submit(&mut theirs).unwrap();
+    let mut ours = limit_order(1, SYMBOL, 101, Side::Ask, 10_200, 5);
+    exchange.submit(&mut ours).unwrap();
+
+    // Account 1 buys 5: filled entirely by account 2, never reaching its own
+    // order. Refusing this would be wrong -- it is not a self-match.
+    let mut buy = limit_order(1, SYMBOL, 102, Side::Bid, 10_250, 5);
+    let events = exchange.submit(&mut buy).unwrap().to_vec();
+
+    assert!(
+        !events.iter().any(|e| e.kind == EventKind::Rejected as u8),
+        "a trade that never met itself was refused: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Filled as u8),
+        "it should have traded"
+    );
+    // Account 1's own ask is still resting.
+    assert_eq!(
+        exchange.book(SYMBOL).unwrap().depth(Side::Ask, 10),
+        vec![(10_200, 5)]
+    );
+}
+
+#[test]
+fn a_sweep_that_would_reach_its_own_order_is_refused() {
+    let mut exchange = funded();
+
+    let mut theirs = limit_order(2, SYMBOL, 201, Side::Ask, 10_100, 2);
+    exchange.submit(&mut theirs).unwrap();
+    let mut ours = limit_order(1, SYMBOL, 101, Side::Ask, 10_200, 5);
+    exchange.submit(&mut ours).unwrap();
+
+    // Buying 5 takes account 2's 2 and then reaches account 1's own order.
+    let mut buy = limit_order(1, SYMBOL, 102, Side::Bid, 10_250, 5);
+    let events = exchange.submit(&mut buy).unwrap().to_vec();
+
+    assert_eq!(
+        events
+            .iter()
+            .find(|e| e.kind == EventKind::Rejected as u8)
+            .map(|e| e.reject_reason),
+        Some(RejectReason::SelfMatchPrevented as u8),
+        "a sweep that reaches its own order was allowed: {events:?}"
+    );
+    // Nothing traded, so both asks are intact.
+    assert_eq!(
+        exchange.book(SYMBOL).unwrap().depth(Side::Ask, 10),
+        vec![(10_100, 2), (10_200, 5)]
+    );
 }
 
 #[test]
