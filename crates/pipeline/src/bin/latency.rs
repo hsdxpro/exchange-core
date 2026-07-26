@@ -40,8 +40,8 @@ fn venue() -> Exchange<MemoryLog> {
     ));
     let mut exchange = Exchange::new(MemoryLog::new(), instruments).unwrap();
     for account in 1..=16 {
-        exchange.deposit(account, USD, u128::from(u64::MAX));
-        exchange.deposit(account, BTC, u128::from(u64::MAX));
+        exchange.deposit(account, USD, u64::MAX).unwrap();
+        exchange.deposit(account, BTC, u64::MAX).unwrap();
     }
     exchange
 }
@@ -277,8 +277,8 @@ fn on_disk(sink: &mut u64, batch: usize) -> Vec<f64> {
         ));
         let mut exchange = Exchange::new(FileLog::open(&path).unwrap(), instruments).unwrap();
         for account in 1..=16 {
-            exchange.deposit(account, USD, u128::from(u64::MAX));
-            exchange.deposit(account, BTC, u128::from(u64::MAX));
+            exchange.deposit(account, USD, u64::MAX).unwrap();
+            exchange.deposit(account, BTC, u64::MAX).unwrap();
         }
 
         let mut commands: Vec<Command> = (0..COUNT)
@@ -360,8 +360,8 @@ fn recovery() -> (f64, f64, u64) {
     ));
     let mut full = Exchange::new(storage, instruments).unwrap();
     for account in 1..=16 {
-        full.deposit(account, USD, u128::from(u64::MAX));
-        full.deposit(account, BTC, u128::from(u64::MAX));
+        full.deposit(account, USD, u64::MAX).unwrap();
+        full.deposit(account, BTC, u64::MAX).unwrap();
     }
     let started = Instant::now();
     let replayed = full.recover().unwrap();

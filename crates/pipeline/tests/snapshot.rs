@@ -18,7 +18,7 @@ use bx_pipeline::snapshot::Snapshot;
 use bx_pipeline::{Exchange, accounting_violations, limit_order, market_order};
 use bx_protocol::{AccountId, EventKind, Side};
 use common::{
-    ACCOUNTS, BTC, START_BTC, START_USD, SYMBOL, TraderPopulation, USD, fund, funded, instruments,
+    ACCOUNTS, BTC, START_BTC, START_USD, SYMBOL, TraderPopulation, USD, funded, instruments,
 };
 
 /// Every resting order, in queue order. This is the comparison that catches a
@@ -68,10 +68,9 @@ fn a_snapshot_plus_the_journal_after_it_equals_a_full_replay() {
         let total = exchange.next_sequence();
         let storage = exchange.into_storage();
 
-        // Path A: replay everything from zero, re-applying deposits the way a
-        // venue would restore balances from its account store.
+        // Path A: replay everything from zero. Deposits are journalled, so
+        // nothing is re-applied by hand.
         let mut full = Exchange::new(storage, instruments()).unwrap();
-        fund(&mut full);
         assert_eq!(full.recover().unwrap(), total);
         let full_book = resting(&full);
         let full_holdings = holdings(&full);
@@ -158,11 +157,17 @@ fn a_snapshot_restores_balances_without_any_deposits() {
     assert_eq!(restored.accounts().balance(1, USD).reserved, held);
     assert_eq!(
         restored.accounts().balance(1, USD).total(),
-        START_USD,
+        u128::from(START_USD),
         "restored the wrong total"
     );
-    assert_eq!(restored.accounts().balance(1, BTC).total(), START_BTC);
-    assert_eq!(restored.accounts().total_supply(USD), START_USD * 8);
+    assert_eq!(
+        restored.accounts().balance(1, BTC).total(),
+        u128::from(START_BTC)
+    );
+    assert_eq!(
+        restored.accounts().total_supply(USD),
+        u128::from(START_USD) * 8
+    );
 }
 
 #[test]
@@ -186,7 +191,10 @@ fn a_restored_order_can_still_be_cancelled_and_releases_its_hold() {
         0,
         "cancelling a restored order did not release its hold"
     );
-    assert_eq!(restored.accounts().balance(1, USD).free, START_USD);
+    assert_eq!(
+        restored.accounts().balance(1, USD).free,
+        u128::from(START_USD)
+    );
 }
 
 #[test]
@@ -224,8 +232,11 @@ fn a_snapshot_survives_a_round_trip_through_a_real_file() {
 fn an_empty_venue_snapshots_and_restores_cleanly() {
     let exchange = funded();
     let snapshot = exchange.snapshot();
-    assert!(snapshot.orders.is_empty());
-    assert_eq!(snapshot.sequence, 0);
+    assert!(snapshot.orders.is_empty(), "no orders were placed");
+    // Not zero: funding the accounts is itself journalled, two deposits for
+    // each of the eight accounts.
+    assert_eq!(snapshot.sequence, 16);
+    assert_eq!(snapshot.balances.len(), 16);
 
     let mut restored = Exchange::new(exchange.into_storage(), instruments()).unwrap();
     assert_eq!(restored.recover_from(&snapshot).unwrap(), 0);
@@ -236,5 +247,8 @@ fn an_empty_venue_snapshots_and_restores_cleanly() {
             .depth(Side::Bid, 10)
             .is_empty()
     );
-    assert_eq!(restored.accounts().total_supply(USD), START_USD * 8);
+    assert_eq!(
+        restored.accounts().total_supply(USD),
+        u128::from(START_USD) * 8
+    );
 }

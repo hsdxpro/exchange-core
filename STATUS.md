@@ -240,6 +240,11 @@ These were argued out. Do not relitigate without new information.
 
 ### Things learned the hard way
 
+- **A restart that recovers every order but none of the money is not a
+  restart.** Deposits lived only in memory, so replay rebuilt the books and left
+  the balances at zero. It looked correct only because every recovery test
+  re-applied the deposits by hand before asserting. `CommandKind::Deposit` is
+  now journalled like anything else and those workarounds are gone.
 - **A swallowed error is how a money bug hides.** `settle` skipped an execution
   with a bare `continue` when a value it needed was missing, which would drop
   one side of a trade the engine had already matched and published. Every
@@ -271,8 +276,6 @@ Ordered by how much it matters.
 
 1. **No owner on the order**, so self-trade prevention cannot be implemented.
    Requires `OrderSlot` to grow from 24 to 32 bytes in the engine.
-3. **Deposits are not journalled.** Balances are not recovered by replay; tests
-   re-apply them manually. Needs a `Deposit` command kind.
 4. **`CancelReplace` is cancel-then-submit** and emits both sets of events. It
    works, but a client sees a `Canceled` it did not ask for.
 5. **`market_order` uses `Ticks::MIN` as its sentinel.** Works, but a real

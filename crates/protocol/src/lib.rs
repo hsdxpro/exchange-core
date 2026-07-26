@@ -80,6 +80,13 @@ pub enum CommandKind {
     AmendDown = 2,
     /// Cancel and re-enter with a new ID and new priority.
     CancelReplace = 3,
+    /// Credits an account. Journalled like everything else, so balances are
+    /// reproduced by replay rather than restored from somewhere else.
+    ///
+    /// A deposit names no instrument, so it reuses two fields: `symbol` carries
+    /// the asset credited and `quantity` the amount. See
+    /// [`Command::deposit_asset`].
+    Deposit = 4,
 }
 
 /// Why an order was refused. Every variant is a distinct, reportable reason; a
@@ -221,6 +228,13 @@ impl Event {
 }
 
 impl Command {
+    /// Asset credited by a [`CommandKind::Deposit`]. Meaningless for any other
+    /// kind: a deposit names no instrument, so it reuses the symbol field.
+    #[must_use]
+    pub const fn deposit_asset(&self) -> u32 {
+        self.symbol
+    }
+
     /// Builds a command with the sequence unset. The sequencer stamps it.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -259,6 +273,7 @@ impl Command {
             1 => Some(CommandKind::Cancel),
             2 => Some(CommandKind::AmendDown),
             3 => Some(CommandKind::CancelReplace),
+            4 => Some(CommandKind::Deposit),
             _ => None,
         }
     }
@@ -385,6 +400,22 @@ mod tests {
         let decoded = Command::read_from_bytes(command.as_bytes()).unwrap();
         assert_eq!(decoded.quantity, command.quantity);
         assert_eq!(decoded.price, command.price);
+    }
+
+    #[test]
+    fn every_command_kind_decodes_and_unknown_ones_are_refused() {
+        for (byte, kind) in [
+            (0, CommandKind::NewOrder),
+            (1, CommandKind::Cancel),
+            (2, CommandKind::AmendDown),
+            (3, CommandKind::CancelReplace),
+            (4, CommandKind::Deposit),
+        ] {
+            let mut command = sample();
+            command.kind = byte;
+            assert_eq!(command.kind(), Some(kind));
+            assert!(command.is_well_formed());
+        }
     }
 
     #[test]

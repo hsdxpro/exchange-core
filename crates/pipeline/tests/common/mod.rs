@@ -22,8 +22,8 @@ pub const MAX_OPEN_ORDERS: u32 = 200_000;
 
 /// Accounts the funded fixtures create, and what each starts with.
 pub const ACCOUNTS: std::ops::RangeInclusive<AccountId> = 1..=8;
-pub const START_USD: u128 = 100_000_000;
-pub const START_BTC: u128 = 10_000;
+pub const START_USD: u64 = 100_000_000;
+pub const START_BTC: u64 = 10_000;
 
 #[must_use]
 pub fn instruments() -> Instruments {
@@ -53,13 +53,12 @@ pub fn funded() -> Exchange<MemoryLog> {
     exchange
 }
 
-/// Restores the starting balances. Deposits are not journalled yet, so recovery
-/// tests re-apply them the way a real venue would restore from its account
-/// store.
+/// Credits the starting balances. These are journalled, so a recovery test does
+/// not re-apply them: replay reproduces them.
 pub fn fund(exchange: &mut Exchange<MemoryLog>) {
     for account in ACCOUNTS {
-        exchange.deposit(account, USD, START_USD);
-        exchange.deposit(account, BTC, START_BTC);
+        exchange.deposit(account, USD, START_USD).unwrap();
+        exchange.deposit(account, BTC, START_BTC).unwrap();
     }
 }
 

@@ -13,8 +13,8 @@ use bx_journal::MemoryLog;
 use bx_pipeline::{Exchange, accounting_violations, limit_order, market_order};
 use bx_protocol::{Command, CommandKind, Event, EventKind, RejectReason, Side, Ticks, TimeInForce};
 use common::{
-    BTC, FLOOR, START_BTC, START_USD, SYMBOL, TraderPopulation, USD, cancel, fund, funded,
-    instruments, venue,
+    BTC, FLOOR, START_BTC, START_USD, SYMBOL, TraderPopulation, USD, cancel, funded, instruments,
+    venue,
 };
 use std::collections::BTreeMap;
 
@@ -232,16 +232,22 @@ fn balances_move_correctly_and_nothing_is_created_or_destroyed() {
     );
 
     // Seller gave 5 BTC and received 5 * 10_100 USD.
-    assert_eq!(exchange.accounts().balance(1, BTC).total(), START_BTC - 5);
+    assert_eq!(
+        exchange.accounts().balance(1, BTC).total(),
+        u128::from(START_BTC) - 5
+    );
     assert_eq!(
         exchange.accounts().balance(1, USD).total(),
-        START_USD + 5 * 10_100
+        u128::from(START_USD) + 5 * 10_100
     );
     // Buyer received 5 BTC and paid for them.
-    assert_eq!(exchange.accounts().balance(2, BTC).total(), START_BTC + 5);
+    assert_eq!(
+        exchange.accounts().balance(2, BTC).total(),
+        u128::from(START_BTC) + 5
+    );
     assert_eq!(
         exchange.accounts().balance(2, USD).total(),
-        START_USD - 5 * 10_100
+        u128::from(START_USD) - 5 * 10_100
     );
 
     assert_eq!(
@@ -259,7 +265,7 @@ fn balances_move_correctly_and_nothing_is_created_or_destroyed() {
 #[test]
 fn an_order_beyond_the_balance_is_refused_and_leaves_no_trace() {
     let mut exchange = venue();
-    exchange.deposit(1, USD, 1_000); // enough for well under one lot
+    exchange.deposit(1, USD, 1_000).unwrap(); // enough for well under one lot
     let mut subscriber = Subscriber::default();
 
     let mut command = limit_order(1, SYMBOL, 101, Side::Bid, 10_100, 5);
@@ -291,7 +297,7 @@ fn an_order_beyond_the_balance_is_refused_and_leaves_no_trace() {
 fn one_account_cannot_reserve_the_same_balance_twice() {
     let mut exchange = venue();
     // Exactly enough for one order of 5 at 10_100, not two.
-    exchange.deposit(1, USD, 5 * 10_100);
+    exchange.deposit(1, USD, 5 * 10_100).unwrap();
     let mut subscriber = Subscriber::default();
 
     send(
@@ -375,7 +381,7 @@ fn a_trading_session_keeps_the_feed_and_the_book_in_agreement() {
 }
 
 #[test]
-fn replaying_the_journal_reproduces_the_book_exactly() {
+fn replaying_the_journal_restores_balances_as_well_as_orders() {
     for seed in [3_u64, 42, 1_234] {
         let mut exchange = funded();
         let mut subscriber = Subscriber::default();
@@ -395,11 +401,10 @@ fn replaying_the_journal_reproduces_the_book_exactly() {
         let sequences = exchange.next_sequence();
 
         // Restart: take the journal, build a clean exchange over it, replay.
-        // Deposits are not journalled yet, so they are re-applied the way a
-        // real venue would restore balances from its account store.
+        // Nothing is re-applied by hand -- deposits are journalled, so the
+        // money comes back from the log along with the orders.
         let storage = exchange.into_storage();
         let mut recovered = Exchange::new(storage, instruments()).unwrap();
-        fund(&mut recovered);
         let replayed = recovered.recover().unwrap();
 
         assert_eq!(
@@ -454,7 +459,6 @@ fn a_crash_before_sync_loses_nothing_that_was_acknowledged() {
     storage.crash();
 
     let mut recovered = Exchange::new(storage, instruments()).unwrap();
-    fund(&mut recovered);
     let replayed = recovered.recover().unwrap();
 
     assert_eq!(replayed, acknowledged, "an acknowledged command was lost");
@@ -534,9 +538,9 @@ fn an_account_trading_with_itself_conserves_its_own_balances() {
 fn a_market_buy_cannot_spend_more_than_the_account_has() {
     let mut exchange = venue();
     // Seller has plenty of BTC.
-    exchange.deposit(2, BTC, 1_000);
+    exchange.deposit(2, BTC, 1_000).unwrap();
     // Buyer can afford exactly 1 unit at 10_100.
-    exchange.deposit(1, USD, 10_100);
+    exchange.deposit(1, USD, 10_100).unwrap();
 
     let mut ask = limit_order(2, SYMBOL, 201, Side::Ask, 10_100, 100);
     exchange.submit(&mut ask).unwrap();

@@ -87,8 +87,26 @@ impl<S: LogStorage> Exchange<S> {
         })
     }
 
-    pub fn deposit(&mut self, account: AccountId, asset: instrument::AssetId, amount: u128) {
-        self.accounts.deposit(account, asset, amount);
+    /// Credits an account, journalling it so replay reproduces the balance.
+    ///
+    /// Balances used to live only in memory, which meant a restart recovered
+    /// every order but none of the money behind them, and recovery only looked
+    /// correct because the caller re-applied deposits by hand.
+    ///
+    /// # Errors
+    /// Fails only if the journal cannot be written.
+    pub fn deposit(
+        &mut self,
+        account: AccountId,
+        asset: instrument::AssetId,
+        amount: Quantity,
+    ) -> bx_journal::Result<()> {
+        let mut command = deposit(account, asset, amount);
+        self.journal.append(&mut command)?;
+        self.journal.sync()?;
+        self.events.clear();
+        self.apply(command);
+        Ok(())
     }
 
     #[must_use]
@@ -281,6 +299,11 @@ impl<S: LogStorage> Exchange<S> {
                 self.apply_cancel(&command);
             }
             CommandKind::AmendDown => self.apply_amend(&command),
+            CommandKind::Deposit => self.accounts.deposit(
+                command.account,
+                command.deposit_asset(),
+                u128::from(command.quantity),
+            ),
             CommandKind::CancelReplace => {
                 // The replacement is only submitted if the original was
                 // actually cancelled. Replacing an order that does not exist
@@ -723,6 +746,21 @@ pub fn market_order(
         Ticks::MIN,
         quantity,
         TimeInForce::ImmediateOrCancel,
+    )
+}
+
+/// Credits an account. `symbol` carries the asset, `quantity` the amount.
+#[must_use]
+pub fn deposit(account: AccountId, asset: instrument::AssetId, amount: Quantity) -> Command {
+    Command::new(
+        CommandKind::Deposit,
+        account,
+        asset,
+        0,
+        Side::Bid,
+        0,
+        amount,
+        TimeInForce::GoodTillCancel,
     )
 }
 
