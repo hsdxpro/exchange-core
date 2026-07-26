@@ -278,8 +278,6 @@ Ordered by how much it matters.
    Requires `OrderSlot` to grow from 24 to 32 bytes in the engine.
 4. **`CancelReplace` is cancel-then-submit** and emits both sets of events. It
    works, but a client sees a `Canceled` it did not ask for.
-5. **`market_order` uses `Ticks::MIN` as its sentinel.** Works, but a real
-   protocol should carry an explicit order-type field.
 7. **openraft's reported 40 ms blocking issue is unverified** against our
    batching pattern. Measure before committing to it on the data path.
 

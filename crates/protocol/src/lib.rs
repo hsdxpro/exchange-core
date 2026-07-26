@@ -71,6 +71,21 @@ pub enum TimeInForce {
     PostOnly = 3,
 }
 
+/// Whether an order names a price or takes whatever the book offers.
+///
+/// Carried explicitly rather than inferred from a sentinel price. A market
+/// order used to be signalled by `Ticks::MIN`, which meant every reader had to
+/// know the trick, and a price field that is sometimes a price and sometimes a
+/// flag is a bug waiting to be written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(u8)]
+pub enum OrderType {
+    /// Rests or trades at `price`, never worse.
+    Limit = 0,
+    /// Takes the best available. `price` is unused.
+    Market = 1,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(u8)]
 pub enum CommandKind {
@@ -171,7 +186,7 @@ pub struct Command {
     pub kind: u8,
     pub side: u8,
     pub time_in_force: u8,
-    pub _pad: [u8; 1],
+    pub order_type: u8,
 }
 
 const _: () = assert!(size_of::<Command>() == 64);
@@ -228,6 +243,21 @@ impl Event {
 }
 
 impl Command {
+    #[must_use]
+    pub const fn order_type(&self) -> Option<OrderType> {
+        match self.order_type {
+            0 => Some(OrderType::Limit),
+            1 => Some(OrderType::Market),
+            _ => None,
+        }
+    }
+
+    /// True when this order takes liquidity at any price.
+    #[must_use]
+    pub const fn is_market(&self) -> bool {
+        matches!(self.order_type(), Some(OrderType::Market))
+    }
+
     /// Asset credited by a [`CommandKind::Deposit`]. Meaningless for any other
     /// kind: a deposit names no instrument, so it reuses the symbol field.
     #[must_use]
@@ -260,8 +290,16 @@ impl Command {
             kind: kind as u8,
             side: side as u8,
             time_in_force: time_in_force as u8,
-            _pad: [0; 1],
+            order_type: OrderType::Limit as u8,
         }
+    }
+
+    /// The same command as a market order: takes the best available price.
+    #[must_use]
+    pub const fn taking(mut self) -> Self {
+        self.order_type = OrderType::Market as u8;
+        self.price = 0;
+        self
     }
 
     /// Returns `None` if a discriminant is not a value this version defines,
@@ -302,7 +340,10 @@ impl Command {
     /// Called on replay, where the bytes may be truncated or corrupt.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        self.kind().is_some() && self.side().is_some() && self.time_in_force().is_some()
+        self.kind().is_some()
+            && self.side().is_some()
+            && self.time_in_force().is_some()
+            && self.order_type().is_some()
     }
 }
 
@@ -416,6 +457,31 @@ mod tests {
             assert_eq!(command.kind(), Some(kind));
             assert!(command.is_well_formed());
         }
+    }
+
+    #[test]
+    fn a_market_order_is_flagged_not_inferred_from_its_price() {
+        let limit = sample();
+        assert!(!limit.is_market());
+        assert_eq!(limit.order_type(), Some(OrderType::Limit));
+
+        let market = sample().taking();
+        assert!(market.is_market());
+        // The price field carries no hidden meaning for a market order.
+        assert_eq!(market.price, 0);
+        assert_eq!(
+            Command::read_from_bytes(market.as_bytes()).unwrap(),
+            market,
+            "the flag did not survive the wire"
+        );
+    }
+
+    #[test]
+    fn an_unknown_order_type_is_refused_rather_than_treated_as_a_limit() {
+        let mut command = sample();
+        command.order_type = 200;
+        assert!(command.order_type().is_none());
+        assert!(!command.is_well_formed());
     }
 
     #[test]

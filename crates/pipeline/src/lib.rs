@@ -340,39 +340,28 @@ impl<S: LogStorage> Exchange<S> {
             return;
         }
 
-        // A market order carries no usable limit, so a buy holds the whole free
-        // quote balance and gets the unspent part back afterwards.
-        let market = command.price == Ticks::MIN;
+        let market = command.is_market();
 
         let (asset, amount) = match side {
             Side::Bid => {
-                let quote = instrument.quote;
-                let amount = if market {
-                    // The engine matches on quantity and knows nothing about
-                    // money, so the reservation has to cover the worst price
-                    // the ladder can represent. Reserving merely "whatever is
-                    // free" let a market buy sweep more than the account could
-                    // pay for, and the shortfall surfaced as a failed settle
-                    // after the trade had already happened.
-                    //
-                    // This is conservative: a proper affordability walk would
-                    // price the actual sweep, which needs an early-exit
-                    // traversal the engine does not expose today.
-                    let Some(amount) =
-                        instrument.notional(instrument.ceiling_ticks(), command.quantity)
-                    else {
-                        self.reject(command, RejectReason::QuantityTooLarge);
-                        return;
-                    };
-                    amount
+                // The engine matches on quantity and knows nothing about money,
+                // so a buy has to hold the quote asset up front. A market buy
+                // has no limit to price that against and holds at the worst
+                // price the band can represent, getting the unspent part back
+                // when the order ends. Reserving merely "whatever is free" let
+                // a market buy sweep more than the account could pay for, and
+                // the shortfall surfaced as a failed settle after the trade had
+                // already happened.
+                let price = if market {
+                    instrument.ceiling_ticks()
                 } else {
-                    let Some(amount) = instrument.notional(command.price, command.quantity) else {
-                        self.reject(command, RejectReason::QuantityTooLarge);
-                        return;
-                    };
-                    amount
+                    command.price
                 };
-                (quote, amount)
+                let Some(amount) = instrument.notional(price, command.quantity) else {
+                    self.reject(command, RejectReason::QuantityTooLarge);
+                    return;
+                };
+                (instrument.quote, amount)
             }
             Side::Ask => (instrument.base, u128::from(command.quantity)),
         };
@@ -544,8 +533,12 @@ impl<S: LogStorage> Exchange<S> {
             self.consume(command.order_id, taker_used);
             self.consume(execution.resting_order, maker_used);
 
-            // A buy that traded below its limit over-reserved; give it back.
+            // A buy that traded below its limit over-reserved; give it back. A
+            // market buy has no limit to compare against: it was reserved at
+            // the band ceiling and gets the whole unspent remainder back when
+            // the order ends.
             if side == Side::Bid
+                && !command.is_market()
                 && let Some(at_limit) = instrument.notional(command.price, execution.quantity)
                 && at_limit > notional
             {
@@ -728,7 +721,7 @@ impl<S: LogStorage> Exchange<S> {
     }
 }
 
-/// A market order: no usable limit, and a time in force that never rests.
+/// A market order: takes the best available price, and never rests.
 #[must_use]
 pub fn market_order(
     account: AccountId,
@@ -743,10 +736,11 @@ pub fn market_order(
         symbol,
         order_id,
         side,
-        Ticks::MIN,
+        0,
         quantity,
         TimeInForce::ImmediateOrCancel,
     )
+    .taking()
 }
 
 /// Credits an account. `symbol` carries the asset, `quantity` the amount.
