@@ -13,6 +13,7 @@
 //! minimum barely moves.
 
 use bx_journal::{FileLog, MemoryLog};
+use bx_pipeline::hub::{Channel, Hub};
 use bx_pipeline::instrument::{AssetId, Instrument, Instruments};
 use bx_pipeline::{Exchange, limit_order, market_order};
 use bx_protocol::{Command, CommandKind, Side, Ticks, TimeInForce};
@@ -72,6 +73,11 @@ fn resting_orders(sink: &mut u64) -> Vec<f64> {
             *sink = sink.wrapping_add(events.len() as u64);
         }
         samples.push(started.elapsed().as_secs_f64() * 1e9 / COUNT as f64);
+        assert_eq!(
+            exchange.open_orders() as u64,
+            COUNT,
+            "orders were rejected, so this measured the reject path"
+        );
         black_box(&exchange);
     }
     samples
@@ -97,6 +103,11 @@ fn crossing_orders(sink: &mut u64) -> Vec<f64> {
             *sink = sink.wrapping_add(events.len() as u64);
         }
         samples.push(started.elapsed().as_secs_f64() * 1e9 / COUNT as f64);
+        assert_eq!(
+            exchange.open_orders(),
+            0,
+            "every maker should have been consumed"
+        );
         black_box(&exchange);
     }
     samples
@@ -131,55 +142,64 @@ fn cancels(sink: &mut u64) -> Vec<f64> {
             *sink = sink.wrapping_add(events.len() as u64);
         }
         samples.push(started.elapsed().as_secs_f64() * 1e9 / COUNT as f64);
+        assert_eq!(exchange.open_orders(), 0, "a cancel did not take effect");
         black_box(&exchange);
     }
     samples
 }
 
 /// A realistic mix: mostly posting and cancelling, some taking.
+///
+/// One generator for every stream measurement, so they all price the same work
+/// and a difference between them is the thing being measured rather than a
+/// difference in traffic. Deterministic, so runs are comparable.
+fn mixed_commands(count: u64) -> Vec<Command> {
+    let mut state = 0x2026_u64;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        state >> 16
+    };
+    (0..count)
+        .map(|i| {
+            let account = 1 + next() % 16;
+            let roll = next() % 100;
+            if roll < 20 && i > 100 {
+                Command::new(
+                    CommandKind::Cancel,
+                    account,
+                    SYMBOL,
+                    i - 100,
+                    Side::Bid,
+                    0,
+                    0,
+                    TimeInForce::GoodTillCancel,
+                )
+            } else if roll < 30 {
+                market_order(account, SYMBOL, i + 1, Side::Bid, 1)
+            } else {
+                let side = if next().is_multiple_of(2) {
+                    Side::Bid
+                } else {
+                    Side::Ask
+                };
+                let price = match side {
+                    Side::Bid => FLOOR + 1_000 - (next() % 50) as Ticks,
+                    Side::Ask => FLOOR + 1_001 + (next() % 50) as Ticks,
+                };
+                limit_order(account, SYMBOL, i + 1, side, price, 1)
+            }
+        })
+        .collect()
+}
+
 fn mixed_stream(sink: &mut u64) -> Vec<f64> {
     const COUNT: u64 = 200_000;
     let mut samples = Vec::with_capacity(REPS);
     for _ in 0..REPS {
         let mut exchange = venue();
-        let mut state = 0x2026_u64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            state >> 16
-        };
-        let commands: Vec<Command> = (0..COUNT)
-            .map(|i| {
-                let account = 1 + next() % 16;
-                let roll = next() % 100;
-                if roll < 20 && i > 100 {
-                    Command::new(
-                        CommandKind::Cancel,
-                        account,
-                        SYMBOL,
-                        i - 100,
-                        Side::Bid,
-                        0,
-                        0,
-                        TimeInForce::GoodTillCancel,
-                    )
-                } else if roll < 30 {
-                    market_order(account, SYMBOL, i + 1, Side::Bid, 1)
-                } else {
-                    let side = if next().is_multiple_of(2) {
-                        Side::Bid
-                    } else {
-                        Side::Ask
-                    };
-                    let price = match side {
-                        Side::Bid => FLOOR + 1_000 - (next() % 50) as Ticks,
-                        Side::Ask => FLOOR + 1_001 + (next() % 50) as Ticks,
-                    };
-                    limit_order(account, SYMBOL, i + 1, side, price, 1)
-                }
-            })
-            .collect();
+        let commands = mixed_commands(COUNT);
 
         let started = Instant::now();
         for mut command in commands {
@@ -192,6 +212,36 @@ fn mixed_stream(sink: &mut u64) -> Vec<f64> {
     samples
 }
 
+/// The same mixed traffic, with subscribers attached.
+///
+/// Fan-out is on the event path, so it is part of what a command costs. Three
+/// channels are subscribed -- depth, tape, and one private account -- which is
+/// what a real connected client set looks like from the venue's side.
+fn mixed_stream_with_subscribers(sink: &mut u64) -> Vec<f64> {
+    const COUNT: u64 = 200_000;
+    const RETAINED: usize = 8_192;
+    let mut samples = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut exchange = venue();
+        let mut hub = Hub::new(RETAINED);
+        hub.subscribe(Channel::Book(SYMBOL));
+        hub.subscribe(Channel::Trades(SYMBOL));
+        hub.subscribe(Channel::Account(1));
+        let commands = mixed_commands(COUNT);
+
+        let started = Instant::now();
+        for mut command in commands {
+            let events = exchange.submit(&mut command).unwrap();
+            hub.publish(events);
+            *sink = sink.wrapping_add(events.len() as u64);
+        }
+        samples.push(started.elapsed().as_secs_f64() * 1e9 / COUNT as f64);
+        black_box(&exchange);
+        black_box(&hub);
+    }
+    samples
+}
+
 /// The same mixed traffic, submitted in batches. One journal sync covers the
 /// whole batch, which is the difference between being sync-bound and being
 /// compute-bound.
@@ -200,44 +250,7 @@ fn batched_stream(sink: &mut u64, batch: usize) -> Vec<f64> {
     let mut samples = Vec::with_capacity(REPS);
     for _ in 0..REPS {
         let mut exchange = venue();
-        let mut state = 0x2026_u64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            state >> 16
-        };
-        let mut commands: Vec<Command> = (0..COUNT)
-            .map(|i| {
-                let account = 1 + next() % 16;
-                let roll = next() % 100;
-                if roll < 20 && i > 100 {
-                    Command::new(
-                        CommandKind::Cancel,
-                        account,
-                        SYMBOL,
-                        i - 100,
-                        Side::Bid,
-                        0,
-                        0,
-                        TimeInForce::GoodTillCancel,
-                    )
-                } else if roll < 30 {
-                    market_order(account, SYMBOL, i + 1, Side::Bid, 1)
-                } else {
-                    let side = if next().is_multiple_of(2) {
-                        Side::Bid
-                    } else {
-                        Side::Ask
-                    };
-                    let price = match side {
-                        Side::Bid => FLOOR + 1_000 - (next() % 50) as Ticks,
-                        Side::Ask => FLOOR + 1_001 + (next() % 50) as Ticks,
-                    };
-                    limit_order(account, SYMBOL, i + 1, side, price, 1)
-                }
-            })
-            .collect();
+        let mut commands = mixed_commands(COUNT);
 
         let started = Instant::now();
         for chunk in commands.chunks_mut(batch) {
@@ -406,6 +419,11 @@ fn main() {
     );
     report("cancel by order id", &mut cancels(&mut sink), "per cancel");
     report("mixed stream", &mut mixed_stream(&mut sink), "per command");
+    report(
+        "mixed stream, 3 subscribers",
+        &mut mixed_stream_with_subscribers(&mut sink),
+        "per command",
+    );
     report(
         "mixed stream, batch 64",
         &mut batched_stream(&mut sink, 64),
