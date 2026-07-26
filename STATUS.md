@@ -49,8 +49,10 @@ bea8c29  Bitmap-ladder matching engine and order book
 crates/engine/     bx-engine     the matching engine. ZERO dependencies,
                                  forbid(unsafe_code). Keep it that way.
 crates/protocol/   bx-protocol   wire types. Depends only on zerocopy.
-crates/journal/    bx-journal    append-only log + replay.
-crates/pipeline/   bx-pipeline   sequencer, accounts, books, events.
+crates/journal/    bx-journal    append-only log, replay, replication.
+crates/pipeline/   bx-pipeline   sequencer, accounts, books, events, snapshots.
+crates/gateway/    bx-gateway    framing, sessions, group commit, TCP server,
+                                 config. Binaries: venue, load.
 xtask/             xtask         local task runner. Replaces CI.
 ```
 
@@ -58,15 +60,21 @@ xtask/             xtask         local task runner. Replaces CI.
 
 ## 3. What exists and is tested
 
-**107 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**211 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
-| `bx-engine` | 44 | The engine's own suite, unchanged from the shipped version. |
-| `bx-protocol` | 6 | Record round-trip, 64-byte layout, unknown discriminants, short buffers. |
-| `bx-journal` | 15 | Append/replay, torn writes, crash before sync, corruption, sequence gaps, device failure, and the same against a real file. |
-| `bx-pipeline` | 28 | Instrument price mapping, balances and reservation, engine adapter, deltas, hashing. |
-| end-to-end | 14 | Full path with simulated traders and a subscriber. |
+| `bx-engine` | 44 | The engine's own suite. |
+| `bx-protocol` | 11 | Record layout, discriminants, order type, subscription channels. |
+| `bx-journal` | 22 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
+| `bx-pipeline` | 57 | Prices, balances, engine adapter, deltas, hashing, snapshots, and the crossable walk's complexity. |
+| `bx-gateway` | 24 | Framing, the group-commit loop, config parsing and validation. |
+| end-to-end | 19 | Full path with simulated traders and a subscriber. |
+| subscription | 7 | Channels, resume after disconnect, lagging out of the window. |
+| snapshot | 6 | Snapshot/restore equality with a full replay, queue priority. |
+| simulation | 4 | Seeded crash injection, torn writes, dead device, replay determinism. |
+| over sockets | 9 | Real TCP: split records, disconnects, bursts, selective subscription. |
+| venue snapshots | 7 | Cadence from a recovery target, atomic replace, corrupt snapshot refused. |
 
 ### The end-to-end tests matter most
 
@@ -88,75 +96,74 @@ Plus real journal replay (take the storage, build a fresh exchange over it, call
 
 ### Measured latency
 
-`cargo x latency`. Full path per command: sequence, journal append and sync,
-reserve, match, emit. In-memory journal, so no real disk.
+`cargo x latency`, minimum of five runs, whole run in 6.5 s. Full path per
+command: sequence, journal append, durability, reserve, match, emit.
 
-| Path | first cut | now |
-|---|---|---|
-| passive limit order | 432 ns | **117 ns** |
-| crossing order, one fill | 372 ns | **75 ns** |
-| cancel by order id | 298 ns | **118 ns** |
-| mixed stream | 500 ns | **169 ns** |
+| Path | ns |
+|---|---:|
+| passive limit order | 157 |
+| crossing order, one fill | 159 |
+| crossing, self-match check running | 162 |
+| cancel by order id | 75 |
+| mixed stream | 161 |
+| mixed stream, three subscribers attached | 160 |
+| mixed stream, batch 64 | 142 |
 
-Roughly 6M commands/sec on the mixed stream, up from 2M.
+Two of those are worth reading twice. **Fan-out to three channels is free** at
+this resolution -- 160 against 161 -- because publishing is a bounded ring write
+and nothing else. And **self-match prevention costs 3 ns** on the crossing path,
+because an account with nothing resting answers the question in one hash lookup
+and never touches the book.
 
-These drift by 10-20% between sessions on this desktop even for an unchanged
-binary, which is why the benchmark reports the minimum of seven runs and why no
-change is kept on a single-digit-percent showing. Checked directly, by building
-the binary at three commits, confirming the three checksums differ, and running
-them interleaved:
+These figures drift 2-3x on a loaded machine. The numbers above are from a quiet
+one; anything measured while a build is running is worthless.
 
-| commit | min | what it is |
-|---|---:|---|
-| `9104383` | 148 ns | current |
-| `fce3f32` | 146 ns | before the torn-write work |
-| `f8d2e78` | 154 ns | before the money fixes |
+### Durability, which is what actually bounds throughput
 
-A 5% spread, against the same binary reading 169 ns and 148 ns an hour apart.
-The correctness fixes cost nothing measurable, and nothing has regressed.
+The figures above are compute. Durability is a different order of magnitude, and
+the choice between the two rows below is the single biggest decision in the
+design.
 
-Three changes got there. The first was the one asked for, the second was the
-one that mattered, and the third was a bug fix that happened to help:
-
-1. **Zero allocation on the command path.** `Outcome` is a caller-owned buffer
-   that `Exchange` reuses; `Book` writes into it. Capacity settles at the
-   high-water mark of real traffic rather than a guessed reserve.
-2. **A fast hasher for integer keys.** The command path does about seven map
-   lookups, all keyed by integers. `SipHash` costs 20–30 ns each, which was most
-   of the budget. `FastMap` uses the FxHash finalizer instead, and
-   `reservations` moved from `BTreeMap` to a hash map since nothing iterates it.
-3. **Publishing only levels that actually changed.** The order's price was
-   touched speculatively before matching, so every command paid for level
-   lookups and events it did not need — and a market order, which addresses the
-   ladder extreme, published two deltas for a price no book occupies.
-
-### Against a real disk, which is the number that actually matters
-
-Everything above uses an in-memory journal. On a real file, per command:
-
-| batch size | per command | commands/sec |
+| per command | local fsync | quorum on loopback |
 |---|---:|---:|
-| 1 | **3,098,161 ns** | 322 |
-| 16 | 198,256 ns | 5,000 |
-| 256 | 15,168 ns | 66,000 |
-| 4,096 | **3,935 ns** | 254,000 |
+| batch 1 | 3,008,223 ns | **51,300 ns** |
+| batch 16 | 192,727 ns | 6,282 ns |
+| batch 256 | 14,950 ns | 3,324 ns |
+| batch 4,096 | 3,793 ns | — |
 
-One `fsync` costs about 3 ms here. The in-memory figure of 142 ns is **twenty
-thousand times smaller** than the real cost of an unbatched command, so all the
-micro-optimisation above is noise next to durability. Batching turns 3.1 ms into
-3.9 µs — a 787× improvement — which is the design's claim that batching is
-mandatory rather than an optimisation, now measured.
+**Reaching another machine beats reaching the platter by 59x at a group of one**,
+which is the latency-sensitive case a client feels. Batching narrows the gap
+because batching was always the way to hide an fsync; quorum acknowledgement is
+what removes the need to hide it. Loopback is the floor -- a real LAN adds tens
+of microseconds -- but the shape holds.
 
-Two consequences worth carrying:
+Compute is 161 ns and one fsync is 3 ms, so **durability is roughly nineteen
+thousand times the cost of matching**. Every micro-optimisation above is noise
+beside that choice.
 
-- **Even at batch 4,096 this is 254k commands/sec, not millions.** Local `fsync`
-  cannot reach the target on this hardware. Windows `FlushFileBuffers` is
-  unusually slow and Linux NVMe would do far better, but the shape holds.
-- **Replicating to memory on two other machines is probably faster than an
-  fsync to local disk.** A LAN round trip is 10–50 µs against 3 ms here. That is
-  precisely why real venues reach quorum over the network rather than waiting on
-  a platter, and it makes the openraft path a throughput decision as well as a
-  fault-tolerance one.
+### What a client actually experiences
+
+`venue` and `load` as separate processes over loopback TCP:
+
+| journal | round trip, one order in flight | pipelined |
+|---|---:|---:|
+| in memory | 8.7 us | 2.9M orders/sec |
+| real file, no replicas | 2,915 us | 127k orders/sec |
+
+The second row is one fsync per group and matches the table above. The first is
+**not a durable number** and must not be quoted as one.
+
+### Restart time
+
+| | |
+|---|---:|
+| replay all 100,000 commands | 12.0 ms |
+| snapshot + replay the last 5,000 | **1.3 ms** |
+
+A 9x saving with 2,002 orders in the snapshot. What it saves depends entirely on
+the ratio between the journal and the resting book, since restoring costs one
+insert per resting order: a journal where nothing is ever cancelled saturates the
+book and the snapshot saves almost nothing.
 
 ---
 
@@ -290,7 +297,22 @@ Ordered by how much it matters.
 
 ---
 
-## 6. Next steps, in order
+## 6. What is left
+
+Two items, both deliberate rather than forgotten:
+
+1. **Leader election.** Quorum durability is implemented and measured;
+   automatic failover is not. It needs consensus, hand-written consensus is how
+   distributed systems lose data quietly, and the right answer is `openraft`.
+   `ReplicatedLog` is the boundary where it belongs.
+2. **QUIC in place of TCP.** The transport is TCP. Swapping it is a `tcp.rs`
+   replacement -- `venue` and `codec` do not change -- which is why they are
+   separate.
+
+Smaller, if wanted: MBO for colocated clients, fee schedules at settlement,
+per-account rate limits.
+
+## 7. Earlier plan, now done
 
 The disk measurement reordered this list. Per-command compute is no longer the
 constraint, so **openraft moved up from last to second**: reaching a quorum in

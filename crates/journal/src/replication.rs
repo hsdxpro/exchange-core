@@ -199,10 +199,6 @@ impl<L: LogStorage> Replica<L> {
         self.held
     }
 
-    pub fn into_log(self) -> L {
-        self.log
-    }
-
     /// Serves one leader until it disconnects.
     ///
     /// # Errors
