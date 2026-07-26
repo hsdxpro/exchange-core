@@ -12,7 +12,7 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**269 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**285 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
@@ -21,11 +21,12 @@ timing is not evidence of anything.
 | `bx-journal` | 28 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
 | `bx-pipeline` | 56 | Prices, balances, engine adapter, deltas, hashing, snapshots, and the crossable walk's complexity. |
 | `bx-gateway` | 47 | Framing, the group-commit loop, the HMAC challenge, token buckets, config parsing and validation. |
-| end-to-end | 20 | Full path with simulated traders and a subscriber. |
+| end-to-end | 22 | Full path with simulated traders and a subscriber, and the open-order index under scrambled cancellation. |
 | subscription | 7 | Channels, resume after disconnect, lagging out of the window. |
 | snapshot | 6 | Snapshot/restore equality with a full replay, queue priority. |
 | simulation | 4 | Seeded crash injection, torn writes, dead device, replay determinism. |
-| over sockets | 16 | Real TCP: split records, disconnects, bursts, selective subscription. |
+| over sockets | 17 | Real TCP: split records, disconnects, bursts, selective subscription, top-of-book. |
+| top of book | 13 | What the cheap feed does not send, which is the whole point of it. |
 | venue snapshots | 7 | Cadence from a recovery target, atomic replace, corrupt snapshot refused. |
 | failover | 2 | Real processes: promotion recovers acked records, no majority means no service. |
 | idle cost | 2 | An idle connection stays under 120 ns a pass. |

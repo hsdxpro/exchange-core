@@ -47,6 +47,13 @@ struct Reservation {
     /// difference back.
     limit_price: Ticks,
     remaining: u128,
+    /// Where this order sits in its account's resting list, so taking it out is
+    /// a swap rather than a search.
+    ///
+    /// `u32` because an account cannot have more orders resting on a symbol than
+    /// the instrument's slot pool holds, and that is itself a `u32`. It also
+    /// costs nothing: the field lands in padding the struct already had.
+    at: u32,
 }
 
 #[derive(Debug)]
@@ -327,6 +334,8 @@ impl<S: LogStorage> Exchange<S> {
                     side,
                     limit_price: record.price,
                     remaining: record.reserved,
+                    // Filled in by `hold`, which is what knows where it landed.
+                    at: 0,
                 },
             );
         }
@@ -458,6 +467,7 @@ impl<S: LogStorage> Exchange<S> {
                 side,
                 limit_price: command.price,
                 remaining: amount,
+                at: 0,
             },
         );
 
@@ -732,31 +742,76 @@ impl<S: LogStorage> Exchange<S> {
     }
 
     /// Records a hold, and that the account now has one more order resting.
-    fn hold(&mut self, order: OrderId, reservation: Reservation) {
-        let key = (reservation.account, reservation.symbol);
-        if self.reservations.insert(order, reservation).is_none() {
-            self.resting_per_account.entry(key).or_default().push(order);
+    fn hold(&mut self, order: OrderId, mut reservation: Reservation) {
+        match self.reservations.get(&order) {
+            // Already indexed. It keeps its place, or the swap that removes it
+            // later would take out somebody else's order.
+            Some(existing) => reservation.at = existing.at,
+            None => {
+                let held = self
+                    .resting_per_account
+                    .entry((reservation.account, reservation.symbol))
+                    .or_default();
+                debug_assert!(held.len() < u32::MAX as usize, "resting list overflowed");
+                reservation.at = held.len() as u32;
+                held.push(order);
+            }
         }
+        self.reservations.insert(order, reservation);
     }
 
+    /// Takes an order out of its account's resting list in constant time.
+    ///
+    /// The position is carried on the reservation, which is already being looked
+    /// up here. Searching for it instead — which is what this did — made every
+    /// fill and every cancel cost a walk of that account's open orders: an
+    /// account resting fifty thousand quotes paid a fifty-thousand-element scan
+    /// per fill, and the benchmark measured 3 microseconds against the 159 ns the
+    /// same path costs with one order resting. Swapping without shifting was
+    /// already here; it was the search in front of it that dominated. This is
+    /// worst for exactly the client the venue exists to serve, since a market
+    /// maker is defined by having a great many orders resting at once.
     fn release_all(&mut self, order: OrderId) {
-        if let Some(reservation) = self.reservations.get(&order).copied() {
-            self.release(order, reservation.remaining);
-            self.reservations.remove(&order);
-            let key = (reservation.account, reservation.symbol);
-            if let Some(held) = self.resting_per_account.get_mut(&key) {
-                // Swap-remove: order within an account's list carries no meaning,
-                // and a market maker with thousands resting should not pay a
-                // shift for each cancel.
-                if let Some(at) = held.iter().position(|held| *held == order) {
-                    held.swap_remove(at);
-                }
-                // Dropped rather than left empty, so the map stays the size of
-                // what is actually resting.
-                if held.is_empty() {
-                    self.resting_per_account.remove(&key);
+        let Some(reservation) = self.reservations.get(&order).copied() else {
+            return;
+        };
+        self.release(order, reservation.remaining);
+        self.reservations.remove(&order);
+        let key = (reservation.account, reservation.symbol);
+        let Some(held) = self.resting_per_account.get_mut(&key) else {
+            return;
+        };
+
+        let at = reservation.at as usize;
+        if held.get(at).copied() == Some(order) {
+            held.swap_remove(at);
+            // Whatever was moved into the gap is no longer where its own
+            // reservation says it is.
+            if let Some(moved) = held.get(at).copied()
+                && let Some(entry) = self.reservations.get_mut(&moved)
+            {
+                entry.at = at as u32;
+            }
+        } else {
+            // The index disagrees with the list. That is a bug rather than a
+            // condition, and it is counted -- but the order still has to come
+            // out, because leaving it would let a cancelled order keep blocking
+            // a self-match and be reported as open. Correct first, fast second.
+            Self::violation();
+            if let Some(found) = held.iter().position(|held| *held == order) {
+                held.swap_remove(found);
+                if let Some(moved) = held.get(found).copied()
+                    && let Some(entry) = self.reservations.get_mut(&moved)
+                {
+                    entry.at = found as u32;
                 }
             }
+        }
+
+        // Dropped rather than left empty, so the map stays the size of what is
+        // actually resting.
+        if held.is_empty() {
+            self.resting_per_account.remove(&key);
         }
     }
 
@@ -781,6 +836,11 @@ impl<S: LogStorage> Exchange<S> {
     fn emit_levels(&mut self, command: &Command, outcome: &Outcome) {
         for change in &outcome.level_changes {
             self.push_level(command, change.side, change.price, change.quantity);
+        }
+        // Almost always empty. An order resting behind the touch moves the depth
+        // feed and nothing here, which is the entire point of the channel.
+        for change in &outcome.top_changes {
+            self.push_top(command, change.side, change.price, change.quantity);
         }
     }
 
@@ -812,6 +872,24 @@ impl<S: LogStorage> Exchange<S> {
             price: execution.price,
             symbol: command.symbol,
             kind: EventKind::Trade as u8,
+            side: side as u8,
+            reject_reason: RejectReason::None as u8,
+            _pad: [0; 1],
+        });
+    }
+
+    fn push_top(&mut self, command: &Command, side: Side, price: Ticks, quantity: u64) {
+        let sequence = self.take_sequence();
+        self.events.push(Event {
+            sequence,
+            cause_sequence: command.sequence,
+            account: 0,
+            order_id: 0,
+            counterparty_order_id: 0,
+            quantity,
+            price,
+            symbol: command.symbol,
+            kind: EventKind::Bbo as u8,
             side: side as u8,
             reject_reason: RejectReason::None as u8,
             _pad: [0; 1],

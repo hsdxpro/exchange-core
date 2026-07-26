@@ -868,8 +868,13 @@ impl<S: LogStorage> Server<S> {
         if command.kind() == Some(CommandKind::Subscribe) {
             let from = self.venue.subscribe(channel);
             self.session_at(index).follow(channel, from);
-            if let Channel::Book(symbol) = channel {
-                self.send_book_state(index, symbol, from);
+            // State before change, on both public feeds that carry state. A
+            // subscriber cannot derive where the book is from a stream that only
+            // says where it moved.
+            match channel {
+                Channel::Book(symbol) => self.send_book_state(index, symbol, from),
+                Channel::Bbo(symbol) => self.send_top_state(index, symbol, from),
+                Channel::Trades(_) | Channel::Account(_) => {}
             }
         } else {
             self.session_at(index).stop_following(channel);
@@ -887,6 +892,38 @@ impl<S: LogStorage> Server<S> {
         for resting in &orders {
             encode(
                 &bx_pipeline::order_state(account, symbol, resting),
+                &mut session.outbox,
+            );
+        }
+    }
+
+    /// Writes the current top of book to one session, one event a side.
+    ///
+    /// The same `Bbo` events the feed carries, not a separate snapshot kind: the
+    /// top of book *is* its own state, so restating it and changing it are the
+    /// same message. That is why this channel needs no equivalent of
+    /// `BookSnapshot`.
+    fn send_top_state(&mut self, index: usize, symbol: SymbolId, at: Sequence) {
+        let Some(book) = self.venue.book(symbol) else {
+            return;
+        };
+        let tops = [Side::Bid, Side::Ask].map(|side| {
+            let (price, quantity) = book.top(side);
+            (side, price, quantity)
+        });
+
+        let session = self.session_at(index);
+        for (side, price, quantity) in tops {
+            encode(
+                &Event {
+                    sequence: at,
+                    quantity,
+                    price,
+                    symbol,
+                    kind: EventKind::Bbo as u8,
+                    side: side as u8,
+                    ..Event::default()
+                },
                 &mut session.outbox,
             );
         }
@@ -1060,6 +1097,14 @@ impl<S: LogStorage> Server<S> {
                         session.outbox.clear();
                     }
                     self.send_book_state(index, symbol, at);
+                }
+                // Also state, and cheaper to restate than a book: two events.
+                Channel::Bbo(symbol) => {
+                    let at = self.venue.hub().next_sequence(channel).unwrap_or_default();
+                    if let Some(session) = self.sessions[index].as_mut() {
+                        session.reposition(channel, at);
+                    }
+                    self.send_top_state(index, symbol, at);
                 }
                 Channel::Trades(_) => {
                     let at = self.venue.hub().next_sequence(channel).unwrap_or_default();

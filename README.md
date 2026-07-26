@@ -12,29 +12,37 @@ Everything below is measured on the machine it was developed on, not estimated.
 
 | | |
 |---|---:|
-| passive limit order, full path | **157 ns** |
-| crossing order, one fill | **159 ns** |
-| cancel by order ID | **75 ns** |
-| three market-data subscribers attached | +0 ns (below noise) |
-| self-match prevention on the crossing path | +3 ns |
+| passive limit order, full path | **188 ns** |
+| crossing order, one fill | **224 ns** |
+| cancel by order ID | **106 ns** |
+| mixed stream | **171 ns** |
+| three market-data subscribers attached | +11 ns |
+| top-of-book feed, on every command | +8 ns |
 
 "Full path" means sequence, journal, balance reservation, match, and event
 emission — not the book in isolation.
+
+The crossing and cancel figures were **3,036 ns and 447 ns** until the index that
+answers "what does this account have working" stopped being searched linearly.
+It is the same index that makes self-match prevention one lookup, and taking an
+order out of it now costs a swap rather than a scan of the account's open
+orders — which is worst for exactly the client a venue exists to serve, since a
+market maker is defined by having thousands resting at once.
 
 Durability is a different order of magnitude, and choosing between these two rows
 is the largest decision in the design:
 
 | commands/sec, durable | local fsync | quorum of replicas |
 |---|---:|---:|
-| group of 1 | 318 | 19,644 |
-| group of 256 | 78,471 | 1,974,452 |
-| group of 16,384 | 2,975,883 | **6,222,727** |
+| group of 1 | 321 | 15,596 |
+| group of 256 | 77,989 | 1,477,527 |
+| group of 16,384 | 2,344,665 | **4,646,905** |
 
-At a group of 16,384 the quorum path costs 161 ns per command — which *is* the
-compute cost above. Durability has become free and the venue is bound by matching
-again. Reaching another machine beats reaching the platter by **59×** at a group
-of one, which is why the design acknowledges after a quorum rather than after a
-flush.
+At a group of 16,384 the quorum path costs 215 ns per command — which is roughly
+the compute cost above. Durability has become nearly free and the venue is bound
+by matching again. Reaching another machine beats reaching the platter by **49×**
+at a group of one, which is why the design acknowledges after a quorum rather
+than after a flush.
 
 Nothing in the code picks a group size. A group is whatever arrived since the
 last pass, so it grows under load — exactly when a sync needs amortising — and
@@ -46,15 +54,19 @@ acknowledged once a majority holds it.
 
 | durability | round trip, one order in flight | pipelined |
 |---|---:|---:|
-| none (journal in memory) | 8.6 µs | 3,764,252/sec |
-| local disk, one `fsync` per group | 3,066 µs | 662,951/sec |
-| **quorum of two followers** | **54.4 µs** | **931,871/sec** |
+| none (journal in memory) | 11.4 µs | 1,796,009/sec |
+| local disk, one `fsync` per group | 357 µs | 1,560,998/sec |
+| **quorum of two followers** | **66.7 µs** | **1,785,257/sec** |
 
-Reaching two other processes is **56× faster than reaching the platter**, which is
-the whole argument for acknowledging after a quorum, measured end to end rather
-than synthetically. With eight concurrent clients the same cluster does
-1,452,296 orders a second, because a group is whatever arrived since the last
-pass and more clients means larger groups.
+All three measured in one sitting, 200,000 orders each, so the rows are
+comparable with each other rather than with some earlier machine.
+
+Reaching two other processes is **5.4× faster than reaching the platter** on a
+single order in flight, which is the whole argument for acknowledging after a
+quorum — and the gap is far wider when there is nothing to amortise the sync
+over, which is exactly when a client is waiting. Pipelined, the three converge:
+once the group is large the sync is shared by thousands of orders and the venue
+is bound by matching instead.
 
 ### Does it hold at scale
 
@@ -62,11 +74,11 @@ Same traffic spread over more accounts, every order resting:
 
 | accounts | per command | holdings | balance memory |
 |---|---:|---:|---:|
-| 16 | 311 ns | 32 | ~0 |
-| 100,000 | 792 ns | 200,000 | 9 MiB |
-| **1,000,000** | **986 ns** | 2,000,000 | **91 MiB** |
+| 16 | 177 ns | 32 | ~0 |
+| 100,000 | 390 ns | 200,000 | 9 MiB |
+| **1,000,000** | **463 ns** | 2,000,000 | **91 MiB** |
 
-About 1.01M commands a second at a million accounts. The 3.2× degradation is
+About 2.16M commands a second at a million accounts. The 2.6× degradation is
 cache misses on the balance map, not anything algorithmic — lookups are still
 O(1), the working set simply stopped fitting. Memory is per *holding* rather than
 per registered user, so an account that has never traded costs nothing.
@@ -81,8 +93,8 @@ one that accepts what it can serve.
 
 | | |
 |---|---:|
-| replay all 100,000 commands | 12.0 ms |
-| snapshot + replay the last 5,000 | **1.3 ms** |
+| replay all 100,000 commands | 12.8 ms |
+| snapshot + replay the last 5,000 | **2.0 ms** |
 
 ## Running it
 
@@ -226,7 +238,7 @@ Scope boundaries, with reasons rather than apologies:
 
 ## Correctness
 
-269 tests. The ones worth looking at:
+285 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed

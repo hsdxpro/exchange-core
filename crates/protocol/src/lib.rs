@@ -169,6 +169,13 @@ pub enum ChannelKind {
     Trades = 1,
     /// The session's own order lifecycle.
     Account = 2,
+    /// Top of book only, for one symbol.
+    ///
+    /// The cheapest public feed and what most clients actually want. An order
+    /// resting deep in the book moves the depth feed and not this one, so a
+    /// client that only needs a price pays for price changes rather than for
+    /// every order the venue receives.
+    Bbo = 3,
 }
 
 /// Why an order was refused. Every variant is a distinct, reportable reason; a
@@ -264,6 +271,14 @@ pub enum EventKind {
     Challenge = 9,
     /// The proof was accepted. The session may trade as the account it claimed.
     Authenticated = 10,
+    /// Best price on one side, and the quantity there.
+    ///
+    /// One side per event, discriminated by `side`, exactly like
+    /// [`Self::BookDelta`] — so a command that moves only the bid publishes only
+    /// the bid, which is what makes this feed cheap. A `quantity` of zero means
+    /// that side is now empty; a real level never rests at zero, because a level
+    /// that reaches zero is removed.
+    Bbo = 11,
 }
 
 // ---------------------------------------------------------------- records
@@ -338,6 +353,7 @@ impl Event {
             8 => Some(EventKind::OrderState),
             9 => Some(EventKind::Challenge),
             10 => Some(EventKind::Authenticated),
+            11 => Some(EventKind::Bbo),
             _ => None,
         }
     }
@@ -394,6 +410,7 @@ impl Command {
             0 => Some(ChannelKind::Book),
             1 => Some(ChannelKind::Trades),
             2 => Some(ChannelKind::Account),
+            3 => Some(ChannelKind::Bbo),
             _ => None,
         }
     }
@@ -762,6 +779,7 @@ mod tests {
             (8, EventKind::OrderState),
             (9, EventKind::Challenge),
             (10, EventKind::Authenticated),
+            (11, EventKind::Bbo),
         ] {
             let event = Event {
                 kind: byte,
@@ -771,7 +789,7 @@ mod tests {
         }
         assert!(
             Event {
-                kind: 11,
+                kind: 12,
                 ..Event::default()
             }
             .kind()

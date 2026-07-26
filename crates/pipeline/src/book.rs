@@ -42,10 +42,32 @@ pub struct Outcome {
     pub reject: Option<RejectReason>,
     pub executions: Vec<Execution>,
     pub level_changes: Vec<LevelChange>,
+    /// Sides whose top of book moved, with where it moved to. Usually empty:
+    /// most orders rest behind the touch and change nothing here.
+    ///
+    /// Separate from `level_changes` because they answer different questions. A
+    /// level change says "this price now holds this much"; this says "the best
+    /// price is now here". A client following only the top wants the second and
+    /// would have to rebuild the whole book to derive it from the first.
+    pub top_changes: Vec<LevelChange>,
     /// Quantity that came to rest, if any.
     pub resting_quantity: Quantity,
     /// Prices this command could have moved. Scratch, reused across commands.
     touched: Vec<(Side, u16)>,
+    /// Best occupied slot on each side before this command ran, or a negative
+    /// value for an empty side.
+    ///
+    /// Held for the length of one command rather than between commands, so there
+    /// is no derived state to snapshot, restore or get wrong: the comparison is
+    /// against what the book itself said a moment ago.
+    ///
+    /// The *price* alone, without the quantity resting at it. Reading the
+    /// quantity here too would cost a table lookup a side on every command,
+    /// including the overwhelming majority that never touch the top — and it is
+    /// not needed, because a level's size changes only when something at that
+    /// price is added, removed or amended, and all three record the price in
+    /// `touched`.
+    top_before: [i32; 2],
 }
 
 impl Outcome {
@@ -56,6 +78,7 @@ impl Outcome {
         self.reject = None;
         self.executions.clear();
         self.level_changes.clear();
+        self.top_changes.clear();
         self.touched.clear();
         self.resting_quantity = 0;
     }
@@ -345,6 +368,7 @@ impl Book {
         market: bool,
     ) {
         out.clear();
+        self.mark_top(out);
 
         let Ok(engine_quantity) = u32::try_from(quantity) else {
             out.reject_with(RejectReason::QuantityTooLarge);
@@ -446,6 +470,7 @@ impl Book {
 
     pub fn cancel_into(&mut self, out: &mut Outcome, order: OrderId) {
         out.clear();
+        self.mark_top(out);
         let Some(slot) = self.slots.slot_of(order) else {
             out.reject_with(RejectReason::UnknownOrderId);
             return;
@@ -468,6 +493,7 @@ impl Book {
 
     pub fn amend_down_into(&mut self, out: &mut Outcome, order: OrderId, quantity: Quantity) {
         out.clear();
+        self.mark_top(out);
         let Some(slot) = self.slots.slot_of(order) else {
             out.reject_with(RejectReason::UnknownOrderId);
             return;
@@ -506,6 +532,60 @@ impl Book {
                 quantity: self.engine.level_quantity(engine_side(side), slot),
             });
         }
+        for side in [Side::Bid, Side::Ask] {
+            let best = self.best_slot(side);
+            // Either the best price moved, or it held and the level standing
+            // there was one of the ones this command changed. Nothing else can
+            // move the top, so nothing else is looked at.
+            let moved = best != out.top_before[side as usize];
+            let resized =
+                !moved && u16::try_from(best).is_ok_and(|slot| out.touched.contains(&(side, slot)));
+            if !moved && !resized {
+                continue;
+            }
+            let (price, quantity) = self.top(side);
+            out.top_changes.push(LevelChange {
+                side,
+                price,
+                quantity,
+            });
+        }
+    }
+
+    /// Best occupied slot on one side, negative when the side is empty. Held by
+    /// the engine's bitmap rather than searched for, so this is a field read.
+    fn best_slot(&self, side: Side) -> i32 {
+        match side {
+            Side::Bid => self.engine.best_bid(),
+            Side::Ask => self.engine.best_ask(),
+        }
+    }
+
+    /// Best price on one side and the quantity resting there, or `(0, 0)` when
+    /// the side is empty.
+    ///
+    /// Zero quantity is unambiguous: a level that reaches zero is removed, so no
+    /// occupied level ever reports it. That means a subscriber reads an emptied
+    /// side with the same rule it reads a removed level, and needs no sentinel.
+    ///
+    /// Two cached reads and a table lookup. The best price is kept by the
+    /// engine's bitmap rather than searched for, and it is read in slot space so
+    /// that asking for the quantity does not convert to a price and back.
+    #[must_use]
+    pub fn top(&self, side: Side) -> (Ticks, Quantity) {
+        let Ok(slot) = u16::try_from(self.best_slot(side)) else {
+            return (0, 0);
+        };
+        (
+            self.instrument.to_price(slot),
+            self.engine.level_quantity(engine_side(side), slot),
+        )
+    }
+
+    /// Records where the top of book stands before a command runs. Two field
+    /// reads, which is what makes this affordable on every command.
+    fn mark_top(&self, out: &mut Outcome) {
+        out.top_before = [self.best_slot(Side::Bid), self.best_slot(Side::Ask)];
     }
 }
 

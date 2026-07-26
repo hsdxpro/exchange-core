@@ -748,3 +748,78 @@ fn a_market_buy_cannot_spend_more_than_the_account_has() {
         exchange.accounts().balance(1, BTC).total()
     );
 }
+
+#[test]
+fn an_accounts_open_order_index_survives_cancellation_in_any_order() {
+    // The index that answers "what does this account have working" is also what
+    // makes self-match prevention a single lookup, and taking an order out of it
+    // is a swap rather than a search: the position rides on the reservation.
+    //
+    // A swap moves some other order into the hole, and that order's own recorded
+    // position is now wrong until it is patched. Cancelling in a scrambled order
+    // is what exercises the patch — cancelling in the order they were placed
+    // never moves anything, so it would pass with the patch deleted.
+    const COUNT: u64 = 400;
+    let mut exchange = funded();
+
+    let mut live: Vec<u64> = Vec::new();
+    for id in 1..=COUNT {
+        let mut order = limit_order(1, SYMBOL, id, Side::Bid, FLOOR + (id as Ticks % 500), 1);
+        exchange.submit(&mut order).unwrap();
+        live.push(id);
+    }
+
+    // A fixed scramble, so a failure is reproducible without a seed.
+    let mut cursor = 0_usize;
+    while !live.is_empty() {
+        cursor = (cursor * 7 + 3) % live.len();
+        let victim = live.remove(cursor);
+        let mut command = cancel(1, victim);
+        exchange.submit(&mut command).unwrap();
+
+        let mut open: Vec<u64> = exchange
+            .open_orders_for(1, SYMBOL)
+            .into_iter()
+            .map(|resting| resting.order)
+            .collect();
+        open.sort_unstable();
+        let mut expected = live.clone();
+        expected.sort_unstable();
+        assert_eq!(
+            open, expected,
+            "the open-order index is wrong after cancelling {victim}"
+        );
+    }
+
+    assert_eq!(
+        accounting_violations(),
+        0,
+        "the index disagreed with itself during cancellation"
+    );
+}
+
+#[test]
+fn an_accounts_open_order_index_survives_being_filled_away() {
+    // The other way an order leaves the index: somebody takes it. Same swap,
+    // same patch, and worth its own test because fills go through the settlement
+    // path rather than the cancel path.
+    const COUNT: u64 = 200;
+    let mut exchange = funded();
+
+    for id in 1..=COUNT {
+        let mut order = limit_order(1, SYMBOL, id, Side::Ask, FLOOR + 500, 1);
+        exchange.submit(&mut order).unwrap();
+    }
+    for i in 0..COUNT {
+        let mut taker = market_order(2, SYMBOL, COUNT + i + 1, Side::Bid, 1);
+        exchange.submit(&mut taker).unwrap();
+        assert_eq!(
+            exchange.open_orders_for(1, SYMBOL).len() as u64,
+            COUNT - i - 1,
+            "the maker's index is wrong after {} fills",
+            i + 1
+        );
+    }
+    assert!(exchange.open_orders_for(1, SYMBOL).is_empty());
+    assert_eq!(accounting_violations(), 0);
+}

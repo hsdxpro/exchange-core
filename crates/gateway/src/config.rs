@@ -217,7 +217,7 @@ pub struct Config {
 /// bounded by concurrent connections rather than by the instrument list.
 #[must_use]
 pub fn feed_memory(retained_per_channel: usize, symbols: usize) -> u64 {
-    const PUBLIC_CHANNELS_PER_SYMBOL: u64 = 2; // book and trades
+    const PUBLIC_CHANNELS_PER_SYMBOL: u64 = 3; // book, trades and bbo
     const EVENT_BYTES: u64 = 64;
     retained_per_channel as u64 * symbols as u64 * PUBLIC_CHANNELS_PER_SYMBOL * EVENT_BYTES
 }
@@ -737,9 +737,10 @@ max_open_orders = 1000000
 
     #[test]
     fn a_feed_that_would_not_fit_in_memory_is_refused_at_startup() {
-        // 65,536 events a channel over 1,000 symbols is 7.8 GiB. The venue must
-        // say so rather than be killed under load.
-        assert_eq!(feed_memory(65_536, 1_000) / 1024 / 1024, 8_000);
+        // 65,536 events a channel over 1,000 symbols, on three public channels
+        // each, is 11.7 GiB. The venue must say so rather than be killed under
+        // load.
+        assert_eq!(feed_memory(65_536, 1_000) / 1024 / 1024, 12_000);
 
         let text = VALID.replace("max_feed_memory_mb = 64", "max_feed_memory_mb = 1");
         let error = Config::parse(&text).unwrap_err();
@@ -755,9 +756,9 @@ max_open_orders = 1000000
 
     #[test]
     fn the_budget_counts_every_listed_instrument() {
-        // One instrument at 65,536 events is 8 MiB, so a 9 MiB budget holds one
-        // and not two.
-        let one = VALID.replace("max_feed_memory_mb = 64", "max_feed_memory_mb = 9");
+        // One instrument at 65,536 events across three public channels is 12
+        // MiB, so a 13 MiB budget holds one and not two.
+        let one = VALID.replace("max_feed_memory_mb = 64", "max_feed_memory_mb = 13");
         assert!(Config::parse(&one).is_ok());
 
         let two = format!(

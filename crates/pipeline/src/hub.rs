@@ -32,6 +32,8 @@ pub enum Channel {
     Book(SymbolId),
     /// Prints for one symbol: the public tape. Carries no identities.
     Trades(SymbolId),
+    /// Top of book for one symbol: the cheapest public feed.
+    Bbo(SymbolId),
     /// One account's own order lifecycle. Private to that account.
     Account(AccountId),
 }
@@ -51,6 +53,7 @@ impl Channel {
         match kind {
             ChannelKind::Book => Self::Book(symbol),
             ChannelKind::Trades => Self::Trades(symbol),
+            ChannelKind::Bbo => Self::Bbo(symbol),
             ChannelKind::Account => Self::Account(session_account),
         }
     }
@@ -61,6 +64,7 @@ impl Channel {
         Some(match event.kind()? {
             EventKind::BookDelta | EventKind::BookSnapshot => Self::Book(event.symbol),
             EventKind::Trade => Self::Trades(event.symbol),
+            EventKind::Bbo => Self::Bbo(event.symbol),
             EventKind::Received
             | EventKind::Rejected
             | EventKind::Resting

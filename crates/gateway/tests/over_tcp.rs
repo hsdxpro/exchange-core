@@ -499,6 +499,78 @@ fn a_client_joining_a_book_that_is_already_trading_can_rebuild_it() {
 }
 
 #[test]
+fn a_client_following_only_the_top_of_book_gets_it_stated_then_changed() {
+    // The cheap feed, over a real socket. Two things have to hold: a subscriber
+    // is told where the market is before it is told how it moved, and an order
+    // that lands behind the touch does not reach it at all.
+    let venue = Running::start();
+
+    let mut maker = venue.connect();
+    send(
+        &mut maker,
+        &[
+            limit_order(1, SYMBOL, 201, Side::Bid, 10_100, 5),
+            limit_order(1, SYMBOL, 202, Side::Ask, 10_200, 7),
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(80));
+
+    let mut watcher = venue.connect();
+    send(
+        &mut watcher,
+        &[
+            limit_order(4, SYMBOL, 299, Side::Bid, 10_000, 1),
+            subscribe(4, SYMBOL, ChannelKind::Bbo),
+        ],
+    );
+    let stated = collect_until(&mut watcher, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Bbo as u8)
+            .count()
+            >= 2
+    });
+    let tops: Vec<(u8, Ticks, u64)> = stated
+        .iter()
+        .filter(|e| e.kind == EventKind::Bbo as u8)
+        .map(|e| (e.side, e.price, e.quantity))
+        .collect();
+    assert!(
+        tops.contains(&(Side::Bid as u8, 10_100, 5))
+            && tops.contains(&(Side::Ask as u8, 10_200, 7)),
+        "the venue did not state the market it already had: {tops:?}"
+    );
+
+    // Deep behind the touch: the depth feed would carry this, and this one must
+    // not.
+    send(
+        &mut maker,
+        &[limit_order(1, SYMBOL, 203, Side::Bid, 10_050, 9)],
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    // Then something that does move it, so the absence above is a real silence
+    // rather than a feed that had simply not caught up.
+    send(
+        &mut maker,
+        &[limit_order(1, SYMBOL, 204, Side::Bid, 10_150, 2)],
+    );
+
+    let after = collect_until(&mut watcher, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|e| e.kind == EventKind::Bbo as u8 && e.price == 10_150)
+    });
+    let moves: Vec<(u8, Ticks, u64)> = after
+        .iter()
+        .filter(|e| e.kind == EventKind::Bbo as u8)
+        .map(|e| (e.side, e.price, e.quantity))
+        .collect();
+    assert_eq!(
+        moves,
+        vec![(Side::Bid as u8, 10_150, 2)],
+        "an order behind the touch reached the top-of-book feed"
+    );
+}
+
+#[test]
 fn a_client_shed_for_being_slow_can_reconnect_and_rebuild_the_book() {
     // This is the recovery story end to end. A client too slow to read is shed,
     // because the alternative is queueing for it without limit. What makes that
