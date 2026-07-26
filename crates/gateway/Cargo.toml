@@ -1,0 +1,16 @@
+[package]
+name = "bx-gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Session handling, wire framing, and the group-commit loop"
+
+[dependencies]
+bx-protocol = { path = "../protocol" }
+bx-journal = { path = "../journal" }
+bx-pipeline = { path = "../pipeline" }
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[lints]
+workspace = true
