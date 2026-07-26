@@ -500,6 +500,21 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_costs_what_the_sizing_guidance_says_it_does() {
+        // Instrument::max_open_orders documents 40 bytes per slot plus a flat
+        // per-book cost. If these move, that guidance is wrong and operators
+        // will size their venue from a stale number.
+        let per_slot = size_of::<bx_engine::OrderSlot>()   // engine slot
+            + size_of::<u32>()                             // engine id -> slot
+            + size_of::<OrderId>()                         // slot -> client id
+            + size_of::<u32>(); // free list
+        assert_eq!(per_slot, 40, "per-slot cost changed");
+
+        let per_book = 2 * bx_engine::PRICE_COUNT * size_of::<bx_engine::PriceLevel>();
+        assert_eq!(per_book, 2 << 20, "per-book level table changed");
+    }
+
+    #[test]
     fn there_is_no_limit_on_orders_at_one_price_level() {
         // A price level is a head and tail index into one shared pool, not an
         // array, so a single level can hold every order the book can hold.

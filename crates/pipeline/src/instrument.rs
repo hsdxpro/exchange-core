@@ -12,6 +12,12 @@ use bx_protocol::{Quantity, SymbolId, Ticks};
 /// Slots in the engine's ladder. Fixed by the engine's design.
 pub const LADDER_SLOTS: i64 = 65_536;
 
+/// Largest resting-order pool the engine can address.
+///
+/// One below `u32::MAX`, because the engine uses that value as its
+/// end-of-list sentinel and so cannot also use it as a slot index.
+pub const MAX_OPEN_ORDERS_LIMIT: u32 = u32::MAX - 1;
+
 /// An asset, for balance purposes. A spot instrument moves two of them.
 pub type AssetId = u32;
 
@@ -37,7 +43,28 @@ pub struct Instrument {
     /// a major pair does — so it is declared here rather than assumed.
     ///
     /// This is unrelated to how many *price levels* the book has. Those come
-    /// from the bitmap ladder and are always [`LADDER_SLOTS`].
+    /// from the bitmap ladder and are always [`LADDER_SLOTS`]. It is also not a
+    /// per-level limit: one price can hold every order in the pool, because a
+    /// level is a head and tail index into it rather than a container.
+    ///
+    /// Sizing it. The pool costs **40 bytes per slot** the moment the book is
+    /// built, and a further **~15 bytes per live order** for the client-ID
+    /// index, so a full book is about **55 bytes per order**:
+    ///
+    /// | | bytes per slot |
+    /// |---|---:|
+    /// | engine order slot | 24 |
+    /// | engine ID-to-slot table | 4 |
+    /// | slot-to-order-ID table | 8 |
+    /// | free list | 4 |
+    /// | client-ID index, per *live* order | ~15 |
+    ///
+    /// On top of that every book costs a flat ~2.1 MiB for the price-level
+    /// table and bitmaps, whatever this value is.
+    ///
+    /// The hard ceiling is [`MAX_OPEN_ORDERS_LIMIT`], set by the engine's u32
+    /// slot index. Long before that the limit is memory: a million orders is
+    /// ~55 MiB, so a thousand symbols at a million each is ~57 GiB.
     pub max_open_orders: u32,
 }
 
