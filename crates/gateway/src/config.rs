@@ -152,6 +152,9 @@ pub struct Config {
     pub replay_rate: u64,
     pub retained_per_channel: usize,
     pub max_records_per_session: usize,
+    /// Connections held at once. Beyond this the venue refuses rather than
+    /// serving everyone slowly.
+    pub max_sessions: usize,
     /// Followers to replicate to. Empty means a lone leader.
     pub replicas: Vec<String>,
     /// How long the leader waits for a follower to confirm.
@@ -186,6 +189,7 @@ impl Config {
         let mut replay_rate = None;
         let mut retained = None;
         let mut max_records = None;
+        let mut max_sessions = None;
         let mut ack_timeout_ms = None;
         let mut max_feed_memory_mb = None;
         let mut replicas = Vec::new();
@@ -264,6 +268,7 @@ impl Config {
                 "replay_rate" => replay_rate = Some(number("replay_rate")?),
                 "retained_per_channel" => retained = Some(number("retained_per_channel")?),
                 "max_records_per_session" => max_records = Some(number("max_records_per_session")?),
+                "max_sessions" => max_sessions = Some(number("max_sessions")?),
                 "ack_timeout_ms" => ack_timeout_ms = Some(number("ack_timeout_ms")?),
                 "max_feed_memory_mb" => max_feed_memory_mb = Some(number("max_feed_memory_mb")?),
                 "replica" => replicas.push(value.to_string()),
@@ -282,6 +287,7 @@ impl Config {
         let replay_rate = required(replay_rate, "replay_rate")?;
         let retained = required(retained, "retained_per_channel")?;
         let max_records = required(max_records, "max_records_per_session")?;
+        let max_sessions = required(max_sessions, "max_sessions")?;
         let ack_timeout_ms = required(ack_timeout_ms, "ack_timeout_ms")?;
         let max_feed_memory_mb = required(max_feed_memory_mb, "max_feed_memory_mb")?;
 
@@ -295,6 +301,7 @@ impl Config {
             (replay_rate, "replay_rate"),
             (retained, "retained_per_channel"),
             (max_records, "max_records_per_session"),
+            (max_sessions, "max_sessions"),
             (ack_timeout_ms, "ack_timeout_ms"),
             (max_feed_memory_mb, "max_feed_memory_mb"),
         ] {
@@ -349,6 +356,8 @@ impl Config {
             retained_per_channel: retained,
             max_records_per_session: usize::try_from(max_records)
                 .map_err(|_| ConfigError::whole_file("max_records_per_session is too large"))?,
+            max_sessions: usize::try_from(max_sessions)
+                .map_err(|_| ConfigError::whole_file("max_sessions is too large"))?,
             replicas,
             ack_timeout: Duration::from_millis(ack_timeout_ms),
             max_feed_memory: budget,
@@ -378,6 +387,7 @@ target_recovery_ms = 2000
 replay_rate = 7600000
 retained_per_channel = 65536
 max_records_per_session = 4096
+max_sessions = 512
 ack_timeout_ms = 250
 max_feed_memory_mb = 64
 replica = 10.0.0.2:7100
@@ -402,6 +412,7 @@ max_open_orders = 1000000
         assert_eq!(config.replay_rate, 7_600_000);
         assert_eq!(config.retained_per_channel, 65_536);
         assert_eq!(config.max_records_per_session, 4_096);
+        assert_eq!(config.max_sessions, 512);
         assert_eq!(config.ack_timeout, Duration::from_millis(250));
         assert_eq!(config.max_feed_memory, 64 * 1024 * 1024);
         assert_eq!(config.replicas, vec!["10.0.0.2:7100", "10.0.0.3:7100"]);
@@ -454,6 +465,7 @@ max_open_orders = 1000000
             "replay_rate",
             "retained_per_channel",
             "max_records_per_session",
+            "max_sessions",
             "ack_timeout_ms",
             "max_feed_memory_mb",
         ] {

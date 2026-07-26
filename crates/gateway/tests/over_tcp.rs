@@ -27,6 +27,7 @@ const FLOOR: Ticks = 10_000;
 /// is bounded (a few hundred events at a time) and would blow straight through
 /// it if a pass were unbounded, which is the regression being guarded.
 const RETAINED: usize = 32_768;
+const MAX_SESSIONS: usize = 1_024;
 const MAX_RECORDS: usize = 256;
 
 fn instruments() -> Instruments {
@@ -53,6 +54,7 @@ impl Running {
             instruments(),
             RETAINED,
             MAX_RECORDS,
+            MAX_SESSIONS,
         )
         .unwrap();
         // Funded well beyond anything these tests spend. An underfunded account

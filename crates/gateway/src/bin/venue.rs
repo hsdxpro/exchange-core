@@ -44,6 +44,7 @@ fn measurement_config() -> Config {
         replay_rate: 7_600_000,
         retained_per_channel: 1 << 16,
         max_records_per_session: 4_096,
+        max_sessions: 512,
         replicas: Vec::new(),
         ack_timeout: Duration::from_millis(250),
         max_feed_memory: 64 * 1024 * 1024,
@@ -66,6 +67,7 @@ fn run<S: LogStorage>(config: &Config, storage: S, fresh: bool) -> std::io::Resu
         listed(config),
         config.retained_per_channel,
         config.max_records_per_session,
+        config.max_sessions,
     )?;
 
     if fresh {

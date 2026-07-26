@@ -18,6 +18,7 @@ const USD: u32 = 2;
 const SYMBOL: u32 = 1;
 const FLOOR: Ticks = 10_000;
 const RETAINED: usize = 4_096;
+const MAX_SESSIONS: usize = 1_024;
 const MAX_RECORDS: usize = 256;
 
 fn instruments() -> Instruments {
@@ -55,6 +56,7 @@ fn venue(journal: &Path) -> Server<FileLog> {
         instruments(),
         RETAINED,
         MAX_RECORDS,
+        MAX_SESSIONS,
     )
     .unwrap()
 }

@@ -208,10 +208,24 @@ pub struct Server<S: LogStorage> {
     /// Set to snapshot periodically. None means never, which is slower to
     /// recover and no less correct.
     snapshots: Option<(SnapshotPolicy, PathBuf)>,
+    refused: u64,
     /// Reused across passes so a steady-state loop allocates nothing.
     inbound: Vec<Command>,
     outbound: Vec<Event>,
     max_records_per_session: usize,
+    /// Connections this venue will hold at once.
+    ///
+    /// The loop reads every session each pass, so an idle connection costs a
+    /// syscall per pass -- measured at about 444 ns. That is linear and cheap in
+    /// isolation, but it is paid by every *active* client, because it lands in
+    /// the same pass: a thousand idle connections put 444 microseconds in front
+    /// of every order. Beyond a few hundred, this loop needs readiness
+    /// notification rather than a scan, and that is a different design.
+    ///
+    /// Refusing past the ceiling turns an invisible cliff into a stated policy.
+    /// A venue that accepts ten thousand connections and then serves all of them
+    /// slowly is worse than one that accepts what it can serve.
+    max_sessions: usize,
 }
 
 impl<S: LogStorage> Server<S> {
@@ -226,6 +240,7 @@ impl<S: LogStorage> Server<S> {
         instruments: Instruments,
         retained_per_channel: usize,
         max_records_per_session: usize,
+        max_sessions: usize,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
@@ -239,8 +254,10 @@ impl<S: LogStorage> Server<S> {
             inbound: Vec::new(),
             outbound: Vec::new(),
             max_records_per_session,
+            max_sessions,
             max_outbox: retained_per_channel * FRAME_LEN,
             snapshots: None,
+            refused: 0,
         };
         Ok(server)
     }
@@ -402,10 +419,24 @@ impl<S: LogStorage> Server<S> {
         }
     }
 
+    /// Sessions refused because the venue was already full. An operator watching
+    /// this climb knows to add a gateway rather than wonder why latency drifted.
+    #[must_use]
+    pub const fn refused(&self) -> u64 {
+        self.refused
+    }
+
     fn accept_pending(&mut self) {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    // Accepted and dropped, so the client learns immediately
+                    // rather than waiting on a venue that will not read it.
+                    if self.sessions.len() >= self.max_sessions {
+                        self.refused += 1;
+                        drop(stream);
+                        continue;
+                    }
                     if stream.set_nonblocking(true).is_ok() && stream.set_nodelay(true).is_ok() {
                         self.sessions.push(Session::new(
                             stream,
