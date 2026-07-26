@@ -104,6 +104,13 @@ struct Ring {
     /// Sequence the next published event will take. Also the count published,
     /// since channels number from zero.
     next: Sequence,
+    /// The publish this ring last received an event in.
+    ///
+    /// Compared against the hub's counter to answer "is this channel already in
+    /// the touched list" in one comparison. Searching the list instead would be
+    /// quadratic in the channels one group touches, and a group spanning a
+    /// thousand instruments touches thousands.
+    touched_in: u64,
 }
 
 impl Ring {
@@ -113,6 +120,7 @@ impl Ring {
             slots: vec![Event::default(); capacity].into_boxed_slice(),
             mask: capacity as u64 - 1,
             next: 0,
+            touched_in: 0,
         }
     }
 
@@ -173,6 +181,17 @@ impl Ring {
 pub struct Hub {
     channels: FastMap<Channel, Ring>,
     retained_per_channel: usize,
+    /// Channels that received an event in the last publish.
+    ///
+    /// This is what lets a gateway write to the sessions that have something
+    /// waiting instead of asking every session about every channel it follows.
+    /// That scan was the venue's ceiling under load: every pass paid for every
+    /// connection whether or not anything had happened on it, so four thousand
+    /// idle connections put about ninety microseconds in front of every order.
+    touched: Vec<Channel>,
+    /// Which publish this is, so a ring can say whether it is already listed
+    /// without the list being searched.
+    publishes: u64,
 }
 
 impl Hub {
@@ -187,6 +206,8 @@ impl Hub {
         Self {
             channels: FastMap::default(),
             retained_per_channel,
+            touched: Vec::new(),
+            publishes: 0,
         }
     }
 
@@ -210,14 +231,33 @@ impl Hub {
     /// Events for channels nobody follows are dropped here rather than buffered
     /// on the chance that someone subscribes later.
     pub fn publish(&mut self, events: &[Event]) {
+        self.touched.clear();
+        self.publishes += 1;
+        let publish = self.publishes;
         for event in events {
             let Some(channel) = Channel::of(event) else {
                 continue;
             };
             if let Some(ring) = self.channels.get_mut(&channel) {
                 ring.push(*event);
+                // One comparison rather than a search of the list, which a group
+                // spanning a thousand instruments would make quadratic.
+                if ring.touched_in != publish {
+                    ring.touched_in = publish;
+                    self.touched.push(channel);
+                }
             }
         }
+    }
+
+    /// Channels that received an event in the last [`Self::publish`].
+    ///
+    /// A gateway writes to the subscribers of these and to nobody else. Asking
+    /// every session about every channel it follows is what made an idle
+    /// connection cost anything at all.
+    #[must_use]
+    pub fn touched(&self) -> &[Channel] {
+        &self.touched
     }
 
     /// Appends everything on `channel` from `from` onward to `out`.

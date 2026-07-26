@@ -106,6 +106,12 @@ struct Session {
     /// million comparisons, about a millisecond, on the pass that is already the
     /// busiest.
     queued: bool,
+    /// Already in the set of sessions this pass will write to.
+    ///
+    /// The same trick as `queued`, and for the same reason: a session's outbox
+    /// is filled from several places in a pass and every one of them must be
+    /// able to say "this one owes bytes" without searching a list.
+    owes: bool,
     open: bool,
 }
 
@@ -178,6 +184,7 @@ impl Session {
             challenge,
             cancel_on_disconnect: false,
             queued: false,
+            owes: false,
             open: true,
         }
     }
@@ -185,14 +192,6 @@ impl Session {
     /// True while the session still owes proof of who it is.
     const fn unproven(&self) -> bool {
         self.challenge.is_some()
-    }
-
-    /// Adds a channel this session will be sent, from the position it is at now.
-    /// Subscribing twice is idempotent and does not rewind the cursor.
-    fn follow(&mut self, channel: Channel, from: Sequence) {
-        if !self.cursors.iter().any(|(held, _)| *held == channel) {
-            self.cursors.push((channel, from));
-        }
     }
 
     fn stop_following(&mut self, channel: Channel) {
@@ -389,6 +388,21 @@ pub struct Server<S: LogStorage> {
     /// so the table tracks connected accounts rather than every account ever
     /// seen.
     allowances: FastMap<AccountId, Allowance>,
+    /// Which sessions follow each channel.
+    ///
+    /// The write pass used to ask every session about every channel it followed,
+    /// every pass, whether or not anything had happened — which is why an idle
+    /// connection cost 23 ns a pass and four thousand of them put ninety
+    /// microseconds in front of every order. Now the hub says which channels
+    /// received something and this says who was waiting on them, so a connection
+    /// that has nothing to be told costs nothing at all.
+    subscribers: FastMap<Channel, Vec<usize>>,
+    /// Sessions whose outbox has bytes in it, so the write pass visits those and
+    /// no others. Reused across passes.
+    owing: Vec<usize>,
+    /// The channels the last group touched, copied out so the venue is not
+    /// borrowed while sessions are written to.
+    touched: Vec<Channel>,
     /// What the venue is doing, counted as it does it. Timings are sampled every
     /// sixty-fourth pass so the clock reading does not land on the order path.
     metrics: Metrics,
@@ -466,6 +480,9 @@ impl<S: LogStorage> Server<S> {
             throttled: 0,
             rate: None,
             allowances: FastMap::default(),
+            subscribers: FastMap::default(),
+            owing: Vec::new(),
+            touched: Vec::new(),
             metrics: Metrics::default(),
             timestamps: false,
         };
@@ -682,7 +699,7 @@ impl<S: LogStorage> Server<S> {
                 // anything public.
                 let channel = Channel::Account(account);
                 let from = self.venue.subscribe(channel);
-                self.session_at(index).follow(channel, from);
+                self.follow(index, channel, from);
                 self.claim_allowance(account, now);
             }
 
@@ -726,7 +743,7 @@ impl<S: LogStorage> Server<S> {
             result?;
         }
 
-        self.push_updates();
+        self.push_updates(applied > 0);
         self.drop_closed();
         self.metrics.pass(applied);
         if let Some(started) = timing {
@@ -745,6 +762,44 @@ impl<S: LogStorage> Server<S> {
         self.sessions[index]
             .as_mut()
             .expect("a ready token names a live session")
+    }
+
+    /// Starts a session following a channel, in both the session and the index.
+    ///
+    /// The two must agree exactly. A cursor without an index entry is a client
+    /// that silently receives nothing; an index entry without a cursor is a
+    /// session visited for a channel it does not follow. Both go through here so
+    /// there is one place to get it right.
+    fn follow(&mut self, index: usize, channel: Channel, from: Sequence) {
+        let session = self.session_at(index);
+        if session.cursors.iter().any(|(held, _)| *held == channel) {
+            return;
+        }
+        session.cursors.push((channel, from));
+        self.subscribers.entry(channel).or_default().push(index);
+    }
+
+    /// Stops a session following a channel, in both places.
+    fn stop_following(&mut self, index: usize, channel: Channel) {
+        self.session_at(index).stop_following(channel);
+        if let Some(following) = self.subscribers.get_mut(&channel) {
+            following.retain(|held| *held != index);
+            if following.is_empty() {
+                self.subscribers.remove(&channel);
+            }
+        }
+    }
+
+    /// Takes a session out of every channel's subscriber list, on the way out.
+    fn forget_subscriptions(&mut self, index: usize, cursors: &[(Channel, Sequence)]) {
+        for (channel, _) in cursors {
+            if let Some(following) = self.subscribers.get_mut(channel) {
+                following.retain(|held| *held != index);
+                if following.is_empty() {
+                    self.subscribers.remove(channel);
+                }
+            }
+        }
     }
 
     /// Lets a session act only once it has proved which account it is.
@@ -776,6 +831,7 @@ impl<S: LogStorage> Server<S> {
                     &refused_locally(&command, RejectReason::NotAuthenticated),
                     &mut session.outbox,
                 );
+                self.owes_bytes(index);
                 continue;
             }
             if !self
@@ -791,6 +847,7 @@ impl<S: LogStorage> Server<S> {
                 // The write pass runs before the session is dropped, so the
                 // client is told why rather than seeing a bare disconnect.
                 session.open = false;
+                self.owes_bytes(index);
                 self.closing.push(index);
                 self.inbound.truncate(start);
                 return;
@@ -808,9 +865,10 @@ impl<S: LogStorage> Server<S> {
                 },
                 &mut session.outbox,
             );
+            self.owes_bytes(index);
             let channel = Channel::Account(account);
             let from = self.venue.subscribe(channel);
-            self.session_at(index).follow(channel, from);
+            self.follow(index, channel, from);
             self.claim_allowance(account, Some(Instant::now()));
         }
     }
@@ -859,6 +917,7 @@ impl<S: LogStorage> Server<S> {
                 );
             }
         }
+        self.owes_bytes(index);
         self.throttled += discarded;
     }
 
@@ -874,6 +933,11 @@ impl<S: LogStorage> Server<S> {
         for index in std::mem::take(&mut self.closing) {
             if let Some(mut session) = self.sessions[index].take() {
                 let _ = self.poll.registry().deregister(&mut session.stream);
+                // Out of every channel's subscriber list. Leaving an index entry
+                // behind would have the next session to take this slot written
+                // to for a channel it never asked for.
+                let cursors = std::mem::take(&mut session.cursors);
+                self.forget_subscriptions(index, &cursors);
                 if let Some(account) = session.account {
                     if session.cancel_on_disconnect {
                         withdraw.push(account);
@@ -923,7 +987,7 @@ impl<S: LogStorage> Server<S> {
         let channel = Channel::requested(kind, command.symbol, account);
         if command.kind() == Some(CommandKind::Subscribe) {
             let from = self.venue.subscribe(channel);
-            self.session_at(index).follow(channel, from);
+            self.follow(index, channel, from);
             // State before change, on both public feeds that carry state. A
             // subscriber cannot derive where the book is from a stream that only
             // says where it moved.
@@ -933,7 +997,7 @@ impl<S: LogStorage> Server<S> {
                 Channel::Trades(_) | Channel::Account(_) => {}
             }
         } else {
-            self.session_at(index).stop_following(channel);
+            self.stop_following(index, channel);
         }
     }
 
@@ -951,6 +1015,7 @@ impl<S: LogStorage> Server<S> {
                 &mut session.outbox,
             );
         }
+        self.owes_bytes(index);
     }
 
     /// Writes the current top of book to one session, one event a side.
@@ -983,6 +1048,7 @@ impl<S: LogStorage> Server<S> {
                 &mut session.outbox,
             );
         }
+        self.owes_bytes(index);
     }
 
     /// Writes the book's current levels to one session as `BookSnapshot`.
@@ -1025,6 +1091,21 @@ impl<S: LogStorage> Server<S> {
                 &mut session.outbox,
             );
         }
+        self.owes_bytes(index);
+    }
+
+    /// Entries in the channel-to-session index.
+    ///
+    /// Exposed because the failure it guards against is invisible otherwise. A
+    /// departed session's entries are harmless to *correctness* — the write pass
+    /// checks that the session actually follows the channel before sending it
+    /// anything — so a leak here would never produce a wrong event. It would only
+    /// grow, quietly, for the life of the process, which at a million clients
+    /// connecting and disconnecting is the kind of leak found in production
+    /// rather than in a test.
+    #[must_use]
+    pub fn tracked_subscriptions(&self) -> usize {
+        self.subscribers.values().map(Vec::len).sum()
     }
 
     /// Sessions refused because the venue was already full. An operator watching
@@ -1072,10 +1153,17 @@ impl<S: LogStorage> Server<S> {
                         encode(&Event::challenging(nonce), &mut session.outbox);
                         session.flush();
                     }
+                    let unsent = !session.outbox.is_empty();
                     if index == self.sessions.len() {
                         self.sessions.push(Some(session));
                     } else {
                         self.sessions[index] = Some(session);
+                    }
+                    // A challenge the socket would not take yet still has to
+                    // reach the client, or it waits for a nonce that is sitting
+                    // in a buffer nobody writes.
+                    if unsent {
+                        self.owes_bytes(index);
                     }
                     self.live += 1;
                     self.metrics.accepted();
@@ -1087,22 +1175,41 @@ impl<S: LogStorage> Server<S> {
     }
 
     /// Sends each session everything on its channels it has not seen.
-    fn push_updates(&mut self) {
-        let mut closed = Vec::new();
-        let mut shed = 0_u32;
-        // Channels that fell outside the window, handled after the borrow ends.
+    fn push_updates(&mut self, published: bool) {
+        // Channels that fell outside the window, handled after the borrows end.
         let mut lagged: Vec<(usize, Channel)> = Vec::new();
-        for (index, session) in self
-            .sessions
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(index, slot)| slot.as_mut().map(|session| (index, session)))
-        {
-            for (channel, cursor) in &mut session.cursors {
+
+        // Only the channels that received something, and only the sessions
+        // following them. What this replaced — every session, every channel it
+        // follows, every pass — is what made an idle connection cost anything.
+        //
+        // Read only after a group that produced events. The hub's list is from
+        // its last publish, so consulting it on a pass that applied nothing
+        // would walk the previous group's subscribers again and hand back most
+        // of the cost this exists to remove.
+        self.touched.clear();
+        if published {
+            self.touched.extend_from_slice(self.venue.hub().touched());
+        }
+        for channel in &self.touched {
+            let Some(following) = self.subscribers.get(channel) else {
+                continue;
+            };
+            for &index in following {
+                let Some(session) = self.sessions[index].as_mut() else {
+                    continue;
+                };
+                let Some(cursor) = session
+                    .cursors
+                    .iter_mut()
+                    .find(|(held, _)| held == channel)
+                    .map(|(_, cursor)| cursor)
+                else {
+                    continue;
+                };
                 // Straight from the ring into the bytes that go on the wire. The
-                // events already *are* those bytes, so the `Vec<Event>` that used
-                // to sit between them copied every event a second time, once per
-                // subscriber, on every message.
+                // events already *are* those bytes, so a `Vec<Event>` in between
+                // copied every event a second time, per subscriber, per message.
                 match self
                     .venue
                     .resume_bytes(*channel, *cursor, &mut session.outbox)
@@ -1111,21 +1218,58 @@ impl<S: LogStorage> Server<S> {
                     Resume::Lagged { .. } => lagged.push((index, *channel)),
                     Resume::NotSubscribed => {}
                 }
+                if !session.outbox.is_empty() && !session.owes {
+                    session.owes = true;
+                    self.owing.push(index);
+                }
             }
+        }
+
+        // Written to only the sessions that have something waiting. A session
+        // whose socket is full stays here until it drains.
+        let mut shed = 0_u32;
+        let mut closed = Vec::new();
+        let mut still_owing = Vec::new();
+        for index in std::mem::take(&mut self.owing) {
+            let Some(session) = self.sessions[index].as_mut() else {
+                continue;
+            };
             session.flush();
             if session.over_budget() {
                 session.open = false;
                 shed += 1;
             }
             if !session.open {
+                session.owes = false;
                 closed.push(index);
+            } else if session.outbox.is_empty() {
+                session.owes = false;
+            } else {
+                still_owing.push(index);
             }
         }
+        self.owing = still_owing;
         self.closing.append(&mut closed);
         for _ in 0..shed {
             self.metrics.shed();
         }
         self.resynchronise(&lagged);
+    }
+
+    /// Marks a session as owing bytes, so the write pass visits it.
+    ///
+    /// Called wherever something is put in an outbox outside the feed path — a
+    /// challenge, a refusal, a book restated on subscribe. Missing one of these
+    /// would leave a session holding bytes nobody ever writes, which is a client
+    /// that hangs rather than an error anybody sees.
+    fn owes_bytes(&mut self, index: usize) {
+        if let Some(session) = self.sessions[index].as_mut()
+            && !session.owes
+            && !session.outbox.is_empty()
+        {
+            session.owes = true;
+            self.owing.push(index);
+        }
     }
 
     /// Puts a session that fell outside the retention window back on its feet.

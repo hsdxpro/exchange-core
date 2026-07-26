@@ -12,7 +12,7 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**307 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**310 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
@@ -25,12 +25,12 @@ timing is not evidence of anything.
 | subscription | 7 | Channels, resume after disconnect, lagging out of the window. |
 | snapshot | 6 | Snapshot/restore equality with a full replay, queue priority. |
 | simulation | 4 | Seeded crash injection, torn writes, dead device, replay determinism. |
-| over sockets | 17 | Real TCP: split records, disconnects, bursts, selective subscription, top-of-book. |
+| over sockets | 20 | Real TCP: split records, disconnects, bursts, selective subscription, top-of-book, unsubscribe, and a subscriber index that does not grow under connection churn. |
 | top of book | 13 | What the cheap feed does not send, which is the whole point of it. |
 | venue snapshots | 7 | Cadence from a recovery target, atomic replace, corrupt snapshot refused. |
 | failover | 3 | Real processes: a cluster elects its own leader and replaces it when it dies with nobody editing a file, promotion recovers acked records, no majority means no service. |
 | `bx-election` | 4 | Three nodes electing one leader, a higher term after a death, a minority electing nobody, and a vote that survives a restart. |
-| idle cost | 2 | An idle connection stays under 120 ns a pass. |
+| idle cost | 2 | A pass over 256 idle connections costs no more than a pass over one. |
 | many clients | 1 | A million accounts, and the memory that costs. |
 | admission | 20 | Real sockets: an unproven order never reaches the book, a captured proof does not open the next connection, a flood is cut to its allowance, a refusal is counted against its reason, an acknowledgement carries when the venue saw the order. |
 
@@ -242,14 +242,31 @@ for the reasons above; nothing here should read as shipped until it is.
   is the per-session outbox budget -- that sheds the connection. Both are fine
   now that reconnecting restates the book; before, a shed client came back to a
   stream of increments against a book it no longer knew.
-- **An idle connection is not free, and the active clients pay for it.** Reading
-  every socket every pass measured **422 ns per idle session**, perfectly linear,
-  and it lands in the same pass as real orders -- 10,000 connections would have
-  put 4.25 ms in front of every order, invisibly. Sessions are now found by
-  readiness (`mio`: epoll, IOCP or kqueue), which took the marginal cost to
-  **23 ns**, an 18x reduction, and the residue is userspace rather than syscalls.
-  A ceiling still exists because the cost is still linear, so `max_sessions`
-  refuses past it and counts the refusals.
+- **An idle connection costs nothing, and it took two goes to get there.** The
+  cost lands in the same pass as real orders, so whatever an idle connection
+  costs, every active client pays it.
+
+  Reading every socket every pass measured **422 ns per idle session**, perfectly
+  linear: 10,000 connections would have put 4.25 ms in front of every order,
+  invisibly. Finding sessions by readiness (`mio`: epoll, IOCP or kqueue) took
+  that to **16 ns**.
+
+  Still linear, though, and that was still a ceiling — it was simply a higher
+  one, which is why it survived. The remaining cost was the *write* half: every
+  pass asked every session about every channel it followed, whether or not
+  anything had happened on it. The hub now reports which channels a group
+  touched and the gateway holds an index from channel to session, so a
+  connection with nothing to say and nothing to be told is not visited at all.
+
+  Measured over 256 idle connections: **5,400 ns a pass before, 1,300 ns after,
+  and a marginal cost per connection of zero**. The pass no longer grows with the
+  connection count at all. `max_sessions` still refuses past its limit and counts
+  the refusals, but it now bounds descriptors and memory rather than time.
+
+  The index has to be given back when a session goes, and getting that wrong
+  produces no wrong events -- the write pass checks the session really follows
+  the channel -- so it needed a test that watches the index itself across
+  connection churn rather than one that watches for bad output.
 - **Edge-triggered readiness means reading until `WouldBlock`, not once.** The
   loop deliberately reads one buffer per session per pass, for fairness. With
   edge triggering that is not enough on its own: a socket is reported readable

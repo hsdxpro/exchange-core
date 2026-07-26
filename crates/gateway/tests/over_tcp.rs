@@ -45,6 +45,9 @@ struct Running {
     /// Sessions the server held at its last pass. Only a hint: the test thread
     /// reads it while the server thread writes it.
     sessions: Arc<AtomicUsize>,
+    /// Entries in the channel-to-session index, so a test can watch it for a
+    /// leak that produces no wrong events and would otherwise be invisible.
+    subscriptions: Arc<AtomicUsize>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -75,11 +78,14 @@ impl Running {
         let flag = Arc::clone(&stop);
         let sessions = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&sessions);
+        let subscriptions = Arc::new(AtomicUsize::new(0));
+        let tracked = Arc::clone(&subscriptions);
 
         let thread = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 server.poll().expect("the venue failed to commit");
                 counter.store(server.sessions(), Ordering::Relaxed);
+                tracked.store(server.tracked_subscriptions(), Ordering::Relaxed);
                 // Nothing to do until a socket is readable. A deployed venue
                 // busy-polls a pinned core here; a test does not need to.
                 std::thread::sleep(Duration::from_micros(200));
@@ -90,12 +96,19 @@ impl Running {
             address,
             stop,
             sessions,
+            subscriptions,
             thread: Some(thread),
         }
     }
 
     fn sessions_hint(&self) -> usize {
         self.sessions.load(Ordering::Relaxed)
+    }
+
+    /// Entries in the venue's channel-to-session index. Same caveat as
+    /// `sessions_hint`: read from this thread while the server writes it.
+    fn tracked_subscriptions(&self) -> usize {
+        self.subscriptions.load(Ordering::Relaxed)
     }
 
     fn connect(&self) -> TcpStream {
@@ -932,4 +945,147 @@ fn a_client_that_disconnects_does_not_disturb_the_venue() {
             .any(|e| e.kind == EventKind::BookDelta as u8 || e.kind == EventKind::Trade as u8),
         "the venue stopped working after a disconnect: {events:?}"
     );
+}
+
+#[test]
+fn unsubscribing_stops_the_feed_and_leaves_nothing_behind() {
+    // The venue writes to the sessions following the channels a group touched,
+    // which means an index from channel to session. An entry left behind after
+    // an unsubscribe is a session written to for a feed it asked to stop, and a
+    // slot that is later reused inherits it.
+    let venue = Running::start();
+    let mut watcher = venue.connect();
+    send(
+        &mut watcher,
+        &[limit_order(4, SYMBOL, 900, Side::Bid, 10_000, 1)],
+    );
+    watch_public(&mut watcher, 4);
+
+    let mut maker = venue.connect();
+    send(
+        &mut maker,
+        &[limit_order(1, SYMBOL, 301, Side::Bid, 10_100, 1)],
+    );
+    let seen = collect_until(&mut watcher, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::BookDelta)
+    });
+    assert!(
+        has_kind(&seen, EventKind::BookDelta),
+        "the watcher never saw the book while subscribed"
+    );
+
+    send(&mut watcher, &[unsubscribe(4, SYMBOL, ChannelKind::Book)]);
+    std::thread::sleep(Duration::from_millis(100));
+    // Drain whatever was already in flight before the unsubscribe landed.
+    let _ = collect_until(&mut watcher, Duration::from_millis(300), |_| false);
+
+    send(
+        &mut maker,
+        &[limit_order(1, SYMBOL, 302, Side::Bid, 10_090, 1)],
+    );
+    let after = collect_until(&mut watcher, Duration::from_millis(800), |seen| {
+        has_kind(seen, EventKind::BookDelta)
+    });
+    assert!(
+        !has_kind(&after, EventKind::BookDelta),
+        "a depth update arrived after unsubscribing: {after:?}"
+    );
+}
+
+#[test]
+fn a_session_does_not_inherit_the_feeds_of_the_one_before_it() {
+    // Session slots are reused, so a fresh client lands on an index a departed
+    // one used. It must hear about its own orders and nothing else.
+    //
+    // This holds even if the subscriber index still names the old session,
+    // because the write pass checks the session actually follows the channel
+    // before sending -- which is why the *leak* needs its own test below rather
+    // than showing up as a wrong event here.
+    let venue = Running::start();
+    {
+        let mut departing = venue.connect();
+        send(
+            &mut departing,
+            &[limit_order(4, SYMBOL, 910, Side::Bid, 10_000, 1)],
+        );
+        watch_public(&mut departing, 4);
+        let _ = collect_until(&mut departing, Duration::from_secs(2), |seen| {
+            !seen.is_empty()
+        });
+    }
+    // Give the venue a pass to notice the socket has gone and free the slot.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // A fresh client that asks for nothing public. It should hear about its own
+    // orders and not a word about anybody's book.
+    let mut arriving = venue.connect();
+    send(
+        &mut arriving,
+        &[limit_order(3, SYMBOL, 920, Side::Bid, 10_000, 1)],
+    );
+    let mut maker = venue.connect();
+    send(
+        &mut maker,
+        &[limit_order(1, SYMBOL, 303, Side::Bid, 10_150, 5)],
+    );
+
+    let seen = collect_until(&mut arriving, Duration::from_secs(1), |seen| {
+        has_kind(seen, EventKind::BookDelta)
+    });
+    assert!(
+        !has_kind(&seen, EventKind::BookDelta),
+        "a fresh session inherited the departed session's book feed: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|e| e.order_id == 920),
+        "the fresh session did not even get its own acknowledgement"
+    );
+}
+
+#[test]
+fn connection_churn_does_not_grow_the_subscriber_index() {
+    // The index from channel to session is what lets the write pass touch only
+    // the sessions a group concerns, and it is the thing that has to be given
+    // back when a session goes.
+    //
+    // Getting this wrong produces no wrong events -- the write pass checks the
+    // session follows the channel before sending -- so it would never fail a
+    // correctness test. It would simply grow, for the life of the process, one
+    // entry per subscription per departed client. At a million clients
+    // connecting and disconnecting that is a leak found in production.
+    let venue = Running::start();
+    let mut settled = 0;
+
+    for round in 0..12 {
+        {
+            let mut client = venue.connect();
+            send(
+                &mut client,
+                &[limit_order(4, SYMBOL, 2_000 + round, Side::Bid, 10_000, 1)],
+            );
+            watch_public(&mut client, 4);
+            let _ = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
+        }
+        // Long enough for the venue to notice the socket closed and free the slot.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while venue.sessions_hint() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let held = venue.tracked_subscriptions();
+        // After the second round the figure must stop moving. It is not asserted
+        // to be zero: a churn test races the venue's own bookkeeping, and what
+        // matters is that it does not accumulate.
+        if round == 1 {
+            settled = held;
+        } else if round > 1 {
+            assert!(
+                held <= settled,
+                "the subscriber index held {held} entries after {} rounds of \
+                 connect-and-leave, against {settled} after two, so a departed \
+                 session's subscriptions are never given back",
+                round + 1
+            );
+        }
+    }
 }

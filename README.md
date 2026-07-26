@@ -83,11 +83,21 @@ cache misses on the balance map, not anything algorithmic — lookups are still
 O(1), the working set simply stopped fitting. Memory is per *holding* rather than
 per registered user, so an account that has never traded costs nothing.
 
-Connections are the other axis, and the honest answer is different: an idle
-connection costs 23 ns a pass, so a gateway holds thousands rather than millions.
-`max_sessions` makes that a stated ceiling and counts refusals, because a venue
-that accepts ten thousand connections and serves them all slowly is worse than
-one that accepts what it can serve.
+Connections are the other axis, and that ceiling is gone. A pass over 256 idle
+connections costs the same as a pass over one:
+
+| idle connections | ns per pass | marginal, each |
+|---|---:|---:|
+| every socket read every pass | — | 422 |
+| found by readiness | 5,400 | 16 |
+| **written to only when touched** | **1,300** | **0** |
+
+Sessions are found by readiness on the way in, and on the way out the venue
+writes to the subscribers of the channels a group actually touched. A connection
+with nothing to say and nothing to be told is not visited at all, so it costs
+nothing and the cost stops growing with the connection count. `max_sessions` is
+still a stated ceiling and still counts refusals, but it is now about file
+descriptors and memory rather than about time in front of every order.
 
 ### Restart
 
@@ -163,8 +173,9 @@ per-stream flow control, none of which is worth 4.5x the latency here.
 
 **One thread, no async runtime.** Matching a book is a sequential dependency —
 each order changes what the next one sees — so there is no parallelism in it to
-take. Sessions are found by readiness notification rather than scanned, which is
-what keeps an idle connection at 23 ns a pass.
+take. Sessions are found by readiness on the way in and by the channels a group
+touched on the way out, so an idle connection is not visited at all and a pass
+costs the same whether the venue holds one connection or hundreds.
 
 **The price ladder is the price band.** An instrument's book covers 65,536 ticks
 from its floor. A price the ladder cannot address is a price the venue refuses, so
@@ -247,7 +258,7 @@ Scope boundaries, with reasons rather than apologies:
 
 ## Correctness
 
-307 tests. The ones worth looking at:
+310 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed
@@ -260,8 +271,8 @@ Scope boundaries, with reasons rather than apologies:
   and cancel-on-disconnect withdrawing every quote.
 - `crates/journal/src/replication.rs` — a replaced leader is refused and its
   write never reaches the follower's log.
-- `crates/gateway/tests/idle_cost.rs` — a benchmark that fails if an idle
-  connection ever costs more than 120 ns a pass again.
+- `crates/gateway/tests/idle_cost.rs` — a benchmark that fails if a pass over
+  256 idle connections ever costs meaningfully more than a pass over one again.
 - `crates/gateway/tests/failover.rs` — the same binaries a deployment runs: the
   leader is killed mid-session and a node with an empty log is promoted at a
   higher term, then checked against everything the dead leader acknowledged.

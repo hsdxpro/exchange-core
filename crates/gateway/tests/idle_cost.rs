@@ -104,23 +104,32 @@ fn an_idle_connection_costs_almost_nothing() {
     let per_session = (lots - one) / many as f64;
     println!("marginal cost of an idle session: {per_session:.0} ns per pass");
 
-    // Set against the measured 23 ns with room for a loaded machine, but well
-    // under the 422 ns that scanning every socket cost. A revert to scanning has
-    // to fail here, and a threshold picked to be safely absurd would not notice.
-    const BUDGET_PER_SESSION: f64 = 120.0;
+    // The property is now *flatness*, not a small slope, and that is a different
+    // claim worth asserting differently. Sessions are found by readiness on the
+    // way in and by the channels a group touched on the way out, so a connection
+    // that has nothing to say and nothing to be told is not visited at all.
+    //
+    // The history is the reason for the numbers here. Reading every socket every
+    // pass cost 422 ns a session; finding them by readiness took that to 23; and
+    // writing only to the sessions a group actually touched took it to zero. Each
+    // of those was a ceiling on how many clients one venue could hold, and the
+    // last one removes the ceiling rather than raising it.
+    const BUDGET_PER_SESSION: f64 = 8.0;
     assert!(
         per_session < BUDGET_PER_SESSION,
         "an idle session costs {per_session:.0} ns a pass, over the {BUDGET_PER_SESSION:.0} ns \
-         budget. Sessions are supposed to be found by readiness; a cost near 400 ns \
-         means every socket is being read every pass again, and every active \
-         client is paying for it."
+         budget. A cost near 20 ns means the write pass is visiting every session \
+         again rather than the ones a group touched; near 400 means every socket \
+         is being read every pass. Either way every active client is paying for \
+         every idle one."
     );
-    // And the cost has to stay roughly linear: a superlinear curve would mean
-    // something in the loop had become quadratic in connections.
-    let ratio = lots / one.max(1.0);
+    // A pass over 256 connections must not cost meaningfully more than a pass
+    // over one. This is the assertion that would fail if anything in the loop
+    // started iterating connections again.
     assert!(
-        ratio < many as f64 * 4.0,
-        "cost grew {ratio:.1}x for {many}x the sessions, which is worse than linear"
+        lots < one * 2.0,
+        "a pass over {many} idle connections cost {lots:.0} ns against {one:.0} ns for \
+         one, so the loop is still walking connections"
     );
 }
 
