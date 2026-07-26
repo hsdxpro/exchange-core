@@ -9,6 +9,8 @@
 //! the simulator can run a whole cluster in memory and inject torn writes and
 //! I/O errors that are impractical to provoke on a real disk.
 
+pub mod replication;
+
 use bx_protocol::{Command, Sequence};
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -64,6 +66,8 @@ impl From<io::Error> for JournalError {
 }
 
 pub type Result<T> = std::result::Result<T, JournalError>;
+
+pub use replication::{Replica, ReplicatedLog};
 
 /// Somewhere bytes can be appended and read back.
 ///
