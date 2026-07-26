@@ -32,7 +32,13 @@ struct Session {
     stream: TcpStream,
     decoder: Decoder,
     /// Bytes framed but not yet accepted by the socket.
+    ///
+    /// Bounded, because a client that connects and never reads would otherwise
+    /// make the venue allocate without limit. The decoder was already capped;
+    /// this was the remaining direction in which one session could exhaust the
+    /// whole process.
     outbox: Vec<u8>,
+    max_outbox: usize,
     /// Channels this session follows, and where it has read to.
     cursors: Vec<(Channel, Sequence)>,
     /// Set by the first command, which is how a session declares who it is.
@@ -41,11 +47,12 @@ struct Session {
 }
 
 impl Session {
-    fn new(stream: TcpStream, max_records: usize, public: &[Channel]) -> Self {
+    fn new(stream: TcpStream, max_records: usize, max_outbox: usize, public: &[Channel]) -> Self {
         Self {
             stream,
             decoder: Decoder::new(max_records),
             outbox: Vec::new(),
+            max_outbox,
             cursors: public.iter().map(|channel| (*channel, 0)).collect(),
             account: None,
             open: true,
@@ -79,6 +86,17 @@ impl Session {
         }
     }
 
+    /// True once this session owes more bytes than it is allowed to queue.
+    ///
+    /// Such a client is already beyond saving: the backlog exceeds a full
+    /// retention window, so even if it started reading now the feed it needs
+    /// would have been overwritten. Dropping it is the same policy as lagging
+    /// out of the window, applied one step earlier and for the same reason --
+    /// the venue neither slows down for a slow client nor accumulates for one.
+    fn over_budget(&self) -> bool {
+        self.outbox.len() > self.max_outbox
+    }
+
     /// Pushes whatever the socket will take. Anything it will not take stays
     /// queued rather than blocking the venue on one slow client.
     fn flush(&mut self) {
@@ -107,6 +125,10 @@ pub struct Server<S: LogStorage> {
     sessions: Vec<Session>,
     /// Public channels every session follows.
     public: Vec<Channel>,
+    /// Unsent bytes one session may owe. Derived from the retention window
+    /// rather than chosen: a session further behind than the window cannot be
+    /// caught up whatever the venue does.
+    max_outbox: usize,
     /// Reused across passes so a steady-state loop allocates nothing.
     inbound: Vec<Command>,
     outbound: Vec<Event>,
@@ -143,6 +165,7 @@ impl<S: LogStorage> Server<S> {
             inbound: Vec::new(),
             outbound: Vec::new(),
             max_records_per_session,
+            max_outbox: retained_per_channel * FRAME_LEN,
         };
         for channel in server.public.clone() {
             server.venue.subscribe(channel);
@@ -217,6 +240,7 @@ impl<S: LogStorage> Server<S> {
                         self.sessions.push(Session::new(
                             stream,
                             self.max_records_per_session,
+                            self.max_outbox,
                             &self.public,
                         ));
                     }
@@ -245,6 +269,9 @@ impl<S: LogStorage> Server<S> {
                 }
             }
             session.flush();
+            if session.over_budget() {
+                session.open = false;
+            }
         }
     }
 }

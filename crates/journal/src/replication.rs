@@ -23,6 +23,7 @@
 use crate::{LogStorage, RECORD_LEN};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
 /// A follower's reply: how many bytes it now holds.
 const ACK_LEN: usize = size_of::<u64>();
@@ -58,13 +59,25 @@ impl<L: LogStorage> ReplicatedLog<L> {
     /// followers means both plus the leader is three and one confirmation is
     /// enough to survive losing any single machine.
     ///
+    /// `ack_timeout` is how long the leader will wait for one follower to
+    /// confirm. It must be set, and it is the difference between surviving a
+    /// partition and not: a *crashed* follower closes its socket and is noticed
+    /// immediately, but a **hung** one -- a frozen machine, a partitioned
+    /// network, a stalled process -- leaves the socket open and silent. Without
+    /// a deadline the leader blocks inside `sync` forever and the whole venue
+    /// stops acknowledging anything, which is worse than the single-machine
+    /// failure the replication was there to survive. Pick it from the network
+    /// the cluster actually runs on; a value below the real round trip turns
+    /// healthy followers into dead ones.
+    ///
     /// # Errors
     /// Fails if a follower cannot be reached.
-    pub fn connect(local: L, addresses: &[String]) -> io::Result<Self> {
+    pub fn connect(local: L, addresses: &[String], ack_timeout: Duration) -> io::Result<Self> {
         let mut followers = Vec::with_capacity(addresses.len());
         for address in addresses {
             let stream = TcpStream::connect(address)?;
             stream.set_nodelay(true)?;
+            stream.set_read_timeout(Some(ack_timeout))?;
             followers.push(Follower { stream, live: true });
         }
         // Majority of (followers + leader), minus the leader's own vote.
@@ -110,6 +123,10 @@ impl<L: LogStorage> ReplicatedLog<L> {
         let mut confirmed = 0;
         let mut ack = [0_u8; ACK_LEN];
         for follower in self.followers.iter_mut().filter(|f| f.live) {
+            // A timeout lands here as an error, so a follower that has stopped
+            // answering is treated exactly like one that has died: dropped from
+            // the live set, and counted as a missing confirmation rather than
+            // waited on.
             if follower.stream.read_exact(&mut ack).is_ok() {
                 confirmed += 1;
             } else {
@@ -236,6 +253,10 @@ mod tests {
     use bx_protocol::{Command, CommandKind, Side, TimeInForce};
     use std::thread;
 
+    /// Generous for loopback, short enough that the hung-follower test does not
+    /// slow the suite down.
+    const ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
     fn command(order_id: u64) -> Command {
         Command::new(
             CommandKind::NewOrder,
@@ -284,8 +305,12 @@ mod tests {
     #[test]
     fn a_group_is_acknowledged_once_a_quorum_holds_it() {
         let replica = RunningReplica::start();
-        let log = ReplicatedLog::connect(MemoryLog::new(), std::slice::from_ref(&replica.address))
-            .unwrap();
+        let log = ReplicatedLog::connect(
+            MemoryLog::new(),
+            std::slice::from_ref(&replica.address),
+            ACK_TIMEOUT,
+        )
+        .unwrap();
         // Two machines: a majority of two is two, so the one follower must
         // confirm before anything is acknowledged.
         assert_eq!(log.quorum(), 1);
@@ -307,8 +332,12 @@ mod tests {
     #[test]
     fn one_sync_replicates_a_whole_group_not_each_record() {
         let replica = RunningReplica::start();
-        let log = ReplicatedLog::connect(MemoryLog::new(), std::slice::from_ref(&replica.address))
-            .unwrap();
+        let log = ReplicatedLog::connect(
+            MemoryLog::new(),
+            std::slice::from_ref(&replica.address),
+            ACK_TIMEOUT,
+        )
+        .unwrap();
         let mut journal = Journal::open(log).unwrap();
 
         for group in [1_u64, 5, 20] {
@@ -328,6 +357,7 @@ mod tests {
         let log = ReplicatedLog::connect(
             MemoryLog::new(),
             &[first.address.clone(), second.address.clone()],
+            ACK_TIMEOUT,
         )
         .unwrap();
         // Three machines: a majority is two, so one confirmation besides the
@@ -348,7 +378,7 @@ mod tests {
 
     #[test]
     fn a_lone_leader_needs_no_confirmations() {
-        let log = ReplicatedLog::connect(MemoryLog::new(), &[]).unwrap();
+        let log = ReplicatedLog::connect(MemoryLog::new(), &[], ACK_TIMEOUT).unwrap();
         assert_eq!(log.quorum(), 0);
         assert_eq!(log.live_followers(), 0);
         let mut journal = Journal::open(log).unwrap();
@@ -372,7 +402,7 @@ mod tests {
             stream.write_all(&(length as u64).to_le_bytes()).unwrap();
         });
 
-        let log = ReplicatedLog::connect(MemoryLog::new(), &[address]).unwrap();
+        let log = ReplicatedLog::connect(MemoryLog::new(), &[address], ACK_TIMEOUT).unwrap();
         let mut journal = Journal::open(log).unwrap();
         journal.append(&mut command(1)).unwrap();
         journal.sync().unwrap();
@@ -383,6 +413,40 @@ mod tests {
             journal.sync().is_err(),
             "acknowledged a group that no quorum holds"
         );
+    }
+
+    #[test]
+    fn a_follower_that_hangs_does_not_stall_the_leader_forever() {
+        // The dangerous failure is not a follower that dies -- that closes the
+        // socket and is noticed at once -- but one that accepts the connection
+        // and then goes silent. Without a deadline the leader waits inside sync
+        // forever and the venue stops acknowledging anything at all.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let hung = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Accept, read nothing, answer nothing, and hold the socket open.
+            thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        });
+
+        let log = ReplicatedLog::connect(MemoryLog::new(), &[address], ACK_TIMEOUT).unwrap();
+        let mut journal = Journal::open(log).unwrap();
+        journal.append(&mut command(1)).unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = journal.sync();
+        let waited = started.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "a silent follower was counted as a confirmation"
+        );
+        assert!(
+            waited < Duration::from_secs(1),
+            "the leader waited {waited:?} on a hung follower instead of giving up"
+        );
+        hung.join().unwrap();
     }
 
     #[test]
@@ -410,8 +474,12 @@ mod tests {
     #[test]
     fn the_leaders_own_log_is_still_replayable() {
         let replica = RunningReplica::start();
-        let log = ReplicatedLog::connect(MemoryLog::new(), std::slice::from_ref(&replica.address))
-            .unwrap();
+        let log = ReplicatedLog::connect(
+            MemoryLog::new(),
+            std::slice::from_ref(&replica.address),
+            ACK_TIMEOUT,
+        )
+        .unwrap();
         let mut journal = Journal::open(log).unwrap();
         for id in 0..5 {
             journal.append(&mut command(id)).unwrap();

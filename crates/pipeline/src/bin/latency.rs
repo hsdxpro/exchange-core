@@ -26,6 +26,9 @@ const USD: AssetId = 2;
 const SYMBOL: u32 = 1;
 const FLOOR: Ticks = 10_000;
 const REPS: usize = 5;
+/// How long the leader waits for a follower to confirm. Loopback here, so this
+/// only needs to be longer than a local round trip.
+const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Bigger than any run below places, so no measurement is polluted by orders
 /// being rejected for want of a slot -- and no bigger, because the pool is
 /// allocated up front and a needlessly large one only costs cache.
@@ -443,7 +446,8 @@ fn replicated(sink: &mut u64, batch: usize) -> Vec<f64> {
             MAX_OPEN_ORDERS,
         ));
         let local = FileLog::open(&path).unwrap();
-        let log = ReplicatedLog::connect(local, std::slice::from_ref(&address)).unwrap();
+        let log =
+            ReplicatedLog::connect(local, std::slice::from_ref(&address), ACK_TIMEOUT).unwrap();
         let mut exchange = Exchange::new(log, instruments).unwrap();
         for account in 1..=16 {
             exchange.deposit(account, USD, u64::MAX).unwrap();

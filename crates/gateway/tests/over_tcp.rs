@@ -16,7 +16,7 @@ use bx_protocol::{Command, EventKind, Side, Ticks};
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const BTC: u32 = 1;
@@ -39,6 +39,9 @@ fn instruments() -> Instruments {
 struct Running {
     address: String,
     stop: Arc<AtomicBool>,
+    /// Sessions the server held at its last pass. Only a hint: the test thread
+    /// reads it while the server thread writes it.
+    sessions: Arc<AtomicUsize>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -66,10 +69,13 @@ impl Running {
         let address = server.address().unwrap().to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
+        let sessions = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&sessions);
 
         let thread = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 server.poll().expect("the venue failed to commit");
+                counter.store(server.sessions(), Ordering::Relaxed);
                 // Nothing to do until a socket is readable. A deployed venue
                 // busy-polls a pinned core here; a test does not need to.
                 std::thread::sleep(Duration::from_micros(200));
@@ -79,8 +85,13 @@ impl Running {
         Self {
             address,
             stop,
+            sessions,
             thread: Some(thread),
         }
+    }
+
+    fn sessions_hint(&self) -> usize {
+        self.sessions.load(Ordering::Relaxed)
     }
 
     fn connect(&self) -> TcpStream {
@@ -267,6 +278,92 @@ fn a_burst_larger_than_the_retention_window_does_not_drop_the_client() {
         ORDERS,
         "the venue dropped a client that was reading as fast as it could"
     );
+}
+
+#[test]
+fn a_client_that_never_reads_is_dropped_instead_of_growing_the_venue() {
+    // The venue queues what a socket will not yet take. A client that connects,
+    // gets subscribed, and then never reads would otherwise make that queue grow
+    // without limit -- one session able to exhaust the whole process. The bound
+    // is a full retention window, past which the client could not be caught up
+    // anyway, so it is shed for the same reason a lagging one is.
+    let venue = Running::start();
+
+    // A silent client: connected, attributed an account, then never reading.
+    let mut silent = venue.connect();
+    send(
+        &mut silent,
+        &[limit_order(3, SYMBOL, 9_001, Side::Bid, 10_050, 1)],
+    );
+
+    // A well-behaved client generates far more feed than the window holds, and
+    // reads the whole time. It must not be shed.
+    let mut busy = venue.connect();
+    let mut reader = busy.try_clone().unwrap();
+    let writing = Arc::new(AtomicBool::new(true));
+    let still_writing = Arc::clone(&writing);
+    let drain = std::thread::spawn(move || {
+        let mut seen = 0_usize;
+        while still_writing.load(Ordering::Relaxed) {
+            let mut batch = Vec::new();
+            if read_events(&mut reader, 1, &mut batch).is_err() || batch.is_empty() {
+                break;
+            }
+            seen += batch.len();
+        }
+        seen
+    });
+
+    // Enough backlog to pass the bound comfortably: the cap is one retention
+    // window in bytes, and each order produces about three events.
+    const ROUNDS: u64 = 60;
+    for round in 0..ROUNDS {
+        let commands: Vec<Command> = (0..1_000)
+            .map(|i| {
+                limit_order(
+                    1,
+                    SYMBOL,
+                    round * 1_000 + i + 1,
+                    Side::Bid,
+                    FLOOR + 1_000 + ((round * 1_000 + i) % 4_000) as Ticks,
+                    1,
+                )
+            })
+            .collect();
+        send(&mut busy, &commands);
+    }
+    writing.store(false, Ordering::Relaxed);
+    let received = drain.join().unwrap();
+    assert!(
+        received > RETAINED,
+        "the reading client only got {received} events, so the venue never \
+         produced enough backlog to shed anyone"
+    );
+
+    // The silent session is gone; the reading one is not.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while venue.sessions_hint() > 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        venue.sessions_hint(),
+        1,
+        "the silent client was not shed, so its queue was unbounded"
+    );
+
+    // And the venue still trades.
+    let mut fresh = venue.connect();
+    send(
+        &mut fresh,
+        &[limit_order(2, SYMBOL, 8_000_001, Side::Ask, 10_050, 1)],
+    );
+    let mut events = Vec::new();
+    read_events(&mut fresh, 1, &mut events).unwrap();
+    assert!(
+        !events.is_empty(),
+        "the venue stopped serving after shedding a silent client"
+    );
+    drop(silent);
 }
 
 #[test]
