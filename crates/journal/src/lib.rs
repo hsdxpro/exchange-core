@@ -392,6 +392,12 @@ impl<S: LogStorage> Journal<S> {
         &self.storage
     }
 
+    /// The storage underneath, mutably. For tests and tools that need to
+    /// interfere with it — a deployment drives it through the journal.
+    pub fn storage_mut(&mut self) -> &mut S {
+        &mut self.storage
+    }
+
     pub fn into_storage(self) -> S {
         self.storage
     }

@@ -50,12 +50,53 @@ const HEADER_LEN: usize = size_of::<u8>() + size_of::<u64>() + size_of::<u32>();
 /// How long to wait before trying a follower again during a promotion.
 const RETRY_PAUSE: Duration = Duration::from_millis(50);
 
+/// Groups between attempts to bring a dropped follower back in.
+///
+/// Not every group. Connecting to a machine that is genuinely gone costs a
+/// syscall and, depending on the platform and the failure, a wait — and it would
+/// be paid on the commit path, in front of orders. Once every few hundred groups
+/// is frequent enough that a follower rejoins within a moment of coming back,
+/// and rare enough that a permanently dead one costs nothing measurable.
+const READMIT_EVERY: u32 = 256;
+
+/// Bytes of backfill sent to a rejoining follower at a time.
+///
+/// A follower that was away for an hour is behind by more than fits in memory,
+/// so the gap is shipped in bounded pieces rather than read into one buffer.
+const BACKFILL_CHUNK: usize = 1 << 20;
+
 /// Append this group and confirm.
 const APPEND: u8 = 0;
 /// Report what you hold, without changing anything.
 const QUERY: u8 = 1;
 /// Send back a range of your log.
 const FETCH: u8 = 2;
+
+/// Why a follower cannot be brought back in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Refusal {
+    /// It has seen a newer leader, so this one is finished.
+    Deposed,
+    /// It holds records this leader does not, which can only mean it followed
+    /// somebody else. Appending on top would be exactly the divergence that
+    /// fencing exists to prevent, so it stays out and the cluster runs degraded.
+    Ahead,
+}
+
+/// Where a rejoining follower's backfill should start, or why there is none.
+///
+/// Pulled out of the socket work so the decision can be checked on its own. It
+/// is three comparisons, and every one of them is the difference between a
+/// consistent cluster and a quietly corrupt one.
+const fn backfill_from(seen: u64, term: u64, held: u64, settled: u64) -> Result<u64, Refusal> {
+    if seen > term {
+        return Err(Refusal::Deposed);
+    }
+    if held > settled {
+        return Err(Refusal::Ahead);
+    }
+    Ok(held)
+}
 
 fn request(kind: u8, term: u64, length: u32) -> [u8; HEADER_LEN] {
     let mut header = [0_u8; HEADER_LEN];
@@ -70,9 +111,13 @@ fn request(kind: u8, term: u64, length: u32) -> [u8; HEADER_LEN] {
 struct Follower {
     address: String,
     stream: TcpStream,
-    /// A follower that has failed is left in place and not spoken to again, so
-    /// the quorum arithmetic keeps counting against the configured cluster size
+    /// A follower that has failed is left in place rather than removed, so the
+    /// quorum arithmetic keeps counting against the configured cluster size
     /// rather than silently shrinking to whoever is still answering.
+    ///
+    /// It is periodically offered a way back — see `readmit`. Leaving it out
+    /// permanently meant one slow moment cost a node for the lifetime of the
+    /// process, and the next slow moment stopped the venue.
     live: bool,
 }
 
@@ -96,6 +141,13 @@ pub struct ReplicatedLog<L: LogStorage> {
     /// Set once a follower reports a newer term. A deposed leader stops
     /// acknowledging rather than continuing to write.
     deposed: bool,
+    /// Groups since a dropped follower was last offered a way back.
+    since_readmit: u32,
+    /// Followers brought back in after dropping out, and the bytes shipped to
+    /// catch them up. An operator watching the first climb knows a node is
+    /// flapping even though the venue never stopped.
+    readmitted: u64,
+    backfilled: u64,
 }
 
 impl<L: LogStorage> ReplicatedLog<L> {
@@ -149,7 +201,22 @@ impl<L: LogStorage> ReplicatedLog<L> {
             ack_timeout,
             term,
             deposed: false,
+            since_readmit: 0,
+            readmitted: 0,
+            backfilled: 0,
         })
+    }
+
+    /// Followers that dropped out and were brought back.
+    #[must_use]
+    pub const fn readmitted(&self) -> u64 {
+        self.readmitted
+    }
+
+    /// Bytes shipped to followers to close the gap they missed.
+    #[must_use]
+    pub const fn backfilled(&self) -> u64 {
+        self.backfilled
     }
 
     /// Followers that must confirm before a group is acknowledged.
@@ -272,17 +339,120 @@ impl<L: LogStorage> ReplicatedLog<L> {
     /// timed out may still arrive and would be read as the answer to the next one.
     fn reconnect(&mut self, index: usize) -> io::Result<()> {
         std::thread::sleep(RETRY_PAUSE);
-        let stream = TcpStream::connect(&self.followers[index].address)?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(self.ack_timeout))?;
-        self.followers[index].stream = stream;
+        self.dial(index)?;
         self.followers[index].live = true;
         Ok(())
     }
 
+    /// Replaces a follower's socket. No pause: this is also called from the
+    /// commit path, where sleeping would put the delay in front of orders.
+    fn dial(&mut self, index: usize) -> io::Result<()> {
+        let stream = TcpStream::connect(&self.followers[index].address)?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(self.ack_timeout))?;
+        self.followers[index].stream = stream;
+        Ok(())
+    }
+
+    /// Offers every dropped follower a way back into the quorum.
+    ///
+    /// Without this a follower that failed once was never spoken to again, so a
+    /// single slow moment cost a node for the life of the process and the next
+    /// slow moment stopped the venue. That is what a three-node cluster did
+    /// under load while both replica processes were alive and healthy: the
+    /// leader lost one, carried on with no margin, and fail-stopped on the
+    /// second hiccup.
+    ///
+    /// `settled` is everything the leader holds *except* the group about to be
+    /// sent, which goes out through the ordinary path — backfilling it here too
+    /// would write it twice.
+    fn readmit(&mut self, settled: u64) {
+        for index in 0..self.followers.len() {
+            if self.followers[index].live {
+                continue;
+            }
+            if self.rejoin(index, settled).is_ok() {
+                self.followers[index].live = true;
+                self.readmitted += 1;
+            } else {
+                // Still gone, or ahead of this leader. Either way it stays out
+                // and the quorum keeps counting it against the cluster size.
+                self.followers[index].live = false;
+            }
+        }
+    }
+
+    /// Reconnects one follower and closes the gap it missed.
+    ///
+    /// Reconnecting alone is not enough and would be worse than leaving it out:
+    /// a follower that was away has a hole in its log, and appending new groups
+    /// on top would leave it holding a journal that looks complete and is not.
+    /// So it is asked what it holds, and the missing range is shipped from the
+    /// leader's own log before it counts towards a quorum again.
+    fn rejoin(&mut self, index: usize, settled: u64) -> io::Result<()> {
+        self.dial(index)?;
+        let (seen, held) = self.ask(index, QUERY, &[])?;
+        let start = match backfill_from(seen, self.term, held, settled) {
+            Ok(from) => from,
+            Err(Refusal::Deposed) => {
+                self.deposed = true;
+                return Err(io::Error::other(
+                    "a follower reported a newer term; this leader has been replaced",
+                ));
+            }
+            Err(Refusal::Ahead) => {
+                return Err(io::Error::other(
+                    "follower holds more than this leader; refusing to write over it",
+                ));
+            }
+        };
+
+        let mut cursor = start;
+        let mut buffer = vec![0_u8; BACKFILL_CHUNK];
+        while cursor < settled {
+            let want = usize::try_from((settled - cursor).min(BACKFILL_CHUNK as u64))
+                .unwrap_or(BACKFILL_CHUNK);
+            let read = self
+                .local
+                .read_at(HEADER_OFFSET + cursor, &mut buffer[..want])?;
+            if read == 0 {
+                return Err(io::Error::other(
+                    "the leader's own log is shorter than it believes",
+                ));
+            }
+            let length =
+                u32::try_from(read).map_err(|_| io::Error::other("backfill chunk too large"))?;
+            let follower = &mut self.followers[index];
+            follower
+                .stream
+                .write_all(&request(APPEND, self.term, length))?;
+            follower.stream.write_all(&buffer[..read])?;
+            let mut ack = [0_u8; ACK_LEN];
+            follower.stream.read_exact(&mut ack)?;
+            cursor += read as u64;
+            self.backfilled += read as u64;
+        }
+        Ok(())
+    }
+
     /// Bytes of records this node's own log holds, excluding the file header.
-    fn local_len(&self) -> io::Result<u64> {
+    ///
+    /// # Errors
+    /// Fails if the underlying log cannot report its length.
+    pub fn local_len(&self) -> io::Result<u64> {
         Ok(self.local.end()?.saturating_sub(HEADER_OFFSET))
+    }
+
+    /// Makes a follower look like it failed, which is what a hiccup does: the
+    /// socket the leader is holding stops working and it drops out of the
+    /// quorum. Exists so a test can produce that state without a real network
+    /// fault.
+    #[cfg(test)]
+    fn drop_follower(&mut self, index: usize) {
+        let _ = self.followers[index]
+            .stream
+            .shutdown(std::net::Shutdown::Both);
+        self.followers[index].live = false;
     }
 
     /// Sends one request and reads the fixed reply.
@@ -314,6 +484,22 @@ impl<L: LogStorage> ReplicatedLog<L> {
                 "this leader has been replaced by a newer term and cannot acknowledge",
             ));
         }
+        // A dropped follower is offered a way back before the group goes out, so
+        // it rejoins holding everything rather than everything since it woke up.
+        self.since_readmit = self.since_readmit.saturating_add(1);
+        if self.since_readmit >= READMIT_EVERY {
+            self.since_readmit = 0;
+            if self.followers.iter().any(|follower| !follower.live) {
+                let settled = self.local_len()?.saturating_sub(self.pending.len() as u64);
+                self.readmit(settled);
+                if self.deposed {
+                    return Err(io::Error::other(
+                        "a follower reported a newer term; this leader has been replaced",
+                    ));
+                }
+            }
+        }
+
         let length = u32::try_from(self.pending.len())
             .map_err(|_| io::Error::other("replication group too large"))?;
         let header = request(APPEND, self.term, length);
@@ -358,9 +544,15 @@ impl<L: LogStorage> ReplicatedLog<L> {
             // Refusing is the only safe answer. Reporting success here would
             // acknowledge a command to a client that one machine's failure
             // could still erase.
+            // Names all three numbers. "0 of 1" alone reads as though the
+            // leader forgot a node it was configured with, when what it means
+            // is that one confirmation was needed and none arrived.
             return Err(io::Error::other(format!(
-                "replication reached {confirmed} of {} followers",
-                self.quorum
+                "replication reached {confirmed} confirmations, needs {}; {} of {} \
+                 followers still answering",
+                self.quorum,
+                self.followers.iter().filter(|f| f.live).count(),
+                self.followers.len()
             )));
         }
         self.pending.clear();
@@ -569,6 +761,8 @@ mod tests {
     use super::*;
     use crate::{Journal, MemoryLog};
     use bx_protocol::{Command, CommandKind, Side, TimeInForce};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
 
     /// Generous for loopback, short enough that the hung-follower test does not
@@ -1018,6 +1212,200 @@ mod tests {
             records.iter().map(|c| c.order_id).collect::<Vec<_>>(),
             vec![0, 1, 2, 3, 4],
             "replicating broke the local log"
+        );
+    }
+
+    /// A follower that survives its leader, the way the `replica` binary does.
+    ///
+    /// The one-shot helper above cannot express readmission at all: the whole
+    /// property is that a follower keeps its log across a disconnection and is
+    /// brought back holding everything, so it has to outlive the connection that
+    /// dropped.
+    struct StandingReplica {
+        address: String,
+        held: Arc<AtomicU64>,
+        /// A fold over everything it holds. Byte counts alone would pass a
+        /// backfill that shipped the *wrong* range, which is the failure worth
+        /// catching: a follower holding the right number of wrong records looks
+        /// healthy from every angle except this one.
+        digest: Arc<AtomicU64>,
+        serving: Arc<AtomicBool>,
+    }
+
+    /// FNV-1a over a whole log, header included, so two logs that agree produce
+    /// the same number and two that do not almost certainly will not.
+    fn digest_of<L: LogStorage>(log: &L) -> u64 {
+        let end = usize::try_from(log.end().unwrap_or(0)).unwrap_or(0);
+        let mut buffer = vec![0_u8; end];
+        let read = log.read_at(0, &mut buffer).unwrap_or(0);
+        buffer.truncate(read);
+        buffer.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    impl StandingReplica {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let held = Arc::new(AtomicU64::new(0));
+            let reported = Arc::clone(&held);
+            let digest = Arc::new(AtomicU64::new(0));
+            let folded = Arc::clone(&digest);
+            let serving = Arc::new(AtomicBool::new(true));
+            let running = Arc::clone(&serving);
+
+            // Detached: it ends with the test process. A stop flag would have to
+            // interrupt a blocking accept, which is more machinery than a test
+            // helper is worth.
+            thread::spawn(move || {
+                let mut replica = Replica::new(MemoryLog::new(), false);
+                while running.load(Ordering::Relaxed) {
+                    let _ = replica.serve_one(&listener, IDLE);
+                    folded.store(digest_of(&replica.log), Ordering::Relaxed);
+                    reported.store(replica.held(), Ordering::Relaxed);
+                }
+            });
+            Self {
+                address,
+                held,
+                digest,
+                serving,
+            }
+        }
+
+        /// Bytes it has accepted, as of the last leader that hung up.
+        fn held(&self) -> u64 {
+            self.held.load(Ordering::Relaxed)
+        }
+
+        fn digest(&self) -> u64 {
+            self.digest.load(Ordering::Relaxed)
+        }
+
+        /// Stops it answering after the current leader goes.
+        fn retire(&self) {
+            self.serving.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Drives enough groups through a leader to pass the readmission interval.
+    fn push_groups(journal: &mut Journal<ReplicatedLog<MemoryLog>>, from: u64, count: u64) {
+        for id in from..from + count {
+            journal.append(&mut command(id)).unwrap();
+            journal.sync().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_follower_that_drops_out_is_brought_back_holding_everything() {
+        // The bug this pins cost a real cluster its leader. A follower that
+        // failed once was never spoken to again, so one slow moment took a node
+        // out for the life of the process and the next one stopped the venue --
+        // with both replica processes alive and healthy the whole time.
+        let steady = StandingReplica::start();
+        let flaky = StandingReplica::start();
+        let mut journal = Journal::open(
+            ReplicatedLog::connect(
+                MemoryLog::new(),
+                &[steady.address.clone(), flaky.address.clone()],
+                ACK_TIMEOUT,
+                TERM,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        push_groups(&mut journal, 0, 4);
+
+        // Take it out from under the leader, which is what a hiccup looks like:
+        // the socket the leader holds stops working.
+        journal.storage_mut().drop_follower(1);
+        assert_eq!(journal.storage().live_followers(), 1);
+
+        // The venue keeps going on the remaining quorum, which is the point of
+        // replicating to two.
+        push_groups(&mut journal, 100, u64::from(READMIT_EVERY) + 4);
+
+        assert!(
+            journal.storage().readmitted() >= 1,
+            "the follower was never offered a way back"
+        );
+        assert_eq!(
+            journal.storage().live_followers(),
+            2,
+            "it reconnected but was not counted back into the quorum"
+        );
+        assert!(
+            journal.storage().backfilled() > 0,
+            "it rejoined without being sent what it missed"
+        );
+
+        // What matters: it holds everything, not merely everything since it
+        // woke up. A follower with a hole in its log is worse than one that is
+        // absent, because it looks complete.
+        push_groups(&mut journal, 9_000, 1);
+        let leader_bytes = journal.storage().local_len().unwrap();
+        let leader_digest = digest_of(journal.storage());
+        drop(journal);
+        steady.retire();
+        flaky.retire();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while flaky.held() < leader_bytes && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            flaky.held(),
+            leader_bytes,
+            "the readmitted follower holds {} of the leader's {leader_bytes} bytes",
+            flaky.held()
+        );
+        // Byte for byte, not merely the right number of them. A backfill that
+        // shipped the wrong range would satisfy the count above and leave a
+        // follower that is confidently wrong.
+        assert_eq!(
+            flaky.digest(),
+            leader_digest,
+            "the readmitted follower holds the right number of the wrong records"
+        );
+        assert_eq!(
+            steady.digest(),
+            leader_digest,
+            "the follower that never dropped out diverged"
+        );
+    }
+
+    #[test]
+    fn readmission_refuses_a_follower_that_followed_somebody_else() {
+        // Three comparisons, and each is the difference between a consistent
+        // cluster and a quietly corrupt one. Checked directly rather than
+        // through a socket, because the states that reach them are ones a
+        // healthy cluster cannot be talked into producing.
+        const TERM: u64 = 5;
+
+        // Behind: send it what it missed, starting where it stopped.
+        assert_eq!(backfill_from(TERM, TERM, 640, 1_280), Ok(640));
+        // Level: nothing to send, and it rejoins immediately.
+        assert_eq!(backfill_from(TERM, TERM, 1_280, 1_280), Ok(1_280));
+        // Never heard from anyone: an empty follower takes the whole log.
+        assert_eq!(backfill_from(0, TERM, 0, 1_280), Ok(0));
+
+        // Ahead. It can only be holding records this leader does not because it
+        // followed a different one, so writing over them is the divergence
+        // fencing exists to prevent.
+        assert_eq!(backfill_from(TERM, TERM, 1_920, 1_280), Err(Refusal::Ahead));
+
+        // A newer term outranks everything, including being behind: this leader
+        // has been replaced and must stop, not catch anybody up.
+        assert_eq!(
+            backfill_from(TERM + 1, TERM, 0, 1_280),
+            Err(Refusal::Deposed)
+        );
+        assert_eq!(
+            backfill_from(TERM + 1, TERM, 9_999, 1_280),
+            Err(Refusal::Deposed),
+            "a deposed leader must be told so before anything else is considered"
         );
     }
 }
