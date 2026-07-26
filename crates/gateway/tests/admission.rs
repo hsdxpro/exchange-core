@@ -26,6 +26,12 @@ const USD: u32 = 2;
 const SYMBOL: u32 = 1;
 const FLOOR: Ticks = 10_000;
 
+/// Commands one session may hand the venue in a single pass, and so the largest
+/// batch the discard path can be asked to process at once. Deliberately the
+/// deployment default rather than a small test number: the cost of refusing a
+/// batch is a property of its size, and a batch of 256 would hide it.
+const BATCH: usize = 4_096;
+
 const ALICE: u64 = 1;
 const BOB: u64 = 2;
 const ALICE_SECRET: [u8; SECRET_LEN] = [0x11; SECRET_LEN];
@@ -65,8 +71,15 @@ impl Running {
     fn configured(authenticated: bool, rate: Option<RateLimit>, timestamps: bool) -> Self {
         let mut instruments = Instruments::new();
         instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000, 65_536));
-        let mut server = Server::bind("127.0.0.1:0", MemoryLog::new(), instruments, 4_096, 256, 64)
-            .expect("the venue could not bind");
+        let mut server = Server::bind(
+            "127.0.0.1:0",
+            MemoryLog::new(),
+            instruments,
+            4_096,
+            BATCH,
+            64,
+        )
+        .expect("the venue could not bind");
 
         if authenticated {
             let mut credentials = Credentials::new();
