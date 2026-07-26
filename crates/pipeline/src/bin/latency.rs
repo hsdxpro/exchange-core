@@ -59,6 +59,16 @@ fn report(name: &str, per_op_ns: &mut [f64], unit: &str) {
     println!("{name:<38}{min:>9.0} ns{median:>12.0} ns   {unit}");
 }
 
+/// Reports a durability figure as the throughput it implies, because "can this
+/// keep up with a million orders a second" is the question and nanoseconds per
+/// command is only the answer once divided into a second.
+fn report_throughput(name: &str, per_op_ns: &mut [f64]) {
+    per_op_ns.sort_by(f64::total_cmp);
+    let best = per_op_ns[0];
+    let per_second = 1e9 / best;
+    println!("{name:<38}{best:>12.0} ns{:>16.0} cmd/sec", per_second);
+}
+
 /// Passive limit orders that never cross, so this is the pure resting path.
 fn resting_orders(sink: &mut u64) -> Vec<f64> {
     const COUNT: u64 = 100_000;
@@ -184,6 +194,36 @@ fn cancels(sink: &mut u64) -> Vec<f64> {
         black_box(&exchange);
     }
     samples
+}
+
+/// Posts and cancels, so the resting book stays near `LIFETIME` orders however
+/// many commands are sent.
+///
+/// A durable-throughput run needs millions of commands to amortise a sync across
+/// a large group. Posting all of them would saturate the order pool and start
+/// measuring rejections, which is cheaper than real work and would report a
+/// throughput the venue cannot reach.
+fn bounded_commands(count: u64) -> Vec<Command> {
+    const LIFETIME: u64 = 2_001;
+    (0..count)
+        .map(|i| {
+            if i.is_multiple_of(2) || i <= LIFETIME {
+                let price = FLOOR + 1_000 + (i % 4_000) as Ticks;
+                limit_order(1 + i % 16, SYMBOL, i + 1, Side::Bid, price, 1)
+            } else {
+                Command::new(
+                    CommandKind::Cancel,
+                    1 + i % 16,
+                    SYMBOL,
+                    i - LIFETIME + 1,
+                    Side::Bid,
+                    0,
+                    0,
+                    TimeInForce::GoodTillCancel,
+                )
+            }
+        })
+        .collect()
 }
 
 /// A realistic mix: mostly posting and cancelling, some taking.
@@ -315,7 +355,10 @@ fn on_disk(sink: &mut u64, batch: usize) -> Vec<f64> {
     // the same wall-clock budget and the same number of samples of the thing
     // that actually varies.
     const SYNCS: u64 = 48;
-    let count: u64 = SYNCS * batch as u64;
+    /// Enough samples of the sync, but never so much traffic that a large batch
+    /// takes minutes.
+    const MOST: u64 = 400_000;
+    let count: u64 = (SYNCS * batch as u64).min(MOST.max(batch as u64));
     let mut samples = Vec::with_capacity(3);
     for run in 0..3 {
         let path = std::env::temp_dir().join(format!(
@@ -339,12 +382,7 @@ fn on_disk(sink: &mut u64, batch: usize) -> Vec<f64> {
             exchange.deposit(account, BTC, u64::MAX).unwrap();
         }
 
-        let mut commands: Vec<Command> = (0..count)
-            .map(|i| {
-                let price = FLOOR + 1_000 + (i % 4_000) as Ticks;
-                limit_order(1 + i % 16, SYMBOL, i + 1, Side::Bid, price, 1)
-            })
-            .collect();
+        let mut commands = bounded_commands(count);
 
         let started = Instant::now();
         for chunk in commands.chunks_mut(batch) {
@@ -452,7 +490,10 @@ fn recovery() -> (f64, f64, u64) {
 /// shape: the leader stops waiting on its own disk.
 fn replicated(sink: &mut u64, batch: usize) -> Vec<f64> {
     const SYNCS: u64 = 48;
-    let count: u64 = SYNCS * batch as u64;
+    /// Enough samples of the sync, but never so much traffic that a large batch
+    /// takes minutes.
+    const MOST: u64 = 400_000;
+    let count: u64 = (SYNCS * batch as u64).min(MOST.max(batch as u64));
     let mut samples = Vec::with_capacity(3);
 
     for run in 0..3 {
@@ -487,12 +528,7 @@ fn replicated(sink: &mut u64, batch: usize) -> Vec<f64> {
             exchange.deposit(account, BTC, u64::MAX).unwrap();
         }
 
-        let mut commands: Vec<Command> = (0..count)
-            .map(|i| {
-                let price = FLOOR + 1_000 + (i % 4_000) as Ticks;
-                limit_order(1 + i % 16, SYMBOL, i + 1, Side::Bid, price, 1)
-            })
-            .collect();
+        let mut commands = bounded_commands(count);
 
         let started = Instant::now();
         for chunk in commands.chunks_mut(batch) {
@@ -551,24 +587,19 @@ fn main() {
     );
 
     println!();
-    println!("Against a real file, where the fsync dominates:");
+    println!("Durable throughput. How fast can the venue acknowledge?");
     println!("{}", "-".repeat(80));
-    for batch in [1_usize, 16, 256, 4_096] {
-        report(
-            &format!("on disk, batch {batch}"),
+    for batch in [1_usize, 16, 256, 4_096, 16_384] {
+        report_throughput(
+            &format!("local fsync, group of {batch}"),
             &mut on_disk(&mut sink, batch),
-            "per command",
         );
     }
-
     println!();
-    println!("Acknowledged by a quorum instead, follower on loopback:");
-    println!("{}", "-".repeat(80));
-    for batch in [1_usize, 16, 256] {
-        report(
-            &format!("replicated, batch {batch}"),
+    for batch in [1_usize, 16, 256, 4_096, 16_384] {
+        report_throughput(
+            &format!("quorum on loopback, group of {batch}"),
             &mut replicated(&mut sink, batch),
-            "per command",
         );
     }
 

@@ -118,28 +118,31 @@ and never touches the book.
 These figures drift 2-3x on a loaded machine. The numbers above are from a quiet
 one; anything measured while a build is running is worthless.
 
-### Durability, which is what actually bounds throughput
+### Durable throughput, which is the number that answers "can it keep up"
 
-The figures above are compute. Durability is a different order of magnitude, and
-the choice between the two rows below is the single biggest decision in the
-design.
-
-| per command | local fsync | quorum on loopback |
+| group | local fsync | quorum on loopback |
 |---|---:|---:|
-| batch 1 | 3,008,223 ns | **51,300 ns** |
-| batch 16 | 192,727 ns | 6,282 ns |
-| batch 256 | 14,950 ns | 3,324 ns |
-| batch 4,096 | 3,793 ns | — |
+| 1 | 318 cmd/sec | 19,644 cmd/sec |
+| 16 | 5,128 | 274,296 |
+| 256 | 78,471 | 1,974,452 |
+| 4,096 | 1,080,376 | 5,299,407 |
+| 16,384 | **2,975,883** | **6,222,727** |
 
-**Reaching another machine beats reaching the platter by 59x at a group of one**,
-which is the latency-sensitive case a client feels. Batching narrows the gap
-because batching was always the way to hide an fsync; quorum acknowledgement is
-what removes the need to hide it. Loopback is the floor -- a real LAN adds tens
-of microseconds -- but the shape holds.
+**Millions per second, durably, is reached.** At a group of 16,384 the quorum path
+costs 161 ns per command, which *is* the compute cost from the table above:
+durability has become free, and the venue is bound by matching again.
 
-Compute is 161 ns and one fsync is 3 ms, so **durability is roughly nineteen
-thousand times the cost of matching**. Every micro-optimisation above is noise
-beside that choice.
+Getting there needed a fix, not a bigger batch. Group commit was half-done: one
+sync per group, but `FileLog::append` still issued one `write` syscall per
+64-byte record. A group of sixteen thousand commands made sixteen thousand
+syscalls, and they dominated so completely that throughput plateaued near 345,000
+a second no matter how large the group grew. Appends are now buffered and written
+once per sync, which is worth **8.6x** at that group size.
+
+The trade a group size buys is latency for throughput: the first command in a
+group waits for the last. Nothing picks the size -- the group is whatever arrived
+since the previous pass, so it grows under load exactly when throughput matters
+and falls to one when the venue is idle and latency does.
 
 ### What a client actually experiences
 
