@@ -53,10 +53,17 @@ filled, rejected — follows as a separate event. This is how FIX already works,
 what lets us confirm in microseconds without ever confirming something we might have to
 retract.
 
-Risk and matching are pipeline stages in one process, not network services. Accounts shard
-by account ID, books shard by symbol. An account's orders always pass through that
-account's shard first, so reserving balance across two symbols at once is atomic without a
-distributed lock.
+Risk and matching are pipeline stages in one process, not network services. Reserving
+balance across two symbols is therefore atomic without a distributed lock, because both
+symbols are in the same process and the same thread.
+
+**More than one core means more than one process, not more than one thread.** A venue owns
+exactly the instruments its configuration lists, so a listing is partitioned by running
+several of them over disjoint symbol sets. Each partition keeps single-writer determinism
+exactly — a partition *is* a venue — and gets its own journal, replication, leadership and
+failure domain, which threads in one process cannot offer. Threading the matching stage was
+measured and rejected; [`ENGINEERING.md`](ENGINEERING.md) has the reasoning, and §12 has
+the question partitioning leaves open.
 
 ---
 
@@ -104,7 +111,7 @@ What is worth doing:
 
 - **Hugepages** for the level tables, so sparse access does not thrash the TLB. A mount
   option, not a redesign.
-- **One order-slot arena per shard**, shared across the symbols on that shard, rather than a
+- **One order-slot arena per partition**, shared across the symbols it lists, rather than a
   fixed per-book allocation. Total concurrent orders is the real bound, not orders × symbols.
 - **Hard caps** on orders per account and per symbol, sized at startup.
 - **Fixed-size ring buffers** for subscriber replay. They overwrite; they never grow.
@@ -267,7 +274,7 @@ reality.
 | Concern | Built | Intended |
 |---|---|---|
 | Language | Rust 1.97+, edition 2024 | — |
-| Matching path | one thread, no async runtime | thread pinning, symbol shards |
+| Matching path | one thread per partition, no async runtime | thread pinning |
 | Encoding | fixed 64-byte records via `zerocopy` | — |
 | Transport | TCP, unencrypted, `mio` readiness | raw UDP or shm for colo |
 | Gateway | sessions, framing, group commit, HMAC challenge, per-account rate limits | — |
@@ -306,7 +313,7 @@ custom transport becomes the bottleneck.
 | Gateway dies | clients reconnect elsewhere, resume from `last_seq` |
 | Leader dies | The cluster elects a replacement in about a second. The journal is already on a majority so no acknowledged order is lost, the new leader catches up to the longest log a majority holds before serving, and term fencing stops the old one writing if it returns |
 | One journal node dies | majority continues; degraded and alarmed |
-| Matching shard panics | deliberate abort with a state dump, restart from snapshot + replay |
+| A partition panics | deliberate abort with a state dump, restart from snapshot + replay. The other partitions are untouched, which is the point of them being processes |
 | Subscriber falls behind | ring overwrites, subscriber sees the gap and re-snapshots |
 | Client floods | **not built.** A per-account rate limit belongs at the gateway, before sequencing. What exists is the per-session outbox budget, which sheds a client the venue cannot write *to* — not one that writes too much |
 | Order outside price band | rejected at the risk stage |

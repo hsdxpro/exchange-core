@@ -238,10 +238,14 @@ Raft already guarantees is unique per leader and therefore *is* a fencing token.
 
 Scope boundaries, with reasons rather than apologies:
 
-- **Sharding across cores.** One book is single-writer by nature. Different
-  symbols could run as independent engines, but an account trading two of them
-  shares one balance, so that needs a two-stage account/symbol split rather than
-  a lock.
+- **Cross-partition balances.** Symbols already partition across processes —
+  a venue owns exactly the instruments its config lists, so four of them over
+  disjoint symbol sets is four cores, each keeping single-writer determinism and
+  its own failure domain. What that does not solve is an account whose money is
+  in one partition trading a symbol served by another. That is a position
+  service or a buying-power allocation, not a thread pool, and it is the real
+  remaining question. `ENGINEERING.md` has the reasoning for why threading the
+  matching stage was measured and rejected.
 - **`io_uring`.** `LogStorage` is the seam it belongs behind. It is Linux-only,
   and untested platform-specific I/O is worse than none — the measurement also
   said the cost was one syscall *per record*, and batching the writes recovered
@@ -258,7 +262,7 @@ Scope boundaries, with reasons rather than apologies:
 
 ## Correctness
 
-310 tests. The ones worth looking at:
+311 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed

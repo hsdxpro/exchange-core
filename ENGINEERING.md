@@ -12,7 +12,7 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**310 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**311 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
@@ -28,7 +28,7 @@ timing is not evidence of anything.
 | over sockets | 20 | Real TCP: split records, disconnects, bursts, selective subscription, top-of-book, unsubscribe, and a subscriber index that does not grow under connection churn. |
 | top of book | 13 | What the cheap feed does not send, which is the whole point of it. |
 | venue snapshots | 7 | Cadence from a recovery target, atomic replace, corrupt snapshot refused. |
-| failover | 3 | Real processes: a cluster elects its own leader and replaces it when it dies with nobody editing a file, promotion recovers acked records, no majority means no service. |
+| failover, partitioning | 4 | Real processes: a cluster elects its own leader and replaces it when it dies with nobody editing a file, promotion recovers acked records, no majority means no service, and two venues over disjoint symbol sets each own only what they list. |
 | `bx-election` | 4 | Three nodes electing one leader, a higher term after a death, a minority electing nobody, and a vote that survives a restart. |
 | idle cost | 2 | A pass over 256 idle connections costs no more than a pass over one. |
 | many clients | 1 | A million accounts, and the memory that costs. |
@@ -182,6 +182,44 @@ Each of these was settled against a specific alternative, noted below.
   of every session feature, which is where a session leak had already lived in one transport
   and not the other. The consequence kept: one socket per session means the outbox bound and
   shedding a slow client are load-bearing rather than belt-and-braces.
+
+- **Sharding the matching stage across threads — measured, then rejected in
+  favour of partitioning across processes.** The goal is real: at a thousand
+  instruments a command costs 331 ns against 183 at one, and after the book
+  lookup was fixed the remainder is cache — a thousand books is a thousand bitmap
+  ladders, and one core keeps none of them warm. Giving each core its own working
+  set is the answer.
+
+  In-process sharding is the wrong way to get it, for three reasons.
+
+  **Amdahl, structurally.** Stage one owns balances, and an account trades many
+  symbols, so it cannot be sharded *by symbol* at all. Every command passes
+  through it in sequence. Sharding only the books therefore buys about 2x before
+  the serial stage dominates, and going past that needs an account-shard to
+  symbol-shard crossbar with a sequence-ordered merge.
+
+  **It costs the property the rest of the system is built on.** "Everything after
+  the sequencer is a deterministic function of the sequenced stream" is what makes
+  replay a recovery mechanism rather than an approximation. Concurrent shards
+  merging back have to be reordered by sequence, which either reintroduces a
+  barrier that eats the gain, or becomes a considerably harder thing to prove
+  than the thing it replaced. Replay, snapshots, the golden hash and the seeded
+  crash simulation all rest on that property.
+
+  **A venue already owns exactly the instruments its configuration lists**, so
+  running four of them over disjoint symbol sets partitions the listing across
+  four cores today, with no new code. Each partition keeps single-writer
+  determinism *exactly* — a partition is a single venue — and each gets its own
+  journal, its own replication, its own leadership and its own failure domain.
+  One partition crashing does not stop the others, which threads in one process
+  can never offer. That is also how venues are actually run.
+
+  What partitioning does not solve is an account trading symbols in two
+  partitions, because its balance lives in one place. That is a real problem and
+  a real design — a position service, or partitioning accounts as well as
+  symbols, or pre-allocated buying power per partition — and it is a much larger
+  question than "shard the matching thread". Pretending a thread pool answers it
+  would be the wrong kind of progress.
 
 - **Windowed ladder with re-centring — deleted.** It solved a memory problem
   that does not exist: 1000 symbols is ~2 GB of level tables on a machine with
@@ -396,13 +434,23 @@ Ordered by how much it matters.
 
 ## What is left
 
-One, and it is its own piece of work rather than an afternoon.
+One, and it is a distributed-systems question rather than a threading one.
 
-1. **Sharding across cores.** One book is single-writer by nature, so the
-   parallelism is across symbols -- but an account trading two of them shares
-   one balance, which needs a two-stage account/symbol split rather than a lock.
-   It touches replay determinism, snapshots and the golden hash, so it is a
-   change to the core rather than an addition beside it.
+1. **An account trading in two partitions.** Symbols partition across processes
+   today and that is how the venue uses more than one core — see the rejected
+   note above for why threads were not the answer. What partitioning does not
+   solve is a balance: an account's money lives in one partition, so it cannot
+   reserve against a symbol served by another.
+
+   Three shapes are worth weighing, and none of them is small: a position service
+   the partitions reserve against; partitioning accounts as well as symbols, with
+   a crossbar between the two; or pre-allocated buying power per partition,
+   rebalanced out of band. The last is what several venues actually do, because
+   it keeps the matching path free of any remote call.
+
+   Until that is answered, a deployment partitions by asset class or by
+   settlement currency, so accounts rarely straddle a boundary — which is also
+   what venues do.
 
 Smaller, if wanted: MBO for colocated clients, fee schedules at settlement,
 `io_uring` behind `LogStorage`, trading halts, NIC hardware timestamping behind

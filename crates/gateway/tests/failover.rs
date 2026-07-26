@@ -1,4 +1,4 @@
-//! Failover, as real processes.
+//! The venue as real processes: failover, and partitioning.
 //!
 //! Spawns the same `venue` and `replica` binaries a deployment runs, kills the
 //! leader mid-session, promotes a node with an empty log at a higher term, and
@@ -534,5 +534,162 @@ fn a_cluster_elects_its_own_leader_and_replaces_it_without_a_person() {
         trade(&format!("127.0.0.1:{}", client_ports[replacement]), 50),
         50,
         "the replacement does not accept orders"
+    );
+}
+
+/// A venue listing exactly the instruments given, on its own journal and port.
+fn write_partition_config(path: &Path, journal: &Path, symbols: &[u32]) -> PathBuf {
+    let mut text = format!(
+        "listen = 127.0.0.1:0\n\
+         journal = {}\n\
+         target_recovery_ms = 2000\n\
+         replay_rate = 7600000\n\
+         retained_per_channel = 4096\n\
+         max_records_per_session = 256\n\
+         max_sessions = 64\n\
+         ack_timeout_ms = 1000\n\
+         term = 1\n\
+         max_feed_memory_mb = 64\n\
+         authentication = open\n",
+        journal.display()
+    );
+    for symbol in symbols {
+        text.push_str(&format!(
+            "\n[instrument]\n\
+             symbol = {symbol}\n\
+             base = 1\n\
+             quote = 2\n\
+             floor_ticks = 10000\n\
+             max_quantity = 1000000\n\
+             max_open_orders = 100000\n"
+        ));
+    }
+    std::fs::write(path, text).unwrap();
+    path.to_path_buf()
+}
+
+/// Sends one order on `symbol` and reports whether it was acknowledged.
+fn trade_symbol(address: &str, symbol: u32, order_id: u64) -> Option<bx_protocol::Event> {
+    use bx_gateway::codec::{FRAME_LEN, encode};
+    use bx_pipeline::limit_order;
+    use bx_protocol::{Event, EventKind, Side};
+    use zerocopy::FromBytes;
+
+    let mut stream = TcpStream::connect(address).ok()?;
+    stream.set_nodelay(true).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+
+    let mut bytes = Vec::new();
+    encode(
+        &limit_order(1, symbol, order_id, Side::Bid, 10_500, 1),
+        &mut bytes,
+    );
+    stream.write_all(&bytes).ok()?;
+
+    let mut scratch = vec![0_u8; FRAME_LEN * 16];
+    let mut filled = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let Ok(read) = stream.read(&mut scratch[filled..]) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        filled += read;
+        for index in 0..filled / FRAME_LEN {
+            let start = index * FRAME_LEN;
+            if let Ok(event) = Event::read_from_bytes(&scratch[start..start + FRAME_LEN])
+                && (event.kind == EventKind::Received as u8
+                    || event.kind == EventKind::Rejected as u8)
+            {
+                return Some(event);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn symbols_partition_across_processes_with_no_shared_state() {
+    // This is how the venue scales past one core, and it is a deployment rather
+    // than a rewrite: each process owns a disjoint set of instruments, its own
+    // journal, its own replication and its own leadership. Every determinism
+    // property holds inside a partition exactly as it does for a single venue,
+    // because a partition *is* a single venue.
+    //
+    // What this pins is that a venue really does own only what its configuration
+    // lists — an order for somebody else's symbol is refused rather than
+    // quietly accepted into a book that does not exist here.
+    use bx_protocol::{EventKind, RejectReason};
+
+    let scratch = Scratch::new("partition");
+    let first = Process::start(
+        env!("CARGO_BIN_EXE_venue"),
+        &[
+            "--config",
+            write_partition_config(
+                &scratch.file("part1.conf"),
+                &scratch.file("part1.log"),
+                &[1, 2],
+            )
+            .to_str()
+            .unwrap(),
+            "--listen",
+            "127.0.0.1:7481",
+        ],
+    );
+    let second = Process::start(
+        env!("CARGO_BIN_EXE_venue"),
+        &[
+            "--config",
+            write_partition_config(
+                &scratch.file("part2.conf"),
+                &scratch.file("part2.log"),
+                &[3, 4],
+            )
+            .to_str()
+            .unwrap(),
+            "--listen",
+            "127.0.0.1:7482",
+        ],
+    );
+    assert!(
+        first.wait_for("listening", Duration::from_secs(20))
+            && second.wait_for("listening", Duration::from_secs(20)),
+        "a partition never came up"
+    );
+
+    // Each takes its own symbols.
+    for (address, symbol) in [("127.0.0.1:7481", 1), ("127.0.0.1:7481", 2)] {
+        let event = trade_symbol(address, symbol, u64::from(symbol)).expect("no answer");
+        assert_eq!(
+            event.kind,
+            EventKind::Received as u8,
+            "partition one refused its own symbol {symbol}"
+        );
+    }
+    for (address, symbol) in [("127.0.0.1:7482", 3), ("127.0.0.1:7482", 4)] {
+        let event = trade_symbol(address, symbol, u64::from(symbol)).expect("no answer");
+        assert_eq!(
+            event.kind,
+            EventKind::Received as u8,
+            "partition two refused its own symbol {symbol}"
+        );
+    }
+
+    // And refuses the other's, rather than inventing a book.
+    let stray = trade_symbol("127.0.0.1:7481", 3, 99).expect("no answer");
+    assert_eq!(stray.kind, EventKind::Rejected as u8);
+    assert_eq!(
+        stray.reject_reason,
+        RejectReason::UnknownSymbol as u8,
+        "a partition accepted an order for a symbol it does not list"
+    );
+
+    // Separate journals, so neither partition's recovery depends on the other's.
+    assert!(
+        records(&scratch.file("part1.log")) > 0 && records(&scratch.file("part2.log")) > 0,
+        "a partition wrote nothing of its own"
     );
 }
