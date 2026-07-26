@@ -86,6 +86,22 @@ pub trait LogStorage {
     /// Returns the underlying I/O error if the flush fails.
     fn sync(&mut self) -> io::Result<()>;
 
+    /// Hands buffered appends to the operating system without waiting for the
+    /// device.
+    ///
+    /// The distinction matters when durability comes from somewhere else. A
+    /// replicated leader is acknowledged once a majority holds a group, so it must
+    /// not wait on its own platter -- but the bytes still have to leave the
+    /// process, or a log that buffers until `sync` never gets written at all.
+    /// Surviving a crashed process and surviving lost power are different
+    /// promises, and this is the first one.
+    ///
+    /// # Errors
+    /// Returns the underlying I/O error if the write fails.
+    fn flush(&mut self) -> io::Result<()> {
+        self.sync()
+    }
+
     /// # Errors
     /// Returns the underlying I/O error if the read fails.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
@@ -168,11 +184,17 @@ impl LogStorage for FileLog {
     /// The buffer is only cleared once the write succeeds, so a failed write
     /// leaves the group pending and retryable rather than silently dropped.
     fn sync(&mut self) -> io::Result<()> {
+        self.flush()?;
+        self.file.sync_data()
+    }
+
+    /// Writes without waiting for the device.
+    fn flush(&mut self) -> io::Result<()> {
         if !self.pending.is_empty() {
             self.file.write_all(&self.pending)?;
             self.pending.clear();
         }
-        self.file.sync_data()
+        Ok(())
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {

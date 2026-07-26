@@ -31,6 +31,7 @@ fn serve<L: LogStorage>(listener: &TcpListener, log: L, flush: bool) -> std::io:
         listener.local_addr()?
     );
     loop {
+        println!("waiting for a leader");
         match replica.serve_one(listener) {
             // A leader disconnected. Another may take over, and the highest term
             // seen is remembered so a replaced one cannot come back.

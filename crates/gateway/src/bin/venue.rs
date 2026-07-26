@@ -140,25 +140,29 @@ fn start(config: &Config) -> std::io::Result<()> {
             if config.replicas.is_empty() {
                 run(config, log, fresh)
             } else {
-                run(
-                    config,
-                    ReplicatedLog::connect(log, &config.replicas, config.ack_timeout, config.term)?,
-                    fresh,
-                )
+                run(config, promoted(config, log)?, fresh)
             }
         }
         None if config.replicas.is_empty() => run(config, MemoryLog::new(), true),
-        None => run(
-            config,
-            ReplicatedLog::connect(
-                MemoryLog::new(),
-                &config.replicas,
-                config.ack_timeout,
-                config.term,
-            )?,
-            true,
-        ),
+        None => run(config, promoted(config, MemoryLog::new())?, true),
     }
+}
+
+/// Connects to the followers and brings this node's log up to the longest any
+/// majority holds, before it serves anybody.
+///
+/// A group is acknowledged once a majority holds it and this contacts a majority,
+/// so the two intersect: whatever a client was told is on at least one node that
+/// answers, and the longest log recovers all of it. A node that cannot reach a
+/// majority refuses to start rather than serving without knowing what it missed.
+fn promoted<S: LogStorage>(config: &Config, storage: S) -> std::io::Result<ReplicatedLog<S>> {
+    let mut log =
+        ReplicatedLog::connect(storage, &config.replicas, config.ack_timeout, config.term)?;
+    let recovered = log.catch_up()?;
+    if recovered > 0 {
+        println!("caught up {recovered} bytes from a follower before serving",);
+    }
+    Ok(log)
 }
 
 fn main() -> std::io::Result<()> {

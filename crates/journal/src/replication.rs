@@ -28,7 +28,12 @@
 //! the first would be silent corruption -- a partitioned leader appending happily
 //! to followers that already have a newer one.
 
-use crate::{LogStorage, RECORD_LEN};
+use crate::{HEADER_LEN as FILE_HEADER, LogStorage, RECORD_LEN};
+
+/// Where records start in a log, past the file's identifying header. Offsets on
+/// the wire are relative to the first record, so a leader and a follower agree on
+/// what "byte zero of the log" means regardless of the header.
+const HEADER_OFFSET: u64 = FILE_HEADER;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
@@ -39,8 +44,23 @@ use std::time::Duration;
 /// is told, by the followers themselves, that someone newer has taken over.
 const ACK_LEN: usize = 2 * size_of::<u64>();
 
-/// A group's header: the leader's term, then the byte count.
-const HEADER_LEN: usize = size_of::<u64>() + size_of::<u32>();
+/// A request header: what is being asked, the asker's term, then a length.
+const HEADER_LEN: usize = size_of::<u8>() + size_of::<u64>() + size_of::<u32>();
+
+/// Append this group and confirm.
+const APPEND: u8 = 0;
+/// Report what you hold, without changing anything.
+const QUERY: u8 = 1;
+/// Send back a range of your log.
+const FETCH: u8 = 2;
+
+fn request(kind: u8, term: u64, length: u32) -> [u8; HEADER_LEN] {
+    let mut header = [0_u8; HEADER_LEN];
+    header[0] = kind;
+    header[1..9].copy_from_slice(&term.to_le_bytes());
+    header[9..].copy_from_slice(&length.to_le_bytes());
+    header
+}
 
 /// One follower, as the leader sees it.
 #[derive(Debug)]
@@ -147,6 +167,108 @@ impl<L: LogStorage> ReplicatedLog<L> {
         self.term
     }
 
+    /// Brings this leader's log up to the longest any majority holds.
+    ///
+    /// This is what makes a promotion complete rather than merely exclusive. A
+    /// group is acknowledged only once a majority holds it, and this contacts a
+    /// majority, so the two majorities intersect: whatever was acknowledged is on
+    /// at least one node answering here. Taking the longest log therefore recovers
+    /// everything any client was ever told about.
+    ///
+    /// Consensus is not being reinvented -- something else must already have
+    /// decided this node is the leader and given it a term. This is the recovery
+    /// step that election alone does not provide when the data lives outside the
+    /// elected log.
+    ///
+    /// # Errors
+    /// Fails if a majority cannot be reached, in which case this node must not
+    /// serve: it cannot know what it is missing.
+    pub fn catch_up(&mut self) -> io::Result<u64> {
+        let mut answered = 0;
+        let mut longest = (self.local_len()?, usize::MAX);
+
+        for index in 0..self.followers.len() {
+            if !self.followers[index].live {
+                continue;
+            }
+            match self.ask(index, QUERY, &[]) {
+                Ok((_, held)) => {
+                    answered += 1;
+                    if held > longest.0 {
+                        longest = (held, index);
+                    }
+                }
+                Err(_) => self.followers[index].live = false,
+            }
+        }
+
+        // A majority of the cluster, counting this node. Refusing here is the
+        // point: a leader that cannot see a majority cannot know whether it is
+        // behind, and serving would risk losing an acknowledged order.
+        if answered < self.quorum {
+            return Err(io::Error::other(format!(
+                "reached {answered} of {} followers; a promotion needs a majority \
+                 to know what it is missing",
+                self.quorum
+            )));
+        }
+
+        let (target, source) = longest;
+        let have = self.local_len()?;
+        if source == usize::MAX || target <= have {
+            return Ok(0);
+        }
+
+        // Pull the tail this node never saw, in the order it was written.
+        let mut request = [0_u8; size_of::<u64>() + size_of::<u32>()];
+        request[..8].copy_from_slice(&have.to_le_bytes());
+        let wanted = u32::try_from(target - have)
+            .map_err(|_| io::Error::other("the tail to recover is too large for one fetch"))?;
+        request[8..].copy_from_slice(&wanted.to_le_bytes());
+
+        let (_, _) = self.ask(source, FETCH, &request)?;
+        let mut tail = vec![0_u8; wanted as usize];
+        self.followers[source].stream.read_exact(&mut tail)?;
+        if !tail.len().is_multiple_of(RECORD_LEN) {
+            return Err(io::Error::other("recovered tail is not whole records"));
+        }
+        self.local.append(&tail)?;
+        self.local.sync()?;
+        Ok(tail.len() as u64)
+    }
+
+    /// Bytes this node's own log holds, excluding the file header.
+    fn local_len(&self) -> io::Result<u64> {
+        let mut probe = [0_u8; RECORD_LEN];
+        let mut offset = HEADER_OFFSET;
+        loop {
+            let read = self.local.read_at(offset, &mut probe)?;
+            if read < RECORD_LEN {
+                return Ok(offset - HEADER_OFFSET);
+            }
+            offset += RECORD_LEN as u64;
+        }
+    }
+
+    /// Sends one request and reads the fixed reply.
+    fn ask(&mut self, index: usize, kind: u8, payload: &[u8]) -> io::Result<(u64, u64)> {
+        let length = u32::try_from(payload.len())
+            .map_err(|_| io::Error::other("request payload too large"))?;
+        let follower = &mut self.followers[index];
+        follower
+            .stream
+            .write_all(&request(kind, self.term, length))?;
+        if !payload.is_empty() {
+            follower.stream.write_all(payload)?;
+        }
+        let mut reply = [0_u8; ACK_LEN];
+        follower.stream.read_exact(&mut reply)?;
+        Ok((
+            u64::from_le_bytes(reply[..8].try_into().unwrap_or_default()),
+            u64::from_le_bytes(reply[8..].try_into().unwrap_or_default()),
+        ))
+    }
+
     /// Sends the pending bytes to every live follower and waits for a quorum.
     fn replicate(&mut self) -> io::Result<()> {
         if self.pending.is_empty() {
@@ -159,9 +281,7 @@ impl<L: LogStorage> ReplicatedLog<L> {
         }
         let length = u32::try_from(self.pending.len())
             .map_err(|_| io::Error::other("replication group too large"))?;
-        let mut header = [0_u8; HEADER_LEN];
-        header[..8].copy_from_slice(&self.term.to_le_bytes());
-        header[8..].copy_from_slice(&length.to_le_bytes());
+        let header = request(APPEND, self.term, length);
 
         for follower in self.followers.iter_mut().filter(|f| f.live) {
             if follower.stream.write_all(&header).is_err()
@@ -220,9 +340,16 @@ impl<L: LogStorage> LogStorage for ReplicatedLog<L> {
         Ok(())
     }
 
-    /// Durable means "a quorum holds it". The local disk is not flushed,
-    /// because waiting on it would give up the whole advantage.
+    /// Durable means "a quorum holds it", so this does not wait for the local
+    /// device -- that is the entire advantage being bought.
+    ///
+    /// It does still push the bytes out of the process. A log that buffers until
+    /// `sync` and a `sync` that only replicates meant the leader's own file was
+    /// never written at all: ten thousand acknowledged orders left an eight-byte
+    /// file containing nothing but the magic. The quorum held them, so nothing was
+    /// lost, but the leader was contributing no copy of its own.
     fn sync(&mut self) -> io::Result<()> {
+        self.local.flush()?;
         self.replicate()
     }
 
@@ -274,6 +401,14 @@ impl<L: LogStorage> Replica<L> {
         self.highest_term
     }
 
+    /// The one reply shape: the term that won, and how much this node holds.
+    fn reply(&self, stream: &mut TcpStream) -> io::Result<()> {
+        let mut reply = [0_u8; ACK_LEN];
+        reply[..8].copy_from_slice(&self.highest_term.to_le_bytes());
+        reply[8..].copy_from_slice(&self.held.to_le_bytes());
+        stream.write_all(&reply)
+    }
+
     /// Serves one leader until it disconnects.
     ///
     /// # Errors
@@ -289,8 +424,9 @@ impl<L: LogStorage> Replica<L> {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e),
             }
-            let term = u64::from_le_bytes(header[..8].try_into().unwrap_or_default());
-            let length = u32::from_le_bytes(header[8..].try_into().unwrap_or_default()) as usize;
+            let kind = header[0];
+            let term = u64::from_le_bytes(header[1..9].try_into().unwrap_or_default());
+            let length = u32::from_le_bytes(header[9..].try_into().unwrap_or_default()) as usize;
 
             if term < self.highest_term {
                 // A leader that has been replaced. Refusing loudly rather than
@@ -307,6 +443,35 @@ impl<L: LogStorage> Replica<L> {
             }
             self.highest_term = term;
 
+            // A question, not a change. Answering it is how a newly promoted
+            // leader discovers what it is missing.
+            if kind == QUERY {
+                self.reply(stream)?;
+                continue;
+            }
+            if kind == FETCH {
+                let mut range = [0_u8; size_of::<u64>() + size_of::<u32>()];
+                stream.read_exact(&mut range)?;
+                let from = u64::from_le_bytes(range[..8].try_into().unwrap_or_default());
+                let wanted = u32::from_le_bytes(range[8..].try_into().unwrap_or_default()) as usize;
+                self.reply(stream)?;
+                // Served a record at a time, so a fetch never needs a buffer
+                // proportional to the log.
+                let mut record = [0_u8; RECORD_LEN];
+                let mut sent = 0;
+                while sent < wanted {
+                    let read = self
+                        .log
+                        .read_at(HEADER_OFFSET + from + sent as u64, &mut record)?;
+                    if read < RECORD_LEN {
+                        break;
+                    }
+                    stream.write_all(&record)?;
+                    sent += RECORD_LEN;
+                }
+                continue;
+            }
+
             if length == 0 || !length.is_multiple_of(RECORD_LEN) {
                 return Err(io::Error::other(
                     "leader sent a group that is not whole records",
@@ -316,15 +481,19 @@ impl<L: LogStorage> Replica<L> {
             stream.read_exact(&mut group)?;
 
             self.log.append(&group)?;
+            // Always out of the process, so a follower's file is a real copy and
+            // it survives its own process dying. Only onto the platter when asked,
+            // because waiting for the device is the cost the leader is paying a
+            // quorum to avoid. A log that buffers until `sync` and a follower that
+            // only synced when configured to meant the file held nothing but its
+            // magic while the follower confirmed ten thousand records from memory.
+            self.log.flush()?;
             if self.flush_before_ack {
                 self.log.sync()?;
             }
             self.held += length as u64;
 
-            let mut reply = [0_u8; ACK_LEN];
-            reply[..8].copy_from_slice(&self.highest_term.to_le_bytes());
-            reply[8..].copy_from_slice(&self.held.to_le_bytes());
-            stream.write_all(&reply)?;
+            self.reply(stream)?;
         }
     }
 
@@ -493,7 +662,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut header = [0_u8; HEADER_LEN];
             stream.read_exact(&mut header).unwrap();
-            let length = u32::from_le_bytes(header[8..].try_into().unwrap()) as usize;
+            let length = u32::from_le_bytes(header[9..].try_into().unwrap()) as usize;
             let mut group = vec![0_u8; length];
             stream.read_exact(&mut group).unwrap();
             let mut reply = [0_u8; ACK_LEN];
@@ -629,6 +798,118 @@ mod tests {
     }
 
     #[test]
+    fn a_promoted_leader_recovers_a_group_it_never_saw() {
+        // The guarantee that makes automatic promotion safe. A group is
+        // acknowledged once a majority holds it; a promotion contacts a majority;
+        // two majorities intersect. So the longest log any majority holds contains
+        // everything a client was ever told about, and taking it recovers exactly
+        // that.
+        //
+        // Here the old leader wrote three groups, the new one has none, and the
+        // follower still has all three.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let follower = thread::spawn(move || {
+            let mut replica = Replica::new(MemoryLog::new(), false);
+            // Serves the old leader, then the promoted one.
+            let _ = replica.serve_one(&listener);
+            let _ = replica.serve_one(&listener);
+            replica.held()
+        });
+
+        // The old leader, term 4.
+        {
+            let log = ReplicatedLog::connect(
+                MemoryLog::new(),
+                std::slice::from_ref(&address),
+                ACK_TIMEOUT,
+                4,
+            )
+            .unwrap();
+            let mut journal = Journal::open(log).unwrap();
+            for id in 0..3 {
+                journal.append(&mut command(id)).unwrap();
+                journal.sync().unwrap();
+            }
+        }
+
+        // A different node is promoted at term 5 with an empty log of its own.
+        let mut promoted = ReplicatedLog::connect(
+            MemoryLog::new(),
+            std::slice::from_ref(&address),
+            ACK_TIMEOUT,
+            5,
+        )
+        .unwrap();
+        let recovered = promoted.catch_up().unwrap();
+        assert_eq!(
+            recovered,
+            3 * RECORD_LEN as u64,
+            "the promoted leader did not recover the tail it was missing"
+        );
+
+        // And what it recovered is the real thing, in order.
+        let journal = Journal::open(promoted).unwrap();
+        let replayed = journal.replay().collect_all().unwrap();
+        assert_eq!(
+            replayed.iter().map(|c| c.order_id).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the recovered tail is not the log that was acknowledged"
+        );
+
+        drop(journal);
+        assert_eq!(follower.join().unwrap(), 3 * RECORD_LEN as u64);
+    }
+
+    #[test]
+    fn a_leader_that_cannot_reach_a_majority_refuses_to_serve() {
+        // It cannot know what it is missing, so serving would risk losing an
+        // order a client was told about. Refusing is the only safe answer.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let follower = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Accepts and says nothing, as a partitioned node looks.
+            thread::sleep(Duration::from_millis(600));
+            drop(stream);
+        });
+
+        let mut promoted = ReplicatedLog::connect(
+            MemoryLog::new(),
+            std::slice::from_ref(&address),
+            ACK_TIMEOUT,
+            9,
+        )
+        .unwrap();
+        let outcome = promoted.catch_up();
+        assert!(
+            outcome.is_err(),
+            "a leader served without knowing whether it was behind"
+        );
+        follower.join().unwrap();
+    }
+
+    #[test]
+    fn catching_up_when_already_current_copies_nothing() {
+        let replica = RunningReplica::start();
+        let log = ReplicatedLog::connect(
+            MemoryLog::new(),
+            std::slice::from_ref(&replica.address),
+            ACK_TIMEOUT,
+            TERM,
+        )
+        .unwrap();
+        let mut journal = Journal::open(log).unwrap();
+        journal.append(&mut command(1)).unwrap();
+        journal.sync().unwrap();
+
+        let mut log = journal.into_storage();
+        assert_eq!(log.catch_up().unwrap(), 0, "copied a tail it already had");
+        drop(log);
+        replica.accepted();
+    }
+
+    #[test]
     fn the_replica_refuses_a_group_that_is_not_whole_records() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -640,8 +921,7 @@ mod tests {
         let mut leader = TcpStream::connect(address).unwrap();
         // A length that is not a whole number of records: corruption, or a peer
         // speaking a different protocol version.
-        leader.write_all(&TERM.to_le_bytes()).unwrap();
-        leader.write_all(&30_u32.to_le_bytes()).unwrap();
+        leader.write_all(&request(APPEND, TERM, 30)).unwrap();
         leader.write_all(&[0_u8; 30]).unwrap();
         drop(leader);
 
