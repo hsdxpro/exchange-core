@@ -294,7 +294,11 @@ impl Command {
 // ------------------------------------------------------- snapshot records
 
 /// Identifies a snapshot file and its layout version.
-pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAP ";
+///
+/// Printable ASCII on purpose: a magic carrying raw control bytes makes the
+/// source file read as binary to tools that diff and search it, and is easy for
+/// an editor to mangle silently.
+pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAPv1";
 
 /// Header of a snapshot: what it contains and where in the journal it applies.
 #[derive(
