@@ -102,6 +102,32 @@ pub enum CommandKind {
     /// the asset credited and `quantity` the amount. See
     /// [`Command::deposit_asset`].
     Deposit = 4,
+    /// Starts a feed on one channel. Session control, not venue state: it never
+    /// reaches the exchange and is never journalled, because a subscription
+    /// belongs to a connection and connections do not survive a restart.
+    ///
+    /// Layout: `symbol` names the instrument and `quantity` the channel, via
+    /// [`Command::channel_kind`].
+    Subscribe = 5,
+    /// Stops a feed. Same layout as [`Self::Subscribe`].
+    Unsubscribe = 6,
+}
+
+/// Which feed a [`CommandKind::Subscribe`] names.
+///
+/// The record is a union discriminated by `kind`: an order uses `quantity` for
+/// size, and a subscription has no size, so it carries the channel there. Every
+/// fixed-layout wire protocol does this; what matters is that the message type
+/// determines the layout and that the accessor says so.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(u8)]
+pub enum ChannelKind {
+    /// Price-level changes for one symbol.
+    Book = 0,
+    /// Prints for one symbol.
+    Trades = 1,
+    /// The session's own order lifecycle.
+    Account = 2,
 }
 
 /// Why an order was refused. Every variant is a distinct, reportable reason; a
@@ -258,6 +284,25 @@ impl Command {
         matches!(self.order_type(), Some(OrderType::Market))
     }
 
+    /// Channel named by a [`CommandKind::Subscribe`] or
+    /// [`CommandKind::Unsubscribe`]. Meaningless for any other kind.
+    #[must_use]
+    pub const fn channel_kind(&self) -> Option<ChannelKind> {
+        match self.quantity {
+            0 => Some(ChannelKind::Book),
+            1 => Some(ChannelKind::Trades),
+            2 => Some(ChannelKind::Account),
+            _ => None,
+        }
+    }
+
+    /// True for a message that configures the connection rather than changing
+    /// the venue. These are handled by the gateway and never journalled.
+    #[must_use]
+    pub const fn is_session_control(&self) -> bool {
+        self.kind == CommandKind::Subscribe as u8 || self.kind == CommandKind::Unsubscribe as u8
+    }
+
     /// Asset credited by a [`CommandKind::Deposit`]. Meaningless for any other
     /// kind: a deposit names no instrument, so it reuses the symbol field.
     #[must_use]
@@ -312,6 +357,8 @@ impl Command {
             2 => Some(CommandKind::AmendDown),
             3 => Some(CommandKind::CancelReplace),
             4 => Some(CommandKind::Deposit),
+            5 => Some(CommandKind::Subscribe),
+            6 => Some(CommandKind::Unsubscribe),
             _ => None,
         }
     }
@@ -451,12 +498,41 @@ mod tests {
             (2, CommandKind::AmendDown),
             (3, CommandKind::CancelReplace),
             (4, CommandKind::Deposit),
+            (5, CommandKind::Subscribe),
+            (6, CommandKind::Unsubscribe),
         ] {
             let mut command = sample();
             command.kind = byte;
             assert_eq!(command.kind(), Some(kind));
             assert!(command.is_well_formed());
         }
+    }
+
+    #[test]
+    fn a_subscription_names_its_channel_and_is_session_control() {
+        for (quantity, kind) in [
+            (0, ChannelKind::Book),
+            (1, ChannelKind::Trades),
+            (2, ChannelKind::Account),
+        ] {
+            let command = Command {
+                kind: CommandKind::Subscribe as u8,
+                quantity,
+                ..sample()
+            };
+            assert_eq!(command.channel_kind(), Some(kind));
+            assert!(command.is_session_control());
+        }
+
+        let unknown = Command {
+            kind: CommandKind::Subscribe as u8,
+            quantity: 99,
+            ..sample()
+        };
+        assert!(unknown.channel_kind().is_none());
+
+        // An order is not session control, whatever its quantity.
+        assert!(!sample().is_session_control());
     }
 
     #[test]

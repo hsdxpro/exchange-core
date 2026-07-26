@@ -12,17 +12,24 @@
 //! amortising — and falls to one when the venue is idle and latency matters
 //! more.
 //!
-//! A session receives the public feed for every listed instrument plus the
-//! private feed for the account it trades as, which it declares by being the
-//! account on its first command. Selective subscription is a protocol addition,
-//! not a change to this loop.
+//! A session receives the private feed for the account it trades as -- declared
+//! by being the account on its first command -- and whatever public channels it
+//! asks for. It asks with `Subscribe`, which is session control: the gateway
+//! handles it and it never reaches the exchange or the journal, because a
+//! subscription belongs to a connection and connections do not survive a
+//! restart.
+//!
+//! Public feeds are opt-in rather than given to everyone. At one instrument the
+//! difference is invisible; at a thousand, sending every session every book
+//! would multiply the venue's outbound traffic by the number of instruments
+//! nobody asked about.
 
 use crate::codec::{Decoder, FRAME_LEN, encode};
 use crate::venue::Venue;
 use bx_journal::LogStorage;
 use bx_pipeline::hub::{Channel, Resume};
 use bx_pipeline::instrument::Instruments;
-use bx_protocol::{AccountId, Command, Event, Sequence, SymbolId};
+use bx_protocol::{AccountId, Command, CommandKind, Event, Sequence};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 
@@ -47,16 +54,28 @@ struct Session {
 }
 
 impl Session {
-    fn new(stream: TcpStream, max_records: usize, max_outbox: usize, public: &[Channel]) -> Self {
+    fn new(stream: TcpStream, max_records: usize, max_outbox: usize) -> Self {
         Self {
             stream,
             decoder: Decoder::new(max_records),
             outbox: Vec::new(),
             max_outbox,
-            cursors: public.iter().map(|channel| (*channel, 0)).collect(),
+            cursors: Vec::new(),
             account: None,
             open: true,
         }
+    }
+
+    /// Adds a channel this session will be sent, from the position it is at now.
+    /// Subscribing twice is idempotent and does not rewind the cursor.
+    fn follow(&mut self, channel: Channel, from: Sequence) {
+        if !self.cursors.iter().any(|(held, _)| *held == channel) {
+            self.cursors.push((channel, from));
+        }
+    }
+
+    fn stop_following(&mut self, channel: Channel) {
+        self.cursors.retain(|(held, _)| *held != channel);
     }
 
     /// Reads one buffer's worth, appending decoded commands to `out`.
@@ -123,8 +142,6 @@ pub struct Server<S: LogStorage> {
     listener: TcpListener,
     venue: Venue<S>,
     sessions: Vec<Session>,
-    /// Public channels every session follows.
-    public: Vec<Channel>,
     /// Unsent bytes one session may owe. Derived from the retention window
     /// rather than chosen: a session further behind than the window cannot be
     /// caught up whatever the venue does.
@@ -148,28 +165,20 @@ impl<S: LogStorage> Server<S> {
         retained_per_channel: usize,
         max_records_per_session: usize,
     ) -> io::Result<Self> {
-        let symbols: Vec<SymbolId> = instruments.iter().map(|i| i.symbol).collect();
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         let venue = Venue::new(storage, instruments, retained_per_channel)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let mut server = Self {
+        let server = Self {
             listener,
             venue,
             sessions: Vec::new(),
-            public: symbols
-                .iter()
-                .flat_map(|s| [Channel::Book(*s), Channel::Trades(*s)])
-                .collect(),
             inbound: Vec::new(),
             outbound: Vec::new(),
             max_records_per_session,
             max_outbox: retained_per_channel * FRAME_LEN,
         };
-        for channel in server.public.clone() {
-            server.venue.subscribe(channel);
-        }
         Ok(server)
     }
 
@@ -203,19 +212,38 @@ impl<S: LogStorage> Server<S> {
         self.accept_pending();
 
         self.inbound.clear();
-        for session in &mut self.sessions {
+        for index in 0..self.sessions.len() {
+            let start = self.inbound.len();
+            self.sessions[index].read_into(&mut self.inbound);
+
             // Attribute each session's account from its *own* first command.
             // Reading everyone into one buffer first and then handing accounts
             // out would give a session whoever happened to be at the front.
-            let start = self.inbound.len();
-            session.read_into(&mut self.inbound);
-            if session.account.is_none()
+            if self.sessions[index].account.is_none()
                 && let Some(command) = self.inbound.get(start)
             {
                 let account = command.account;
-                session.account = Some(account);
-                session.cursors.push((Channel::Account(account), 0));
-                self.venue.subscribe(Channel::Account(account));
+                self.sessions[index].account = Some(account);
+                // A session always gets its own private feed; it has to ask for
+                // anything public.
+                let channel = Channel::Account(account);
+                let from = self.venue.subscribe(channel);
+                self.sessions[index].follow(channel, from);
+            }
+
+            // Control messages belong to the connection, not the venue. Taking
+            // them out here is what keeps them out of the journal: a
+            // subscription replayed after a restart would resurrect a feed for a
+            // connection that no longer exists.
+            let account = self.sessions[index].account.unwrap_or_default();
+            let mut cursor = start;
+            while cursor < self.inbound.len() {
+                if self.inbound[cursor].is_session_control() {
+                    let command = self.inbound.remove(cursor);
+                    self.apply_control(index, &command, account);
+                } else {
+                    cursor += 1;
+                }
             }
         }
 
@@ -232,6 +260,21 @@ impl<S: LogStorage> Server<S> {
         Ok(applied)
     }
 
+    /// Starts or stops one session's feed. A channel that does not decode is
+    /// ignored rather than guessed at.
+    fn apply_control(&mut self, index: usize, command: &Command, account: AccountId) {
+        let Some(kind) = command.channel_kind() else {
+            return;
+        };
+        let channel = Channel::requested(kind, command.symbol, account);
+        if command.kind() == Some(CommandKind::Subscribe) {
+            let from = self.venue.subscribe(channel);
+            self.sessions[index].follow(channel, from);
+        } else {
+            self.sessions[index].stop_following(channel);
+        }
+    }
+
     fn accept_pending(&mut self) {
         loop {
             match self.listener.accept() {
@@ -241,7 +284,6 @@ impl<S: LogStorage> Server<S> {
                             stream,
                             self.max_records_per_session,
                             self.max_outbox,
-                            &self.public,
                         ));
                     }
                 }

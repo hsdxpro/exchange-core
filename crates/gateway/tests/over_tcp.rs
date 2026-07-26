@@ -11,8 +11,8 @@ use bx_gateway::codec::encode;
 use bx_gateway::tcp::{Server, read_events};
 use bx_journal::MemoryLog;
 use bx_pipeline::instrument::{Instrument, Instruments};
-use bx_pipeline::{limit_order, market_order};
-use bx_protocol::{Command, EventKind, Side, Ticks};
+use bx_pipeline::{limit_order, market_order, subscribe, unsubscribe};
+use bx_protocol::{ChannelKind, Command, Event, EventKind, Side, Ticks};
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -113,6 +113,54 @@ impl Drop for Running {
     }
 }
 
+/// Collects events until `enough` is satisfied or the window closes.
+///
+/// Reading an exact count means guessing how many events a command produces,
+/// and a wrong guess blocks until the socket times out and then reports a
+/// failure that has nothing to do with the venue. Three tests were wrong that
+/// way before this existed. A short read timeout means "nothing more for now"
+/// rather than an error.
+fn collect_until(
+    stream: &mut TcpStream,
+    window: Duration,
+    enough: impl Fn(&[Event]) -> bool,
+) -> Vec<Event> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + window;
+    while Instant::now() < deadline && !enough(&seen) {
+        let mut batch = Vec::new();
+        match read_events(stream, 1, &mut batch) {
+            Ok(()) if batch.is_empty() => break, // peer closed
+            Ok(()) => seen.extend(batch),
+            Err(_) => {} // nothing waiting; keep trying until the deadline
+        }
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    seen
+}
+
+fn has_kind(events: &[Event], kind: EventKind) -> bool {
+    events.iter().any(|e| e.kind == kind as u8)
+}
+
+/// Asks for the public feeds. Sessions get their own private feed for free but
+/// have to ask for anything public, so every test that watches the book or the
+/// tape starts here.
+fn watch_public(stream: &mut TcpStream, account: u64) {
+    send(
+        stream,
+        &[
+            subscribe(account, SYMBOL, ChannelKind::Book),
+            subscribe(account, SYMBOL, ChannelKind::Trades),
+        ],
+    );
+}
+
 fn send(stream: &mut TcpStream, commands: &[Command]) {
     let mut bytes = Vec::new();
     for command in commands {
@@ -126,6 +174,7 @@ fn send(stream: &mut TcpStream, commands: &[Command]) {
 fn orders_sent_over_a_socket_trade_and_come_back_as_events() {
     let venue = Running::start();
     let mut trader = venue.connect();
+    watch_public(&mut trader, 1);
 
     send(
         &mut trader,
@@ -135,12 +184,18 @@ fn orders_sent_over_a_socket_trade_and_come_back_as_events() {
         ],
     );
 
-    let mut events = Vec::new();
-    read_events(&mut trader, 2, &mut events).unwrap();
-    assert!(
-        events.iter().all(|e| e.kind == EventKind::BookDelta as u8),
-        "expected depth updates, got {events:?}"
-    );
+    // Its own acknowledgements arrive too; the depth updates are what matter.
+    let events = collect_until(&mut trader, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::BookDelta as u8)
+            .count()
+            >= 2
+    });
+    let events: Vec<_> = events
+        .into_iter()
+        .filter(|e| e.kind == EventKind::BookDelta as u8)
+        .collect();
+    assert_eq!(events.len(), 2, "expected two depth updates");
     let prices: Vec<Ticks> = events.iter().map(|e| e.price).collect();
     assert!(prices.contains(&10_100) && prices.contains(&10_090));
 }
@@ -149,8 +204,9 @@ fn orders_sent_over_a_socket_trade_and_come_back_as_events() {
 fn a_second_client_sees_the_public_feed_of_the_first_clients_trading() {
     let venue = Running::start();
     let mut maker = venue.connect();
-    // The watcher connects first so it is subscribed before anything trades.
+    // The watcher subscribes before anything trades.
     let mut watcher = venue.connect();
+    watch_public(&mut watcher, 4);
 
     send(
         &mut maker,
@@ -184,6 +240,7 @@ fn a_second_client_sees_the_public_feed_of_the_first_clients_trading() {
 fn a_record_split_across_two_writes_is_still_understood() {
     let venue = Running::start();
     let mut trader = venue.connect();
+    watch_public(&mut trader, 1);
 
     let mut bytes = Vec::new();
     encode(
@@ -197,10 +254,14 @@ fn a_record_split_across_two_writes_is_still_understood() {
     trader.write_all(&bytes[30..]).unwrap();
     trader.flush().unwrap();
 
-    let mut events = Vec::new();
-    read_events(&mut trader, 1, &mut events).unwrap();
-    assert_eq!(events[0].kind, EventKind::BookDelta as u8);
-    assert_eq!(events[0].price, 10_100);
+    let events = collect_until(&mut trader, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::BookDelta)
+    });
+    let delta = events
+        .iter()
+        .find(|e| e.kind == EventKind::BookDelta as u8)
+        .expect("the torn record never reached the book");
+    assert_eq!(delta.price, 10_100);
 }
 
 #[test]
@@ -208,14 +269,19 @@ fn many_orders_pushed_at_once_are_applied_as_one_group_and_all_arrive() {
     const ORDERS: usize = 200;
     let venue = Running::start();
     let mut trader = venue.connect();
+    watch_public(&mut trader, 1);
 
     let commands: Vec<Command> = (0..ORDERS)
         .map(|i| limit_order(1, SYMBOL, 100 + i as u64, Side::Bid, 10_000 + i as Ticks, 1))
         .collect();
     send(&mut trader, &commands);
 
-    let mut events = Vec::new();
-    read_events(&mut trader, ORDERS, &mut events).unwrap();
+    let events = collect_until(&mut trader, Duration::from_secs(20), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::BookDelta as u8)
+            .count()
+            >= ORDERS
+    });
     let deltas = events
         .iter()
         .filter(|e| e.kind == EventKind::BookDelta as u8)
@@ -295,10 +361,13 @@ fn a_client_that_never_reads_is_dropped_instead_of_growing_the_venue() {
         &mut silent,
         &[limit_order(3, SYMBOL, 9_001, Side::Bid, 10_050, 1)],
     );
+    // Subscribed to the public feed, so a backlog builds for it.
+    watch_public(&mut silent, 3);
 
     // A well-behaved client generates far more feed than the window holds, and
     // reads the whole time. It must not be shed.
     let mut busy = venue.connect();
+    watch_public(&mut busy, 1);
     let mut reader = busy.try_clone().unwrap();
     let writing = Arc::new(AtomicBool::new(true));
     let still_writing = Arc::clone(&writing);
@@ -357,8 +426,7 @@ fn a_client_that_never_reads_is_dropped_instead_of_growing_the_venue() {
         &mut fresh,
         &[limit_order(2, SYMBOL, 8_000_001, Side::Ask, 10_050, 1)],
     );
-    let mut events = Vec::new();
-    read_events(&mut fresh, 1, &mut events).unwrap();
+    let events = collect_until(&mut fresh, Duration::from_secs(5), |seen| !seen.is_empty());
     assert!(
         !events.is_empty(),
         "the venue stopped serving after shedding a silent client"
@@ -367,10 +435,84 @@ fn a_client_that_never_reads_is_dropped_instead_of_growing_the_venue() {
 }
 
 #[test]
+fn a_channel_nobody_asked_for_is_never_delivered() {
+    // A session gets its own acknowledgements and nothing else until it asks.
+    // At a thousand instruments, handing every session every book would
+    // multiply outbound traffic by the number of instruments nobody wanted.
+    let venue = Running::start();
+    let mut quiet = venue.connect();
+    send(
+        &mut quiet,
+        &[limit_order(1, SYMBOL, 101, Side::Bid, 10_100, 5)],
+    );
+
+    let events = collect_until(&mut quiet, Duration::from_secs(2), |seen| seen.len() >= 2);
+    assert!(
+        !events.is_empty(),
+        "the session did not even get its own acknowledgements"
+    );
+    assert!(
+        events.iter().all(|e| e.account == 1),
+        "an unsubscribed public feed was delivered: {events:?}"
+    );
+    assert!(
+        events.iter().all(|e| e.kind != EventKind::BookDelta as u8),
+        "depth arrived without being asked for"
+    );
+}
+
+#[test]
+fn unsubscribing_stops_a_feed_the_session_was_receiving() {
+    let venue = Running::start();
+    let mut trader = venue.connect();
+    watch_public(&mut trader, 1);
+    send(
+        &mut trader,
+        &[limit_order(1, SYMBOL, 101, Side::Bid, 10_100, 5)],
+    );
+
+    // Depth arrives while subscribed.
+    let events = collect_until(&mut trader, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::BookDelta)
+    });
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::BookDelta as u8),
+        "never received the feed in the first place"
+    );
+
+    send(
+        &mut trader,
+        &[
+            unsubscribe(1, SYMBOL, ChannelKind::Book),
+            unsubscribe(1, SYMBOL, ChannelKind::Trades),
+        ],
+    );
+    // Drain whatever was already queued before the unsubscribe landed.
+    collect_until(&mut trader, Duration::from_millis(300), |_| false);
+
+    send(
+        &mut trader,
+        &[limit_order(1, SYMBOL, 102, Side::Bid, 10_080, 5)],
+    );
+    let after = collect_until(&mut trader, Duration::from_secs(2), |seen| {
+        has_kind(seen, EventKind::Resting)
+    });
+    assert!(
+        !after.is_empty(),
+        "the session stopped receiving its own events too"
+    );
+    assert!(
+        !has_kind(&after, EventKind::BookDelta),
+        "depth kept arriving after unsubscribing: {after:?}"
+    );
+}
+
+#[test]
 fn a_client_that_disconnects_does_not_disturb_the_venue() {
     let venue = Running::start();
     {
         let mut leaving = venue.connect();
+        watch_public(&mut leaving, 1);
         send(
             &mut leaving,
             &[limit_order(1, SYMBOL, 101, Side::Bid, 10_100, 5)],
@@ -384,13 +526,15 @@ fn a_client_that_disconnects_does_not_disturb_the_venue() {
     // The venue is still trading, and still knows about the departed client's
     // resting order.
     let mut arriving = venue.connect();
+    watch_public(&mut arriving, 2);
     send(
         &mut arriving,
         &[limit_order(2, SYMBOL, 201, Side::Ask, 10_100, 5)],
     );
 
-    let mut events = Vec::new();
-    read_events(&mut arriving, 1, &mut events).unwrap();
+    let events = collect_until(&mut arriving, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::Trade) || has_kind(seen, EventKind::BookDelta)
+    });
     assert!(
         events
             .iter()

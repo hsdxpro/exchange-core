@@ -17,8 +17,8 @@ use accounts::Accounts;
 use book::{Execution, Outcome};
 use bx_journal::{Journal, LogStorage};
 use bx_protocol::{
-    AccountId, Command, CommandKind, Event, EventKind, OrderId, Quantity, RejectReason, Sequence,
-    Side, SnapshotBalance, SnapshotOrder, SymbolId, Ticks, TimeInForce,
+    AccountId, ChannelKind, Command, CommandKind, Event, EventKind, OrderId, Quantity,
+    RejectReason, Sequence, Side, SnapshotBalance, SnapshotOrder, SymbolId, Ticks, TimeInForce,
 };
 use fastmap::FastMap;
 use instrument::{Instrument, Instruments};
@@ -339,6 +339,12 @@ impl<S: LogStorage> Exchange<S> {
                 self.apply_cancel(&command);
             }
             CommandKind::AmendDown => self.apply_amend(&command),
+            // Session control never reaches here: the gateway handles it and
+            // does not journal it. One in the journal means a bug upstream, so
+            // it is refused rather than quietly ignored.
+            CommandKind::Subscribe | CommandKind::Unsubscribe => {
+                self.reject(&command, RejectReason::UnsupportedTimeInForce);
+            }
             CommandKind::Deposit => self.accounts.deposit(
                 command.account,
                 command.deposit_asset(),
@@ -869,6 +875,36 @@ pub fn deposit(account: AccountId, asset: instrument::AssetId, amount: Quantity)
         Side::Bid,
         0,
         amount,
+        TimeInForce::GoodTillCancel,
+    )
+}
+
+/// Asks for a feed. `symbol` names the instrument, `quantity` the channel.
+#[must_use]
+pub fn subscribe(account: AccountId, symbol: SymbolId, channel: ChannelKind) -> Command {
+    control(CommandKind::Subscribe, account, symbol, channel)
+}
+
+/// Stops a feed.
+#[must_use]
+pub fn unsubscribe(account: AccountId, symbol: SymbolId, channel: ChannelKind) -> Command {
+    control(CommandKind::Unsubscribe, account, symbol, channel)
+}
+
+fn control(
+    kind: CommandKind,
+    account: AccountId,
+    symbol: SymbolId,
+    channel: ChannelKind,
+) -> Command {
+    Command::new(
+        kind,
+        account,
+        symbol,
+        0,
+        Side::Bid,
+        0,
+        channel as u64,
         TimeInForce::GoodTillCancel,
     )
 }

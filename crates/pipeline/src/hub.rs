@@ -20,7 +20,7 @@
 //! only for the ones actually connected.
 
 use crate::fastmap::FastMap;
-use bx_protocol::{AccountId, Event, EventKind, Sequence, SymbolId};
+use bx_protocol::{AccountId, ChannelKind, Event, EventKind, Sequence, SymbolId};
 
 /// What a subscriber can follow.
 ///
@@ -37,6 +37,24 @@ pub enum Channel {
 }
 
 impl Channel {
+    /// The channel a client asked for.
+    ///
+    /// `Account` deliberately ignores the requested account and uses the
+    /// session's own: a client must not be able to subscribe to somebody else's
+    /// private feed by naming their account number.
+    #[must_use]
+    pub const fn requested(
+        kind: ChannelKind,
+        symbol: SymbolId,
+        session_account: AccountId,
+    ) -> Self {
+        match kind {
+            ChannelKind::Book => Self::Book(symbol),
+            ChannelKind::Trades => Self::Trades(symbol),
+            ChannelKind::Account => Self::Account(session_account),
+        }
+    }
+
     /// The channel an event belongs on, or `None` if its kind does not decode.
     #[must_use]
     pub fn of(event: &Event) -> Option<Self> {
@@ -219,6 +237,25 @@ mod tests {
         let mut out = Vec::new();
         let resume = hub.resume(channel, from, &mut out);
         (resume, out)
+    }
+
+    #[test]
+    fn a_client_cannot_subscribe_to_another_accounts_private_feed() {
+        // The client asks for account 999's feed; it gets its own.
+        let channel = Channel::requested(ChannelKind::Account, 1, 42);
+        assert_eq!(channel, Channel::Account(42));
+    }
+
+    #[test]
+    fn a_requested_public_channel_is_the_one_named() {
+        assert_eq!(
+            Channel::requested(ChannelKind::Book, 7, 42),
+            Channel::Book(7)
+        );
+        assert_eq!(
+            Channel::requested(ChannelKind::Trades, 7, 42),
+            Channel::Trades(7)
+        );
     }
 
     #[test]
