@@ -86,7 +86,7 @@ Requires `rustup` and nothing else. There is no CI; `xtask` is the task runner.
 cargo x
 ```
 
-That is format, `clippy -D warnings`, and all 226 tests. Also:
+That is format, `clippy -D warnings`, and all 227 tests. Also:
 
 ```bash
 cargo x latency
@@ -155,6 +155,12 @@ recovery mechanism rather than an approximation, and it constrains every feature
 only after the commit succeeds. An acknowledgement that has to be retracted is
 worse than one that took longer.
 
+**A client can ask what it still has working.** A book can be rebuilt from a
+snapshot; a client's own orders cannot, and a trader that has just reconnected
+must know what is in the market before it acts. The answer costs that account's
+own order count rather than a scan of the venue, because the index that lets
+self-match prevention skip in one lookup is the same index that lists the orders.
+
 **A subscriber is told the book before the changes to it.** Increments alone
 cannot build a book — a client has no idea what was resting before it arrived — so
 subscribing sends the current levels stamped with the sequence the increments
@@ -182,16 +188,14 @@ Scope boundaries, with reasons rather than apologies:
   and untested platform-specific I/O is worse than none — the measurement also
   said the cost was one syscall *per record*, and batching the writes recovered
   8.6× without leaving `std`.
-- **Withdrawals, order-status queries, cancel-on-disconnect, trading halts.**
-  Venue features rather than exchange-core ones. The one that matters most is the
-  order-status query: a client shed for being slow can rebuild the book from a
-  snapshot but not its own open orders.
+- **Withdrawals, cancel-on-disconnect, trading halts.** Venue features rather
+  than exchange-core ones.
 - **Fees.** The design puts them at settlement so they never touch matching;
   nothing applies them yet.
 
 ## Correctness
 
-226 tests. The ones worth looking at:
+227 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed

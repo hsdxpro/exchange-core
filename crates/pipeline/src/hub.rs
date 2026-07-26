@@ -65,7 +65,9 @@ impl Channel {
             | EventKind::Rejected
             | EventKind::Resting
             | EventKind::Filled
-            | EventKind::Canceled => Self::Account(event.account),
+            | EventKind::Canceled
+            // A client's own order state is private to it, like its fills.
+            | EventKind::OrderState => Self::Account(event.account),
         })
     }
 }

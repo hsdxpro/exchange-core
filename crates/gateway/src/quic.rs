@@ -293,16 +293,21 @@ impl<S: LogStorage> QuicVenue<S> {
         }
     }
 
-    /// Starts or stops one session's feed.
+    /// Handles one session-control message: a feed starting or stopping, or a
+    /// question about the session's own orders.
     fn apply_control(&mut self, id: u64, command: &Command) {
-        let Some(kind) = command.channel_kind() else {
-            return;
-        };
         let account = self
             .sessions
             .get(&id)
             .and_then(|session| session.account)
             .unwrap_or_default();
+        if command.kind() == Some(CommandKind::QueryOpenOrders) {
+            self.answer_open_orders(id, command.symbol, account);
+            return;
+        }
+        let Some(kind) = command.channel_kind() else {
+            return;
+        };
         let channel = Channel::requested(kind, command.symbol, account);
 
         if command.kind() == Some(CommandKind::Subscribe) {
@@ -319,6 +324,23 @@ impl<S: LogStorage> QuicVenue<S> {
             }
         } else if let Some(session) = self.sessions.get_mut(&id) {
             session.cursors.retain(|(held, _)| *held != channel);
+        }
+    }
+
+    /// Tells one session what it still has working on a symbol.
+    ///
+    /// Sent on the session's own stream, since its orders are private to it.
+    fn answer_open_orders(&mut self, id: u64, symbol: SymbolId, account: AccountId) {
+        let orders = self.venue.exchange().open_orders_for(account, symbol);
+        if orders.is_empty() {
+            return;
+        }
+        let events: Vec<Event> = orders
+            .iter()
+            .map(|resting| bx_pipeline::order_state(account, symbol, resting))
+            .collect();
+        if let Some(session) = self.sessions.get(&id) {
+            let _ = session.outbound.send((Channel::Account(account), events));
         }
     }
 

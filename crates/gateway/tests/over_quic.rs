@@ -10,7 +10,7 @@ use bx_gateway::codec::encode;
 use bx_gateway::quic::{ALPN, QuicVenue, read_events, self_signed};
 use bx_journal::MemoryLog;
 use bx_pipeline::instrument::{Instrument, Instruments};
-use bx_pipeline::{limit_order, subscribe};
+use bx_pipeline::{limit_order, query_open_orders, subscribe};
 use bx_protocol::{ChannelKind, Command, Event, EventKind, Side, Ticks};
 use quinn::{ClientConfig, Endpoint};
 use std::net::SocketAddr;
@@ -337,6 +337,99 @@ fn a_client_that_disconnects_reconnects_and_rebuilds_what_it_missed() {
                 .iter()
                 .any(|e| e.kind == EventKind::BookDelta as u8 && e.price == 10_000),
             "the order placed after the snapshot never arrived as an increment"
+        );
+    });
+}
+
+#[test]
+fn a_reconnecting_client_can_recover_the_orders_it_still_has_working() {
+    // A book can be rebuilt from a snapshot; a client's own orders cannot. Until
+    // it can ask, a trader that has just reconnected does not know what it still
+    // has in the market, which is the one thing it must know before acting.
+    let venue = Running::start();
+    runtime().block_on(async {
+        {
+            let mut before = connect(&venue).await;
+            send(
+                &mut before,
+                &[
+                    limit_order(1, SYMBOL, 101, Side::Bid, 10_100, 5),
+                    limit_order(1, SYMBOL, 102, Side::Bid, 10_090, 7),
+                    limit_order(1, SYMBOL, 103, Side::Ask, 10_400, 2),
+                ],
+            )
+            .await;
+            collect_until(&mut before.acks, Duration::from_secs(5), |seen| {
+                seen.iter()
+                    .filter(|e| e.kind == EventKind::Resting as u8)
+                    .count()
+                    >= 3
+            })
+            .await;
+        } // gone, with three orders still working
+
+        // Someone else trades one of them away while it is disconnected.
+        let mut other = connect(&venue).await;
+        send(
+            &mut other,
+            &[limit_order(2, SYMBOL, 201, Side::Ask, 10_100, 5)],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Back, and asking.
+        let mut returning = connect(&venue).await;
+        send(
+            &mut returning,
+            &[
+                limit_order(1, SYMBOL, 104, Side::Bid, 10_000, 1),
+                query_open_orders(1, SYMBOL),
+            ],
+        )
+        .await;
+        let events = collect_until(&mut returning.acks, Duration::from_secs(10), |seen| {
+            seen.iter()
+                .filter(|e| e.kind == EventKind::OrderState as u8)
+                .count()
+                >= 3
+        })
+        .await;
+
+        let working: Vec<(u64, Ticks, u64)> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::OrderState as u8)
+            .map(|e| (e.order_id, e.price, e.quantity))
+            .collect();
+
+        // 101 was fully taken while it was away and must not be reported.
+        assert!(
+            !working.iter().any(|(order, _, _)| *order == 101),
+            "an order that was already filled was reported as working: {working:?}"
+        );
+        // The two that survived, with what is still working rather than what was
+        // originally sent.
+        assert!(working.contains(&(102, 10_090, 7)), "{working:?}");
+        assert!(working.contains(&(103, 10_400, 2)), "{working:?}");
+        // Not the one it placed in the same batch as the query. Session control is
+        // answered where it sits in the stream, so 104 is applied after and
+        // arrives as a Resting event -- the same composition as a book snapshot
+        // and its increments. The split is exact rather than approximate.
+        assert!(
+            !working.iter().any(|(order, _, _)| *order == 104),
+            "an order placed after the query appeared in its answer: {working:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == EventKind::Resting as u8 && e.order_id == 104),
+            "the order placed after the query never arrived as an event"
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::OrderState as u8)
+                .all(|e| e.account == 1),
+            "another account's orders were reported"
         );
     });
 }

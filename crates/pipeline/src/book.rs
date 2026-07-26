@@ -215,6 +215,25 @@ impl Book {
         out
     }
 
+    /// One resting order, as it currently stands. `None` if it is not resting.
+    ///
+    /// The quantity is what is still working, which is the only figure a client
+    /// that has just reconnected can act on.
+    #[must_use]
+    pub fn resting_order(&self, order: OrderId) -> Option<Resting> {
+        let slot = self.slots.slot_of(order)?;
+        let view = self.engine.order(slot)?;
+        Some(Resting {
+            order,
+            side: match view.side {
+                ESide::Bid => Side::Bid,
+                ESide::Ask => Side::Ask,
+            },
+            price: self.instrument.to_price(view.price),
+            quantity: u64::from(view.quantity),
+        })
+    }
+
     /// Walks the resting orders an incoming order would trade against, best
     /// price first, stopping at the first level it cannot reach.
     ///

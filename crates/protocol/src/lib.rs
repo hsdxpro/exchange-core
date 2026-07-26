@@ -111,6 +111,16 @@ pub enum CommandKind {
     Subscribe = 5,
     /// Stops a feed. Same layout as [`Self::Subscribe`].
     Unsubscribe = 6,
+    /// Asks for the session's own resting orders on one symbol.
+    ///
+    /// Session control, like a subscription: it changes nothing and is never
+    /// journalled. It exists because a client can rebuild a *book* from a
+    /// snapshot but not its own orders, and a trader that has just reconnected
+    /// needs to know what it still has working before it can act.
+    ///
+    /// Layout: `symbol` names the instrument. Answered with
+    /// [`EventKind::OrderState`], one per resting order.
+    QueryOpenOrders = 7,
 }
 
 /// Which feed a [`CommandKind::Subscribe`] names.
@@ -188,6 +198,11 @@ pub enum EventKind {
     /// One price level changed. The unit of the depth feed.
     BookDelta = 5,
     Trade = 6,
+    /// One of the session's own orders as it stands right now.
+    ///
+    /// Sent in answer to [`CommandKind::QueryOpenOrders`]. `quantity` is what is
+    /// still working, not what was originally sent.
+    OrderState = 8,
     /// One price level as it stands right now, not a change to it.
     ///
     /// Sent when a client starts following a book, and again if it falls outside
@@ -268,6 +283,7 @@ impl Event {
             5 => Some(EventKind::BookDelta),
             6 => Some(EventKind::Trade),
             7 => Some(EventKind::BookSnapshot),
+            8 => Some(EventKind::OrderState),
             _ => None,
         }
     }
@@ -310,7 +326,9 @@ impl Command {
     /// the venue. These are handled by the gateway and never journalled.
     #[must_use]
     pub const fn is_session_control(&self) -> bool {
-        self.kind == CommandKind::Subscribe as u8 || self.kind == CommandKind::Unsubscribe as u8
+        self.kind == CommandKind::Subscribe as u8
+            || self.kind == CommandKind::Unsubscribe as u8
+            || self.kind == CommandKind::QueryOpenOrders as u8
     }
 
     /// Asset credited by a [`CommandKind::Deposit`]. Meaningless for any other
@@ -369,6 +387,7 @@ impl Command {
             4 => Some(CommandKind::Deposit),
             5 => Some(CommandKind::Subscribe),
             6 => Some(CommandKind::Unsubscribe),
+            7 => Some(CommandKind::QueryOpenOrders),
             _ => None,
         }
     }
@@ -510,6 +529,7 @@ mod tests {
             (4, CommandKind::Deposit),
             (5, CommandKind::Subscribe),
             (6, CommandKind::Unsubscribe),
+            (7, CommandKind::QueryOpenOrders),
         ] {
             let mut command = sample();
             command.kind = byte;
@@ -616,6 +636,7 @@ mod tests {
             (5, EventKind::BookDelta),
             (6, EventKind::Trade),
             (7, EventKind::BookSnapshot),
+            (8, EventKind::OrderState),
         ] {
             let event = Event {
                 kind: byte,
@@ -625,7 +646,7 @@ mod tests {
         }
         assert!(
             Event {
-                kind: 8,
+                kind: 9,
                 ..Event::default()
             }
             .kind()

@@ -567,9 +567,13 @@ impl<S: LogStorage> Server<S> {
             .retain(|index| self.sessions[*index].is_some());
     }
 
-    /// Starts or stops one session's feed. A channel that does not decode is
-    /// ignored rather than guessed at.
+    /// Handles one session-control message: a feed starting or stopping, or a
+    /// question about the session's own orders.
     fn apply_control(&mut self, index: usize, command: &Command, account: AccountId) {
+        if command.kind() == Some(CommandKind::QueryOpenOrders) {
+            self.answer_open_orders(index, command.symbol, account);
+            return;
+        }
         let Some(kind) = command.channel_kind() else {
             return;
         };
@@ -582,6 +586,22 @@ impl<S: LogStorage> Server<S> {
             }
         } else {
             self.session_at(index).stop_following(channel);
+        }
+    }
+
+    /// Tells one session what it still has working on a symbol.
+    ///
+    /// A client can rebuild a book from a snapshot but not its own orders, so
+    /// this is what a trader needs after reconnecting before it can act. Costs
+    /// that account's own order count rather than a scan of the venue.
+    fn answer_open_orders(&mut self, index: usize, symbol: SymbolId, account: AccountId) {
+        let orders = self.venue.exchange().open_orders_for(account, symbol);
+        let session = self.session_at(index);
+        for resting in &orders {
+            encode(
+                &bx_pipeline::order_state(account, symbol, resting),
+                &mut session.outbox,
+            );
         }
     }
 

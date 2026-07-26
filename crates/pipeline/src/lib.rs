@@ -60,15 +60,19 @@ pub struct Exchange<S: LogStorage> {
     /// several times per command and nothing iterates it, so ordering is not
     /// needed and O(log n) tree descents are pure cost.
     reservations: FastMap<OrderId, Reservation>,
-    /// How many orders each account has resting on each symbol.
+    /// Which orders each account has resting on each symbol.
     ///
-    /// Exists so self-match prevention can answer "could this possibly trade
-    /// against itself" in one lookup. An account with nothing resting on the
-    /// symbol cannot self-match, which is the overwhelming majority of orders,
-    /// and they skip the check entirely. One entry per account that is actually
-    /// resting something, so the memory is bounded by open orders rather than by
-    /// how many accounts exist.
-    resting_per_account: FastMap<(AccountId, SymbolId), u32>,
+    /// Serves two callers that would otherwise each want their own index.
+    /// Self-match prevention asks "could this possibly trade against itself",
+    /// which is emptiness and so one lookup -- an account with nothing resting on
+    /// the symbol cannot self-match, which is the overwhelming majority of
+    /// orders, and they skip the check entirely. An open-orders query asks which
+    /// ones, which is the list itself, so answering costs the account's own order
+    /// count rather than a scan of every order in the venue.
+    ///
+    /// One entry per account that is actually resting something, so memory is
+    /// bounded by open orders rather than by how many accounts exist.
+    resting_per_account: FastMap<(AccountId, SymbolId), Vec<OrderId>>,
     events: Vec<Event>,
     /// Set once [`Self::commit`] has handed the current batch's events out, so
     /// the next enqueue knows to start a fresh batch rather than append to one
@@ -342,7 +346,7 @@ impl<S: LogStorage> Exchange<S> {
             // Session control never reaches here: the gateway handles it and
             // does not journal it. One in the journal means a bug upstream, so
             // it is refused rather than quietly ignored.
-            CommandKind::Subscribe | CommandKind::Unsubscribe => {
+            CommandKind::Subscribe | CommandKind::Unsubscribe | CommandKind::QueryOpenOrders => {
                 self.reject(&command, RejectReason::UnsupportedTimeInForce);
             }
             CommandKind::Deposit => self.accounts.deposit(
@@ -480,6 +484,26 @@ impl<S: LogStorage> Exchange<S> {
         }
         self.emit_outcome(command, side, &outcome);
         self.scratch = outcome;
+    }
+
+    /// One account's resting orders on one symbol, as they currently stand.
+    ///
+    /// Costs that account's own order count, not the venue's. A client can
+    /// rebuild a book from a snapshot but not its own orders, so this is what a
+    /// trader needs after reconnecting before it can act.
+    #[must_use]
+    pub fn open_orders_for(&self, account: AccountId, symbol: SymbolId) -> Vec<book::Resting> {
+        let Some(book) = self.books.get(&symbol) else {
+            return Vec::new();
+        };
+        self.resting_per_account
+            .get(&(account, symbol))
+            .map(|held| {
+                held.iter()
+                    .filter_map(|order| book.resting_order(*order))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Whether this order would actually trade against its own account.
@@ -702,7 +726,7 @@ impl<S: LogStorage> Exchange<S> {
     fn hold(&mut self, order: OrderId, reservation: Reservation) {
         let key = (reservation.account, reservation.symbol);
         if self.reservations.insert(order, reservation).is_none() {
-            *self.resting_per_account.entry(key).or_insert(0) += 1;
+            self.resting_per_account.entry(key).or_default().push(order);
         }
     }
 
@@ -711,11 +735,16 @@ impl<S: LogStorage> Exchange<S> {
             self.release(order, reservation.remaining);
             self.reservations.remove(&order);
             let key = (reservation.account, reservation.symbol);
-            if let Some(count) = self.resting_per_account.get_mut(&key) {
-                *count -= 1;
-                // Dropped rather than left at zero, so the map stays the size of
+            if let Some(held) = self.resting_per_account.get_mut(&key) {
+                // Swap-remove: order within an account's list carries no meaning,
+                // and a market maker with thousands resting should not pay a
+                // shift for each cancel.
+                if let Some(at) = held.iter().position(|held| *held == order) {
+                    held.swap_remove(at);
+                }
+                // Dropped rather than left empty, so the map stays the size of
                 // what is actually resting.
-                if *count == 0 {
+                if held.is_empty() {
                     self.resting_per_account.remove(&key);
                 }
             }
@@ -877,6 +906,40 @@ pub fn deposit(account: AccountId, asset: instrument::AssetId, amount: Quantity)
         amount,
         TimeInForce::GoodTillCancel,
     )
+}
+
+/// Asks the venue for this account's resting orders on one symbol.
+#[must_use]
+pub fn query_open_orders(account: AccountId, symbol: SymbolId) -> Command {
+    Command::new(
+        CommandKind::QueryOpenOrders,
+        account,
+        symbol,
+        0,
+        Side::Bid,
+        0,
+        0,
+        TimeInForce::GoodTillCancel,
+    )
+}
+
+/// One resting order, as a reply to [`query_open_orders`].
+#[must_use]
+pub fn order_state(account: AccountId, symbol: SymbolId, resting: &book::Resting) -> Event {
+    Event {
+        sequence: 0,
+        cause_sequence: 0,
+        account,
+        order_id: resting.order,
+        counterparty_order_id: 0,
+        quantity: resting.quantity,
+        price: resting.price,
+        symbol,
+        kind: EventKind::OrderState as u8,
+        side: resting.side as u8,
+        reject_reason: RejectReason::None as u8,
+        _pad: [0; 1],
+    }
 }
 
 /// Asks for a feed. `symbol` names the instrument, `quantity` the channel.
