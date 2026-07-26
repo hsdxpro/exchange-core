@@ -36,7 +36,7 @@ use crate::{HEADER_LEN as FILE_HEADER, LogStorage, RECORD_LEN};
 const HEADER_OFFSET: u64 = FILE_HEADER;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A follower's reply: the highest term it has seen, then the bytes it holds.
 ///
@@ -46,6 +46,9 @@ const ACK_LEN: usize = 2 * size_of::<u64>();
 
 /// A request header: what is being asked, the asker's term, then a length.
 const HEADER_LEN: usize = size_of::<u8>() + size_of::<u64>() + size_of::<u32>();
+
+/// How long to wait before trying a follower again during a promotion.
+const RETRY_PAUSE: Duration = Duration::from_millis(50);
 
 /// Append this group and confirm.
 const APPEND: u8 = 0;
@@ -65,6 +68,7 @@ fn request(kind: u8, term: u64, length: u32) -> [u8; HEADER_LEN] {
 /// One follower, as the leader sees it.
 #[derive(Debug)]
 struct Follower {
+    address: String,
     stream: TcpStream,
     /// A follower that has failed is left in place and not spoken to again, so
     /// the quorum arithmetic keeps counting against the configured cluster size
@@ -84,6 +88,8 @@ pub struct ReplicatedLog<L: LogStorage> {
     quorum: usize,
     /// Bytes appended since the last sync, awaiting replication.
     pending: Vec<u8>,
+    /// Kept so a socket can be replaced during a promotion.
+    ack_timeout: Duration,
     /// This leader's term. Monotonic across promotions, and the only thing that
     /// lets a follower tell a current leader from a replaced one.
     term: u64,
@@ -126,7 +132,11 @@ impl<L: LogStorage> ReplicatedLog<L> {
             let stream = TcpStream::connect(address)?;
             stream.set_nodelay(true)?;
             stream.set_read_timeout(Some(ack_timeout))?;
-            followers.push(Follower { stream, live: true });
+            followers.push(Follower {
+                address: address.clone(),
+                stream,
+                live: true,
+            });
         }
         // Majority of (followers + leader), minus the leader's own vote.
         let cluster = followers.len() + 1;
@@ -136,6 +146,7 @@ impl<L: LogStorage> ReplicatedLog<L> {
             followers,
             quorum,
             pending: Vec::new(),
+            ack_timeout,
             term,
             deposed: false,
         })
@@ -183,22 +194,37 @@ impl<L: LogStorage> ReplicatedLog<L> {
     /// # Errors
     /// Fails if a majority cannot be reached, in which case this node must not
     /// serve: it cannot know what it is missing.
-    pub fn catch_up(&mut self) -> io::Result<u64> {
+    pub fn catch_up(&mut self, within: Duration) -> io::Result<u64> {
         let mut answered = 0;
         let mut longest = (self.local_len()?, usize::MAX);
+        let deadline = Instant::now() + within;
 
+        // Retried against a deadline rather than asked once. A follower serves one
+        // leader at a time, so at the moment of a promotion it may still be
+        // finishing with the leader that just died; giving up on the first attempt
+        // would fail a promotion for a reason that resolves itself.
         for index in 0..self.followers.len() {
-            if !self.followers[index].live {
-                continue;
-            }
-            match self.ask(index, QUERY, &[]) {
-                Ok((_, held)) => {
-                    answered += 1;
-                    if held > longest.0 {
-                        longest = (held, index);
+            loop {
+                match self.ask(index, QUERY, &[]) {
+                    Ok((_, held)) => {
+                        answered += 1;
+                        if held > longest.0 {
+                            longest = (held, index);
+                        }
+                        break;
+                    }
+                    Err(_) if Instant::now() < deadline => {
+                        // Reconnect: the socket is no longer usable after a
+                        // timeout, and the follower may be free by now.
+                        if self.reconnect(index).is_err() {
+                            std::thread::sleep(RETRY_PAUSE);
+                        }
+                    }
+                    Err(_) => {
+                        self.followers[index].live = false;
+                        break;
                     }
                 }
-                Err(_) => self.followers[index].live = false,
             }
         }
 
@@ -235,6 +261,19 @@ impl<L: LogStorage> ReplicatedLog<L> {
         self.local.append(&tail)?;
         self.local.sync()?;
         Ok(tail.len() as u64)
+    }
+
+    /// Opens a fresh connection to one follower, replacing a socket that timed
+    /// out. A timed-out stream cannot be reused: the reply to the request that
+    /// timed out may still arrive and would be read as the answer to the next one.
+    fn reconnect(&mut self, index: usize) -> io::Result<()> {
+        std::thread::sleep(RETRY_PAUSE);
+        let stream = TcpStream::connect(&self.followers[index].address)?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(self.ack_timeout))?;
+        self.followers[index].stream = stream;
+        self.followers[index].live = true;
+        Ok(())
     }
 
     /// Bytes this node's own log holds, excluding the file header.
@@ -409,19 +448,37 @@ impl<L: LogStorage> Replica<L> {
         stream.write_all(&reply)
     }
 
-    /// Serves one leader until it disconnects.
+    /// Serves one leader until it disconnects or goes quiet.
+    ///
+    /// `idle_timeout` bounds how long a silent leader may hold this follower. A
+    /// follower serves one leader at a time, so without it a leader that hangs
+    /// rather than dying keeps its replacement from ever being served -- the
+    /// promotion cannot complete because the node it must ask is still waiting on
+    /// a corpse. Longer than the leader's own acknowledgement timeout, or a busy
+    /// leader looks silent.
     ///
     /// # Errors
     /// Fails on an I/O error that is not the leader simply going away.
-    pub fn serve(&mut self, stream: &mut TcpStream) -> io::Result<()> {
+    pub fn serve(&mut self, stream: &mut TcpStream, idle_timeout: Duration) -> io::Result<()> {
         stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(idle_timeout))?;
         let mut header = [0_u8; HEADER_LEN];
         let mut group = Vec::new();
 
         loop {
             match stream.read_exact(&mut header) {
                 Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                // Gone, or gone quiet. Either way this follower is free again.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(());
+                }
                 Err(e) => return Err(e),
             }
             let kind = header[0];
@@ -501,9 +558,9 @@ impl<L: LogStorage> Replica<L> {
     ///
     /// # Errors
     /// Fails if the listener cannot accept.
-    pub fn serve_one(&mut self, listener: &TcpListener) -> io::Result<()> {
+    pub fn serve_one(&mut self, listener: &TcpListener, idle_timeout: Duration) -> io::Result<()> {
         let (mut stream, _) = listener.accept()?;
-        self.serve(&mut stream)
+        self.serve(&mut stream, idle_timeout)
     }
 }
 
@@ -519,6 +576,8 @@ mod tests {
     const ACK_TIMEOUT: Duration = Duration::from_millis(250);
     /// Any term will do for the tests that are not about fencing.
     const TERM: u64 = 7;
+    /// Generous, so a busy machine does not look like a silent leader.
+    const IDLE: Duration = Duration::from_secs(5);
 
     fn command(order_id: u64) -> Command {
         Command::new(
@@ -550,7 +609,7 @@ mod tests {
             let address = listener.local_addr().unwrap().to_string();
             let thread = thread::spawn(move || {
                 let mut replica = Replica::new(MemoryLog::new(), false);
-                let _ = replica.serve_one(&listener);
+                let _ = replica.serve_one(&listener, IDLE);
                 replica.held()
             });
             Self {
@@ -729,8 +788,8 @@ mod tests {
         let follower = thread::spawn(move || {
             let mut replica = Replica::new(MemoryLog::new(), false);
             // Two leaders in turn: term 9 takes over, then term 4 tries.
-            let _ = replica.serve_one(&listener);
-            let result = replica.serve_one(&listener);
+            let _ = replica.serve_one(&listener, IDLE);
+            let result = replica.serve_one(&listener, IDLE);
             (result.is_err(), replica.highest_term(), replica.held())
         });
 
@@ -773,8 +832,8 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         let follower = thread::spawn(move || {
             let mut replica = Replica::new(MemoryLog::new(), false);
-            let _ = replica.serve_one(&listener);
-            let _ = replica.serve_one(&listener);
+            let _ = replica.serve_one(&listener, IDLE);
+            let _ = replica.serve_one(&listener, IDLE);
             (replica.highest_term(), replica.held())
         });
 
@@ -812,8 +871,8 @@ mod tests {
         let follower = thread::spawn(move || {
             let mut replica = Replica::new(MemoryLog::new(), false);
             // Serves the old leader, then the promoted one.
-            let _ = replica.serve_one(&listener);
-            let _ = replica.serve_one(&listener);
+            let _ = replica.serve_one(&listener, IDLE);
+            let _ = replica.serve_one(&listener, IDLE);
             replica.held()
         });
 
@@ -841,7 +900,7 @@ mod tests {
             5,
         )
         .unwrap();
-        let recovered = promoted.catch_up().unwrap();
+        let recovered = promoted.catch_up(Duration::from_secs(2)).unwrap();
         assert_eq!(
             recovered,
             3 * RECORD_LEN as u64,
@@ -881,7 +940,7 @@ mod tests {
             9,
         )
         .unwrap();
-        let outcome = promoted.catch_up();
+        let outcome = promoted.catch_up(Duration::from_secs(2));
         assert!(
             outcome.is_err(),
             "a leader served without knowing whether it was behind"
@@ -904,7 +963,11 @@ mod tests {
         journal.sync().unwrap();
 
         let mut log = journal.into_storage();
-        assert_eq!(log.catch_up().unwrap(), 0, "copied a tail it already had");
+        assert_eq!(
+            log.catch_up(Duration::from_secs(2)).unwrap(),
+            0,
+            "copied a tail it already had"
+        );
         drop(log);
         replica.accepted();
     }
@@ -915,7 +978,7 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         let server = thread::spawn(move || {
             let mut replica = Replica::new(MemoryLog::new(), false);
-            replica.serve_one(&listener)
+            replica.serve_one(&listener, IDLE)
         });
 
         let mut leader = TcpStream::connect(address).unwrap();

@@ -29,6 +29,11 @@ use std::time::Duration;
 const ACCOUNTS: std::ops::RangeInclusive<u64> = 1..=16;
 const STARTING_BALANCE: u64 = u64::MAX / 4;
 
+/// How long a promoted node keeps trying to reach a majority before giving up and
+/// refusing to serve. Long enough to outlast a follower finishing with the leader
+/// that just died.
+const PROMOTION_WINDOW: Duration = Duration::from_secs(15);
+
 /// What the venue runs as when no configuration file is given: one instrument,
 /// journal in memory. Enough to point the load harness at, and not a deployment.
 fn measurement_config() -> Config {
@@ -158,7 +163,9 @@ fn start(config: &Config) -> std::io::Result<()> {
 fn promoted<S: LogStorage>(config: &Config, storage: S) -> std::io::Result<ReplicatedLog<S>> {
     let mut log =
         ReplicatedLog::connect(storage, &config.replicas, config.ack_timeout, config.term)?;
-    let recovered = log.catch_up()?;
+    // Retried against a deadline: at the moment of a promotion a follower may
+    // still be finishing with the leader that just died.
+    let recovered = log.catch_up(PROMOTION_WINDOW)?;
     if recovered > 0 {
         println!("caught up {recovered} bytes from a follower before serving",);
     }

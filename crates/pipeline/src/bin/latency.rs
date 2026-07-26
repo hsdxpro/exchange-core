@@ -19,7 +19,7 @@ use bx_pipeline::{Exchange, limit_order, market_order};
 use bx_protocol::{Command, CommandKind, Side, Ticks, TimeInForce};
 use std::hint::black_box;
 use std::net::TcpListener;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const BTC: AssetId = 1;
 const USD: AssetId = 2;
@@ -559,7 +559,7 @@ fn replicated(sink: &mut u64, batch: usize) -> Vec<f64> {
         let address = listener.local_addr().unwrap().to_string();
         let follower = std::thread::spawn(move || {
             let mut replica = Replica::new(MemoryLog::new(), false);
-            let _ = replica.serve_one(&listener);
+            let _ = replica.serve_one(&listener, Duration::from_secs(30));
         });
 
         let path = std::env::temp_dir().join(format!(

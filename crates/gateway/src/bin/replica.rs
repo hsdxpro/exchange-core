@@ -23,6 +23,15 @@
 use bx_journal::{FileLog, LogStorage, MemoryLog, Replica};
 use std::net::TcpListener;
 use std::path::Path;
+use std::time::Duration;
+
+/// How long a silent leader may hold this follower before it is dropped.
+///
+/// A follower serves one leader at a time, so a leader that hangs rather than
+/// dying would otherwise keep its replacement from ever being served. Comfortably
+/// longer than a leader's own acknowledgement timeout, so a busy leader is not
+/// mistaken for a dead one.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn serve<L: LogStorage>(listener: &TcpListener, log: L, flush: bool) -> std::io::Result<()> {
     let mut replica = Replica::new(log, flush);
@@ -31,8 +40,7 @@ fn serve<L: LogStorage>(listener: &TcpListener, log: L, flush: bool) -> std::io:
         listener.local_addr()?
     );
     loop {
-        println!("waiting for a leader");
-        match replica.serve_one(listener) {
+        match replica.serve_one(listener, IDLE_TIMEOUT) {
             // A leader disconnected. Another may take over, and the highest term
             // seen is remembered so a replaced one cannot come back.
             Ok(()) => println!(
