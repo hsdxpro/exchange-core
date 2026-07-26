@@ -68,6 +68,10 @@ impl Channel {
             | EventKind::Canceled
             // A client's own order state is private to it, like its fills.
             | EventKind::OrderState => Self::Account(event.account),
+            // Not published at all. A challenge and its acceptance belong to one
+            // connection, and putting them on a retained channel would replay a
+            // nonce to whoever subscribed next.
+            EventKind::Challenge | EventKind::Authenticated => return None,
         })
     }
 }

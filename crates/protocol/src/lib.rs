@@ -30,6 +30,15 @@ pub type Quantity = u64;
 /// version is rejected at the handshake rather than misread.
 pub const WIRE_VERSION: u8 = 1;
 
+/// Bytes of nonce in an [`EventKind::Challenge`]. 128 bits, so a nonce does not
+/// repeat within a venue's lifetime and a proof cannot be replayed onto a later
+/// connection.
+pub const CHALLENGE_LEN: usize = 16;
+
+/// Bytes of proof in a [`CommandKind::Authenticate`]: a full HMAC-SHA256 tag,
+/// untruncated.
+pub const PROOF_LEN: usize = 32;
+
 // ---------------------------------------------------------------- enums
 
 /// `u8` discriminants so the wire representation is stable regardless of what
@@ -133,6 +142,16 @@ pub enum CommandKind {
     /// Session control: it changes nothing itself and is never journalled. The
     /// cancels it later causes are ordinary commands and are.
     CancelOnDisconnect = 8,
+    /// Proves the session may act for `account`, answering the challenge the
+    /// venue sent on connect.
+    ///
+    /// Layout: `account` is the account claimed, and the four fields after it
+    /// carry a 32-byte proof, via [`Command::proof`].
+    ///
+    /// Session control, and the one message accepted before authentication. The
+    /// secret is never sent — see [`EventKind::Challenge`] for why that matters
+    /// on this transport.
+    Authenticate = 9,
 }
 
 /// Which feed a [`CommandKind::Subscribe`] names.
@@ -173,6 +192,11 @@ pub enum RejectReason {
     SelfMatchPrevented = 13,
     UnsupportedTimeInForce = 14,
     EngineCapacity = 15,
+    /// Sent before the session proved who it is, or the proof was wrong.
+    NotAuthenticated = 16,
+    /// The account is sending faster than its allowance. The command was
+    /// discarded; the session stays open.
+    RateLimited = 17,
 }
 
 impl fmt::Display for RejectReason {
@@ -194,6 +218,8 @@ impl fmt::Display for RejectReason {
             Self::SelfMatchPrevented => "self-match prevented",
             Self::UnsupportedTimeInForce => "unsupported time-in-force",
             Self::EngineCapacity => "matching engine capacity exhausted",
+            Self::NotAuthenticated => "not authenticated",
+            Self::RateLimited => "rate limit exceeded",
         })
     }
 }
@@ -224,6 +250,20 @@ pub enum EventKind {
     /// the channel sequence the snapshot is taken at, so a client knows exactly
     /// where the increments resume.
     BookSnapshot = 7,
+    /// A nonce the session must sign to prove who it is. Sent on connect, before
+    /// the client has said anything.
+    ///
+    /// The venue takes no TLS, deliberately: a market maker on a cross-connect
+    /// wants nothing between it and the book. That decision is what makes a
+    /// bearer token useless here — anyone able to read the wire could replay it —
+    /// so the secret never crosses the wire at all. The client signs this nonce
+    /// instead, and the venue checks the signature against the secret it holds.
+    /// A fresh nonce per connection is what stops the answer being replayed.
+    ///
+    /// Layout: 16 bytes of nonce, via [`Event::challenge`].
+    Challenge = 9,
+    /// The proof was accepted. The session may trade as the account it claimed.
+    Authenticated = 10,
 }
 
 // ---------------------------------------------------------------- records
@@ -296,7 +336,31 @@ impl Event {
             6 => Some(EventKind::Trade),
             7 => Some(EventKind::BookSnapshot),
             8 => Some(EventKind::OrderState),
+            9 => Some(EventKind::Challenge),
+            10 => Some(EventKind::Authenticated),
             _ => None,
+        }
+    }
+
+    /// The nonce carried by an [`EventKind::Challenge`]. Meaningless for any
+    /// other kind.
+    #[must_use]
+    pub fn challenge(&self) -> [u8; CHALLENGE_LEN] {
+        let mut nonce = [0_u8; CHALLENGE_LEN];
+        nonce[..8].copy_from_slice(&self.order_id.to_le_bytes());
+        nonce[8..].copy_from_slice(&self.counterparty_order_id.to_le_bytes());
+        nonce
+    }
+
+    /// Builds the challenge sent to a session on connect.
+    #[must_use]
+    pub fn challenging(nonce: [u8; CHALLENGE_LEN]) -> Self {
+        let half = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("eight bytes"));
+        Self {
+            kind: EventKind::Challenge as u8,
+            order_id: half(&nonce[..8]),
+            counterparty_order_id: half(&nonce[8..]),
+            ..Self::default()
         }
     }
 
@@ -336,12 +400,51 @@ impl Command {
 
     /// True for a message that configures the connection rather than changing
     /// the venue. These are handled by the gateway and never journalled.
+    ///
+    /// `Authenticate` is listed even though it is taken out of the stream
+    /// earlier, so that a second one from an already-authenticated session
+    /// cannot reach the journal by the ordinary path.
     #[must_use]
     pub const fn is_session_control(&self) -> bool {
         self.kind == CommandKind::Subscribe as u8
             || self.kind == CommandKind::Unsubscribe as u8
             || self.kind == CommandKind::QueryOpenOrders as u8
             || self.kind == CommandKind::CancelOnDisconnect as u8
+            || self.kind == CommandKind::Authenticate as u8
+    }
+
+    /// The 32 bytes proving a [`CommandKind::Authenticate`]. Meaningless for any
+    /// other kind: authentication names no order and no price, so it reuses the
+    /// four fields that would carry them.
+    #[must_use]
+    pub fn proof(&self) -> [u8; PROOF_LEN] {
+        let mut proof = [0_u8; PROOF_LEN];
+        proof[..8].copy_from_slice(&self.order_id.to_le_bytes());
+        proof[8..16].copy_from_slice(&self.replacement_id.to_le_bytes());
+        proof[16..24].copy_from_slice(&self.quantity.to_le_bytes());
+        proof[24..].copy_from_slice(&self.price.to_le_bytes());
+        proof
+    }
+
+    /// Builds the answer to a challenge. `proof` comes from signing the nonce
+    /// with the account's secret; this only carries it.
+    #[must_use]
+    pub fn authenticating(account: AccountId, proof: [u8; PROOF_LEN]) -> Self {
+        let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("eight bytes"));
+        Self {
+            sequence: 0,
+            ingress_ns: 0,
+            account,
+            order_id: word(&proof[..8]),
+            replacement_id: word(&proof[8..16]),
+            quantity: word(&proof[16..24]),
+            price: i64::from_le_bytes(proof[24..].try_into().expect("eight bytes")),
+            symbol: 0,
+            kind: CommandKind::Authenticate as u8,
+            side: 0,
+            time_in_force: 0,
+            order_type: 0,
+        }
     }
 
     /// Asset credited by a [`CommandKind::Deposit`]. Meaningless for any other
@@ -402,6 +505,7 @@ impl Command {
             6 => Some(CommandKind::Unsubscribe),
             7 => Some(CommandKind::QueryOpenOrders),
             8 => Some(CommandKind::CancelOnDisconnect),
+            9 => Some(CommandKind::Authenticate),
             _ => None,
         }
     }
@@ -545,12 +649,16 @@ mod tests {
             (6, CommandKind::Unsubscribe),
             (7, CommandKind::QueryOpenOrders),
             (8, CommandKind::CancelOnDisconnect),
+            (9, CommandKind::Authenticate),
         ] {
             let mut command = sample();
             command.kind = byte;
             assert_eq!(command.kind(), Some(kind));
             assert!(command.is_well_formed());
         }
+        let mut unknown = sample();
+        unknown.kind = 10;
+        assert!(unknown.kind().is_none());
     }
 
     #[test]
@@ -652,6 +760,8 @@ mod tests {
             (6, EventKind::Trade),
             (7, EventKind::BookSnapshot),
             (8, EventKind::OrderState),
+            (9, EventKind::Challenge),
+            (10, EventKind::Authenticated),
         ] {
             let event = Event {
                 kind: byte,
@@ -661,11 +771,37 @@ mod tests {
         }
         assert!(
             Event {
-                kind: 9,
+                kind: 11,
                 ..Event::default()
             }
             .kind()
             .is_none()
+        );
+    }
+
+    #[test]
+    fn a_challenge_round_trips_through_the_record() {
+        let nonce = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3];
+        let event = Event::challenging(nonce);
+        assert_eq!(event.kind(), Some(EventKind::Challenge));
+        assert_eq!(event.challenge(), nonce);
+    }
+
+    #[test]
+    fn a_proof_round_trips_through_the_record() {
+        let mut proof = [0_u8; PROOF_LEN];
+        for (index, byte) in proof.iter_mut().enumerate() {
+            // Distinct per byte, so a field packed in the wrong order shows up
+            // rather than passing on a symmetric pattern.
+            *byte = u8::try_from(index).expect("32 fits in a byte") ^ 0xa5;
+        }
+        let command = Command::authenticating(77, proof);
+        assert_eq!(command.kind(), Some(CommandKind::Authenticate));
+        assert_eq!(command.account, 77);
+        assert_eq!(command.proof(), proof);
+        assert!(
+            command.is_session_control(),
+            "an authentication must never reach the journal"
         );
     }
 

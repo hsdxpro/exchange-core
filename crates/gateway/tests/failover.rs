@@ -134,6 +134,7 @@ fn write_config(path: &Path, journal: &Path, follower: &str, term: u64) -> PathB
          ack_timeout_ms = 1000\n\
          term = {term}\n\
          max_feed_memory_mb = 64\n\
+         authentication = open\n\
          replica = {follower}\n\
          \n\
          [instrument]\n\

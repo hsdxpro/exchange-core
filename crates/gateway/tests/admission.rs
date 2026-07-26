@@ -1,0 +1,663 @@
+//! Who may act, and how fast — over real sockets.
+//!
+//! Everything a client does here goes through the same framing, the same
+//! challenge, and the same group-commit loop a deployment runs. Two properties
+//! are worth the process: that an unproven session cannot reach the book at all,
+//! and that a captured proof is worthless against the next connection. Neither
+//! can be shown by calling a verifier directly, because both are about what the
+//! *server loop* does with a socket.
+
+use bx_gateway::auth::{Credentials, SECRET_LEN, prove};
+use bx_gateway::codec::encode;
+use bx_gateway::limit::RateLimit;
+use bx_gateway::tcp::{Server, read_events};
+use bx_journal::MemoryLog;
+use bx_pipeline::instrument::{Instrument, Instruments};
+use bx_pipeline::limit_order;
+use bx_protocol::{CHALLENGE_LEN, Command, Event, EventKind, PROOF_LEN, RejectReason, Side, Ticks};
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+const BTC: u32 = 1;
+const USD: u32 = 2;
+const SYMBOL: u32 = 1;
+const FLOOR: Ticks = 10_000;
+
+const ALICE: u64 = 1;
+const BOB: u64 = 2;
+const ALICE_SECRET: [u8; SECRET_LEN] = [0x11; SECRET_LEN];
+const BOB_SECRET: [u8; SECRET_LEN] = [0x22; SECRET_LEN];
+
+/// A running venue, and the handle that stops it.
+struct Running {
+    address: String,
+    stop: Arc<AtomicBool>,
+    throttled: Arc<AtomicU64>,
+    rejected_proofs: Arc<AtomicU64>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Running {
+    fn start(authenticated: bool, rate: Option<RateLimit>) -> Self {
+        let mut instruments = Instruments::new();
+        instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000, 65_536));
+        let mut server = Server::bind("127.0.0.1:0", MemoryLog::new(), instruments, 4_096, 256, 64)
+            .expect("the venue could not bind");
+
+        if authenticated {
+            let mut credentials = Credentials::new();
+            credentials.insert(ALICE, ALICE_SECRET);
+            credentials.insert(BOB, BOB_SECRET);
+            server.require_authentication(credentials);
+        }
+        if let Some(rate) = rate {
+            server.rate_limit(rate);
+        }
+        for account in [ALICE, BOB] {
+            for asset in [USD, BTC] {
+                server
+                    .venue_mut()
+                    .deposit(account, asset, u64::MAX / 4)
+                    .expect("funding failed");
+            }
+        }
+
+        let address = server.address().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let throttled = Arc::new(AtomicU64::new(0));
+        let throttle_count = Arc::clone(&throttled);
+        let rejected_proofs = Arc::new(AtomicU64::new(0));
+        let proof_count = Arc::clone(&rejected_proofs);
+
+        let thread = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                server.poll().expect("the venue failed to commit");
+                throttle_count.store(server.throttled(), Ordering::Relaxed);
+                proof_count.store(server.rejected_proofs(), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        });
+
+        Self {
+            address,
+            stop,
+            throttled,
+            rejected_proofs,
+            thread: Some(thread),
+        }
+    }
+
+    fn connect(&self) -> TcpStream {
+        let stream = TcpStream::connect(&self.address).expect("could not connect");
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn send(stream: &mut TcpStream, commands: &[Command]) {
+    let mut bytes = Vec::new();
+    for command in commands {
+        encode(command, &mut bytes);
+    }
+    stream.write_all(&bytes).expect("the venue stopped reading");
+}
+
+/// Collects events until `enough` is satisfied or the window closes.
+fn collect_until(
+    stream: &mut TcpStream,
+    window: Duration,
+    enough: impl Fn(&[Event]) -> bool,
+) -> Vec<Event> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + window;
+    while Instant::now() < deadline && !enough(&seen) {
+        let mut batch = Vec::new();
+        match read_events(stream, 1, &mut batch) {
+            Ok(()) if batch.is_empty() => break, // peer closed
+            Ok(()) => seen.extend(batch),
+            Err(_) => {}
+        }
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    seen
+}
+
+/// Waits for the challenge the venue sends the moment it accepts a connection.
+fn challenge_from(stream: &mut TcpStream) -> [u8; CHALLENGE_LEN] {
+    let events = collect_until(stream, Duration::from_secs(5), |seen| !seen.is_empty());
+    let first = events.first().expect("the venue sent no challenge");
+    assert_eq!(
+        first.kind(),
+        Some(EventKind::Challenge),
+        "the first thing a client hears must be the challenge"
+    );
+    first.challenge()
+}
+
+/// The whole client side of authentication: read the nonce, sign it, send it.
+fn authenticate(stream: &mut TcpStream, account: u64, secret: &[u8; SECRET_LEN]) -> Vec<Event> {
+    let nonce = challenge_from(stream);
+    send(
+        stream,
+        &[Command::authenticating(account, prove(secret, &nonce))],
+    );
+    collect_until(stream, Duration::from_secs(5), |seen| !seen.is_empty())
+}
+
+fn order(account: u64, id: u64, price: Ticks) -> Command {
+    limit_order(account, SYMBOL, id, Side::Bid, price, 1)
+}
+
+fn kinds(events: &[Event], kind: EventKind) -> usize {
+    events.iter().filter(|e| e.kind == kind as u8).count()
+}
+
+/// Commands the venue has answered, accepted or refused.
+///
+/// The unit that matters when counting a flood. Counting *events* instead is a
+/// trap: an accepted order produces two (an acknowledgement and a resting), a
+/// refused one produces a single reject, so a window that stops at "100 events"
+/// stops after 10 acceptances and 80 refusals and reports a limiter ten times
+/// tighter than it is.
+fn answered(events: &[Event]) -> usize {
+    kinds(events, EventKind::Received) + kinds(events, EventKind::Rejected)
+}
+
+/// Polls a counter until it reaches `want`, or gives up.
+///
+/// The venue publishes its counters after a pass, but the socket it closed
+/// during that same pass is visible to the client immediately — so a test that
+/// reads a counter the instant it sees a disconnect reads it one store too
+/// early. That is a race in the harness, not in the venue, and waiting is the
+/// honest fix.
+fn reaches(counter: &AtomicU64, want: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let held = counter.load(Ordering::Relaxed);
+        if held >= want {
+            return held;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    counter.load(Ordering::Relaxed)
+}
+
+fn rejects_for(events: &[Event], reason: RejectReason) -> usize {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::Rejected as u8 && e.reject_reason == reason as u8)
+        .count()
+}
+
+/// True once the peer has closed. Distinguished from "nothing to read yet",
+/// which is what a plain failed read cannot tell you.
+fn is_closed(stream: &mut TcpStream) -> bool {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut scratch = [0_u8; 64];
+    loop {
+        match stream.read(&mut scratch) {
+            Ok(0) => return true,
+            Ok(_) => {} // queued events still draining; keep reading
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                return false;
+            }
+            Err(_) => return true,
+        }
+    }
+}
+
+// ----------------------------------------------------------- authentication
+
+#[test]
+fn an_order_sent_before_proving_anything_never_reaches_the_book() {
+    // The property the whole feature exists for. Before this, a session stated
+    // its account on its first command and was believed.
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let _nonce = challenge_from(&mut client);
+
+    send(&mut client, &[order(ALICE, 1, 10_500)]);
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
+
+    assert_eq!(
+        rejects_for(&events, RejectReason::NotAuthenticated),
+        1,
+        "an unproven order was not refused with a reason: {events:?}"
+    );
+    assert_eq!(
+        kinds(&events, EventKind::Received),
+        0,
+        "an unproven order was acknowledged"
+    );
+    assert_eq!(
+        kinds(&events, EventKind::Resting),
+        0,
+        "an unproven order reached the book"
+    );
+}
+
+#[test]
+fn a_correct_proof_admits_the_session_and_it_can_then_trade() {
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+
+    let events = authenticate(&mut client, ALICE, &ALICE_SECRET);
+    assert_eq!(
+        kinds(&events, EventKind::Authenticated),
+        1,
+        "a correct proof was not accepted: {events:?}"
+    );
+
+    send(&mut client, &[order(ALICE, 1, 10_500)]);
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Resting as u8)
+    });
+    assert_eq!(
+        kinds(&events, EventKind::Resting),
+        1,
+        "an authenticated session could not trade: {events:?}"
+    );
+}
+
+#[test]
+fn a_wrong_proof_closes_the_connection() {
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let nonce = challenge_from(&mut client);
+
+    // Right account, wrong secret.
+    send(
+        &mut client,
+        &[Command::authenticating(ALICE, prove(&BOB_SECRET, &nonce))],
+    );
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
+    assert_eq!(
+        rejects_for(&events, RejectReason::NotAuthenticated),
+        1,
+        "a wrong proof was not reported before the drop: {events:?}"
+    );
+    assert!(
+        is_closed(&mut client),
+        "a session that failed to prove itself was left connected"
+    );
+    assert_eq!(
+        reaches(&venue.rejected_proofs, 1),
+        1,
+        "a failed proof was not counted"
+    );
+}
+
+#[test]
+fn a_proof_captured_from_one_connection_does_not_open_another() {
+    // The reason a nonce exists at all. On a transport with no TLS an
+    // eavesdropper sees every byte of a successful login; this is the test that
+    // says seeing it buys nothing.
+    let venue = Running::start(true, None);
+
+    let mut first = venue.connect();
+    let nonce = challenge_from(&mut first);
+    let captured = prove(&ALICE_SECRET, &nonce);
+    send(&mut first, &[Command::authenticating(ALICE, captured)]);
+    let events = collect_until(&mut first, Duration::from_secs(2), |seen| !seen.is_empty());
+    assert_eq!(
+        kinds(&events, EventKind::Authenticated),
+        1,
+        "the capture was taken from a login that did not work"
+    );
+
+    // Replayed verbatim onto a fresh connection, which gets a fresh nonce.
+    let mut second = venue.connect();
+    let replayed_nonce = challenge_from(&mut second);
+    assert_ne!(nonce, replayed_nonce, "the venue reissued a nonce");
+    send(&mut second, &[Command::authenticating(ALICE, captured)]);
+
+    let events = collect_until(&mut second, Duration::from_secs(2), |seen| !seen.is_empty());
+    assert_eq!(
+        kinds(&events, EventKind::Authenticated),
+        0,
+        "a replayed proof was accepted: {events:?}"
+    );
+    assert!(is_closed(&mut second), "the replaying session was not shed");
+}
+
+#[test]
+fn one_accounts_secret_does_not_open_another_account() {
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let nonce = challenge_from(&mut client);
+
+    // Bob's own secret, correctly signed -- but claiming to be Alice.
+    send(
+        &mut client,
+        &[Command::authenticating(ALICE, prove(&BOB_SECRET, &nonce))],
+    );
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
+    assert_eq!(kinds(&events, EventKind::Authenticated), 0);
+    assert!(is_closed(&mut client));
+}
+
+#[test]
+fn an_unknown_account_is_refused_like_a_bad_proof() {
+    // Same outcome and same timing, so the venue cannot be used to enumerate
+    // which accounts exist.
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let nonce = challenge_from(&mut client);
+    send(
+        &mut client,
+        &[Command::authenticating(9_999, prove(&ALICE_SECRET, &nonce))],
+    );
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
+    assert_eq!(
+        rejects_for(&events, RejectReason::NotAuthenticated),
+        1,
+        "{events:?}"
+    );
+    assert!(is_closed(&mut client));
+}
+
+#[test]
+fn a_client_may_pipeline_its_opening_orders_behind_the_proof() {
+    // A market maker has already spent one round trip collecting the challenge.
+    // Making it spend a second before it can quote would be a latency cost paid
+    // by the client that matters most.
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let nonce = challenge_from(&mut client);
+
+    let mut batch = vec![Command::authenticating(ALICE, prove(&ALICE_SECRET, &nonce))];
+    for id in 1..=5_i64 {
+        batch.push(order(ALICE, id as u64, 10_500 - id));
+    }
+    send(&mut client, &batch);
+
+    let events = collect_until(&mut client, Duration::from_secs(3), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Resting as u8)
+            .count()
+            >= 5
+    });
+    assert_eq!(
+        kinds(&events, EventKind::Authenticated),
+        1,
+        "the proof in a pipelined batch was not accepted: {events:?}"
+    );
+    assert_eq!(
+        kinds(&events, EventKind::Resting),
+        5,
+        "orders behind the proof in the same write were lost: {events:?}"
+    );
+}
+
+#[test]
+fn an_open_venue_sends_no_challenge_and_takes_the_account_as_declared() {
+    // The measurement path, and the one every benchmark uses. Worth pinning:
+    // if a challenge leaked into open mode, every existing client would hang
+    // waiting to be asked for something.
+    let venue = Running::start(false, None);
+    let mut client = venue.connect();
+    send(&mut client, &[order(ALICE, 1, 10_500)]);
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Resting as u8)
+    });
+    assert_eq!(kinds(&events, EventKind::Challenge), 0);
+    assert_eq!(kinds(&events, EventKind::Resting), 1, "{events:?}");
+}
+
+// ------------------------------------------------------------ rate limiting
+
+#[test]
+fn a_flood_is_cut_to_the_allowance_and_told_why() {
+    // One a second, bursting to 20: a hundred at once should leave 20 through
+    // and refuse the rest, rather than dropping the connection or quietly
+    // swallowing them. The rate is slow so that the tokens earned while the
+    // test watches cannot move the answer — a bucket is a function of elapsed
+    // time, and on a loaded machine a test's duration is not a constant.
+    let venue = Running::start(false, Some(RateLimit::new(1, 20)));
+    let mut client = venue.connect();
+
+    let flood: Vec<Command> = (1..=100).map(|id| order(ALICE, id, 10_500)).collect();
+    send(&mut client, &flood);
+
+    let events = collect_until(&mut client, Duration::from_secs(3), |seen| {
+        answered(seen) >= 100
+    });
+    let accepted = kinds(&events, EventKind::Received);
+    let refused = rejects_for(&events, RejectReason::RateLimited);
+
+    assert_eq!(
+        accepted + refused,
+        100,
+        "commands went missing rather than being refused: {accepted} accepted, {refused} refused"
+    );
+    // The burst, plus at most a few tokens earned while the window was open.
+    assert!(
+        (20..=30).contains(&accepted),
+        "a burst of 20 at 1/sec let {accepted} commands through"
+    );
+    assert!(
+        reaches(&venue.throttled, 70) >= 70,
+        "throttled commands were not counted"
+    );
+}
+
+#[test]
+fn a_throttled_session_stays_open_and_recovers() {
+    // Being told "too fast" is not being disconnected. A client that backs off
+    // must be able to carry on.
+    let venue = Running::start(false, Some(RateLimit::new(1_000, 10)));
+    let mut client = venue.connect();
+
+    let flood: Vec<Command> = (1..=50).map(|id| order(ALICE, id, 10_500)).collect();
+    send(&mut client, &flood);
+    let _ = collect_until(&mut client, Duration::from_secs(2), |seen| {
+        answered(seen) >= 50
+    });
+    assert!(
+        !is_closed(&mut client),
+        "a session was dropped for sending too fast rather than throttled"
+    );
+
+    // A tenth of a second at a thousand a second refills well past the burst.
+    std::thread::sleep(Duration::from_millis(100));
+    send(&mut client, &[order(ALICE, 500, 10_400)]);
+    let events = collect_until(&mut client, Duration::from_secs(3), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Resting as u8)
+    });
+    assert!(
+        kinds(&events, EventKind::Resting) >= 1,
+        "a throttled session never recovered: {events:?}"
+    );
+}
+
+#[test]
+fn a_second_connection_does_not_buy_a_second_allowance() {
+    // The reason the bucket is keyed by account rather than by session. If it
+    // were per connection, the limit would be advice: open ten sockets, send ten
+    // times as much.
+    //
+    // A token bucket is a function of elapsed time, so any assertion about how
+    // much got through is partly an assertion about how long the test took —
+    // and under a loaded machine a workspace run stretches by seconds. The rate
+    // is therefore set far below the difference being detected: at one a second
+    // the refill would need a hundred seconds to muddy a hundred-token burst,
+    // and the windows below cap out at six.
+    let venue = Running::start(false, Some(RateLimit::new(1, 100)));
+    let mut first = venue.connect();
+    let mut second = venue.connect();
+
+    // Declare each session's account before either floods, so both are attached
+    // to the same allowance when the flood arrives.
+    send(&mut first, &[order(ALICE, 1, 10_500)]);
+    send(&mut second, &[order(ALICE, 2, 10_500)]);
+    let _ = collect_until(&mut first, Duration::from_secs(2), |seen| !seen.is_empty());
+    let _ = collect_until(&mut second, Duration::from_secs(2), |seen| !seen.is_empty());
+
+    // Counted by order ID, not by socket. Both sessions trade as ALICE and so
+    // both follow ALICE's private feed, which means each is sent the other's
+    // acknowledgements — a count taken per socket reads one session's burst as
+    // the other's and reports a limit that is not being applied.
+    let mine = |events: &[Event], range: std::ops::Range<u64>| -> usize {
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::Received as u8 && range.contains(&e.order_id))
+            .count()
+    };
+
+    // The first session drains the shared allowance...
+    let flood: Vec<Command> = (1_000..1_120).map(|id| order(ALICE, id, 10_500)).collect();
+    send(&mut first, &flood);
+    let drained = collect_until(&mut first, Duration::from_secs(3), |seen| {
+        answered(seen) >= 120
+    });
+    assert!(
+        mine(&drained, 1_000..1_120) >= 90,
+        "the first session did not get its burst, so nothing was drained"
+    );
+
+    // ...so the second finds it empty. With a bucket of its own it would find a
+    // full hundred.
+    let flood: Vec<Command> = (2_000..2_120).map(|id| order(ALICE, id, 10_500)).collect();
+    send(&mut second, &flood);
+    let after = collect_until(&mut second, Duration::from_secs(3), |seen| {
+        answered(seen) >= 120
+    });
+    let accepted = mine(&after, 2_000..2_120);
+    assert!(
+        accepted <= 20,
+        "a second session on the same account got {accepted} commands through an \
+         allowance the first had already drained, so the limit is per connection"
+    );
+}
+
+#[test]
+fn an_allowance_is_forgotten_when_the_account_disconnects() {
+    // Otherwise the table grows by one entry for every account that ever
+    // connected, which at a million users is a leak that only shows up in
+    // production.
+    // One a second: a bucket that survived the disconnect would be drained, and
+    // could not refill to twenty inside the window however long the test waits.
+    let venue = Running::start(false, Some(RateLimit::new(1, 20)));
+    {
+        let mut client = venue.connect();
+        let flood: Vec<Command> = (1..=40).map(|id| order(ALICE, id, 10_500)).collect();
+        send(&mut client, &flood);
+        let _ = collect_until(&mut client, Duration::from_secs(2), |seen| {
+            answered(seen) >= 40
+        });
+    }
+    // The socket is gone; give the venue a pass to notice.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // A fresh connection for the same account starts from a full bucket, which
+    // is only true if the old allowance was dropped.
+    let mut client = venue.connect();
+    let batch: Vec<Command> = (100..=119).map(|id| order(ALICE, id, 10_400)).collect();
+    send(&mut client, &batch);
+    let events = collect_until(&mut client, Duration::from_secs(3), |seen| {
+        answered(seen) >= 20
+    });
+    assert!(
+        kinds(&events, EventKind::Received) >= 20,
+        "a reconnecting account did not get a fresh allowance: {events:?}"
+    );
+}
+
+#[test]
+fn authentication_and_rate_limiting_compose() {
+    // Both on, which is the deployment shape. The proof itself must not be
+    // charged against the allowance in a way that starves the first orders.
+    let venue = Running::start(true, Some(RateLimit::new(1_000, 50)));
+    let mut client = venue.connect();
+    let events = authenticate(&mut client, BOB, &BOB_SECRET);
+    assert_eq!(kinds(&events, EventKind::Authenticated), 1, "{events:?}");
+
+    let batch: Vec<Command> = (1..=20).map(|id| order(BOB, id, 10_400)).collect();
+    send(&mut client, &batch);
+    let events = collect_until(&mut client, Duration::from_secs(3), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Resting as u8)
+            .count()
+            >= 20
+    });
+    assert_eq!(kinds(&events, EventKind::Resting), 20, "{events:?}");
+}
+
+#[test]
+fn a_proof_is_never_charged_to_the_venue_as_a_command() {
+    // A secret in the journal would be written to disk and replayed on every
+    // recovery. The gateway takes it out of the stream; this checks the sequence
+    // never moved for it.
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let events = authenticate(&mut client, ALICE, &ALICE_SECRET);
+    let admitted = events
+        .iter()
+        .find(|e| e.kind == EventKind::Authenticated as u8)
+        .expect("no acceptance");
+    assert_eq!(
+        admitted.sequence, 0,
+        "the acceptance carried a sequence, so the proof entered the stream"
+    );
+
+    // Two orders with another proof between them. If authentication consumed a
+    // sequence the gap would be two, not one. Comparing them to each other
+    // rather than to zero is deliberate: the venue was funded by four journalled
+    // deposits before any client connected, and a test that asserted "the first
+    // order is sequence zero" would be asserting the funding, not the proof.
+    let sequence_of = |client: &mut TcpStream, id: u64| -> u64 {
+        send(client, &[order(ALICE, id, 10_500)]);
+        let events = collect_until(client, Duration::from_secs(2), |seen| {
+            seen.iter().any(|e| e.kind == EventKind::Received as u8)
+        });
+        events
+            .iter()
+            .find(|e| e.kind == EventKind::Received as u8)
+            .expect("no acknowledgement")
+            .cause_sequence
+    };
+    let first = sequence_of(&mut client, 1);
+    send(
+        &mut client,
+        &[Command::authenticating(ALICE, [0; PROOF_LEN])],
+    );
+    let second = sequence_of(&mut client, 2);
+    assert_eq!(
+        second,
+        first + 1,
+        "a proof consumed a sequence, so it was journalled"
+    );
+}
+
+#[test]
+fn the_proof_bytes_are_exactly_a_full_hmac() {
+    // A truncated tag is a weaker tag, and truncation is the kind of thing that
+    // happens silently when a record is repacked.
+    assert_eq!(PROOF_LEN, 32);
+    assert_eq!(CHALLENGE_LEN, 16);
+    let proof = prove(&ALICE_SECRET, &[0; CHALLENGE_LEN]);
+    assert_eq!(Command::authenticating(ALICE, proof).proof(), proof);
+}

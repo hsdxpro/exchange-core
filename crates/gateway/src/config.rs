@@ -18,8 +18,10 @@
 //!   empty instrument list should stop the venue before it accepts an order, not
 //!   surface as strange behaviour under load.
 
+use crate::auth::{self, Credentials, Mode, SECRET_LEN};
+use crate::limit::RateLimit;
 use bx_pipeline::instrument::{Instrument, Instruments, MAX_OPEN_ORDERS_LIMIT, MAX_SYMBOL};
-use bx_protocol::Ticks;
+use bx_protocol::{AccountId, Ticks};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -58,6 +60,35 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 type Result<T> = std::result::Result<T, ConfigError>;
+
+/// Which block a key belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Section {
+    Global,
+    Instrument,
+    Credential,
+}
+
+/// One account's secret, before validation.
+#[derive(Debug, Default)]
+struct CredentialDraft {
+    line: usize,
+    account: Option<u64>,
+    secret: Option<[u8; SECRET_LEN]>,
+}
+
+impl CredentialDraft {
+    fn finish(self) -> Result<(AccountId, [u8; SECRET_LEN])> {
+        let line = self.line;
+        let account = self
+            .account
+            .ok_or_else(|| ConfigError::at(line, "credential is missing account"))?;
+        let secret = self
+            .secret
+            .ok_or_else(|| ConfigError::at(line, "credential is missing secret"))?;
+        Ok((account, secret))
+    }
+}
 
 /// One listed instrument, before validation.
 #[derive(Debug, Default)]
@@ -167,6 +198,15 @@ pub struct Config {
     /// what the retention window actually costs, so a venue refuses to start
     /// rather than being killed under load.
     pub max_feed_memory: u64,
+    /// Whether sessions must prove who they are. Stated explicitly, never
+    /// defaulted: a venue that is open because a key was forgotten looks exactly
+    /// like one that is open on purpose.
+    pub authentication: Mode,
+    /// Account secrets, one per `[credential]` block. Required to be non-empty
+    /// when authentication is required, or nobody could ever connect.
+    pub credentials: Credentials,
+    /// How fast one account may send. None means unlimited, and costs nothing.
+    pub rate_limit: Option<RateLimit>,
     pub instruments: Instruments,
 }
 
@@ -197,8 +237,16 @@ impl Config {
         let mut ack_timeout_ms = None;
         let mut term = None;
         let mut max_feed_memory_mb = None;
+        let mut authentication = None;
+        let mut rate = None;
+        let mut burst = None;
         let mut replicas = Vec::new();
         let mut drafts: Vec<InstrumentDraft> = Vec::new();
+        let mut secrets: Vec<CredentialDraft> = Vec::new();
+        // Which block a key belongs to. Tracked rather than inferred from "is
+        // there an instrument draft yet", which would let a key in a later block
+        // be claimed by an earlier one.
+        let mut section = Section::Global;
 
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
@@ -207,9 +255,18 @@ impl Config {
                 continue;
             }
             if content == "[instrument]" {
+                section = Section::Instrument;
                 drafts.push(InstrumentDraft {
                     line,
                     ..InstrumentDraft::default()
+                });
+                continue;
+            }
+            if content == "[credential]" {
+                section = Section::Credential;
+                secrets.push(CredentialDraft {
+                    line,
+                    ..CredentialDraft::default()
                 });
                 continue;
             }
@@ -229,8 +286,29 @@ impl Config {
                     .map_err(|_| ConfigError::at(line, format!("{name} must be a whole number")))
             };
 
+            if section == Section::Credential
+                && let Some(draft) = secrets.last_mut()
+            {
+                match key {
+                    "account" => {
+                        draft.account = Some(number("account")?);
+                        continue;
+                    }
+                    "secret" => {
+                        draft.secret = Some(
+                            auth::secret_from_hex(value)
+                                .map_err(|why| ConfigError::at(line, why))?,
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
             // Inside an instrument block, instrument keys win.
-            if let Some(draft) = drafts.last_mut() {
+            if section == Section::Instrument
+                && let Some(draft) = drafts.last_mut()
+            {
                 let claimed = match key {
                     "symbol" => {
                         draft.symbol = Some(number("symbol")? as u32);
@@ -278,6 +356,20 @@ impl Config {
                 "term" => term = Some(number("term")?),
                 "max_feed_memory_mb" => max_feed_memory_mb = Some(number("max_feed_memory_mb")?),
                 "replica" => replicas.push(value.to_string()),
+                "authentication" => {
+                    authentication = Some(match value {
+                        "required" => Mode::Required,
+                        "open" => Mode::Open,
+                        other => {
+                            return Err(ConfigError::at(
+                                line,
+                                format!("authentication is `required` or `open`, not `{other}`"),
+                            ));
+                        }
+                    });
+                }
+                "max_commands_per_second" => rate = Some(number("max_commands_per_second")?),
+                "burst_commands" => burst = Some(number("burst_commands")?),
                 // Not ignored. A key nobody reads means the venue is running
                 // with a value the operator thinks they set.
                 other => {
@@ -353,8 +445,66 @@ impl Config {
             )));
         }
 
+        // Stated, never inferred. A venue open because a key was forgotten
+        // reads exactly like one open on purpose, and the two could not be
+        // further apart.
+        let authentication = authentication.ok_or_else(|| {
+            ConfigError::whole_file(
+                "authentication is not set: `required` to make every session prove \
+                 which account it is, or `open` for measurement runs only",
+            )
+        })?;
+        let mut credentials = Credentials::new();
+        for draft in secrets {
+            let (account, secret) = draft.finish()?;
+            credentials.insert(account, secret);
+        }
+        if authentication == Mode::Required && credentials.is_empty() {
+            return Err(ConfigError::whole_file(
+                "authentication is required but no [credential] block is listed, \
+                 so no client could ever connect",
+            ));
+        }
+        if authentication == Mode::Open && !credentials.is_empty() {
+            return Err(ConfigError::whole_file(
+                "credentials are listed but authentication is `open`, so they \
+                 would never be checked",
+            ));
+        }
+
+        // Both or neither: a rate without a burst refuses the opening quotes
+        // every market maker sends, and a burst without a rate never refills.
+        let rate_limit = match (rate, burst) {
+            (Some(rate), Some(burst)) => {
+                let bounded = |value: u64, name: &str| -> Result<u32> {
+                    u32::try_from(value)
+                        .ok()
+                        .filter(|held| *held > 0)
+                        .ok_or_else(|| {
+                            ConfigError::whole_file(format!(
+                                "{name} must be between 1 and {}",
+                                u32::MAX
+                            ))
+                        })
+                };
+                Some(RateLimit::new(
+                    bounded(rate, "max_commands_per_second")?,
+                    bounded(burst, "burst_commands")?,
+                ))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(ConfigError::whole_file(
+                    "max_commands_per_second and burst_commands must be set together",
+                ));
+            }
+        };
+
         Ok(Self {
             listen: listen.unwrap_or_else(|| "127.0.0.1:7070".to_string()),
+            authentication,
+            credentials,
+            rate_limit,
             journal,
             snapshot,
             target_recovery: Duration::from_millis(target_recovery_ms),
@@ -399,8 +549,15 @@ max_records_per_session = 4096
 max_sessions = 4096
 ack_timeout_ms = 250
 max_feed_memory_mb = 64
+authentication = required
+max_commands_per_second = 50000
+burst_commands = 1000
 replica = 10.0.0.2:7100
 replica = 10.0.0.3:7100
+
+[credential]
+account = 1
+secret = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 
 [instrument]
 symbol = 1
@@ -426,12 +583,92 @@ max_open_orders = 1000000
         assert_eq!(config.term, 1, "a term is not required of a lone leader");
         assert_eq!(config.max_feed_memory, 64 * 1024 * 1024);
         assert_eq!(config.replicas, vec!["10.0.0.2:7100", "10.0.0.3:7100"]);
+        assert_eq!(config.authentication, Mode::Required);
+        assert_eq!(config.credentials.len(), 1);
+        let rate = config.rate_limit.expect("a rate limit was configured");
+        assert_eq!(rate.per_second(), 50_000);
+        assert_eq!(rate.burst(), 1_000);
 
+        // The credential block did not swallow the instrument block that follows
+        // it, which is the failure a shared "last draft wins" parser invites.
         let listed: Vec<u32> = config.instruments.iter().map(|i| i.symbol).collect();
         assert_eq!(listed, vec![1]);
         let instrument = config.instruments.get(1).unwrap();
         assert_eq!(instrument.floor_ticks, 10_000);
         assert_eq!(instrument.max_open_orders, 1_000_000);
+    }
+
+    /// Reports what a configuration was refused for, so a test can assert on the
+    /// reason rather than merely that something went wrong.
+    fn refusal(text: &str) -> String {
+        Config::parse(text)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| panic!("the configuration was accepted"))
+    }
+
+    #[test]
+    fn a_venue_cannot_be_open_by_omission() {
+        // The whole point of the setting: leaving it out is an error, because a
+        // venue that is open because a line was forgotten looks exactly like one
+        // that is open on purpose.
+        let text = VALID.replace("authentication = required\n", "");
+        assert!(refusal(&text).contains("authentication is not set"));
+    }
+
+    #[test]
+    fn requiring_authentication_without_credentials_is_refused() {
+        // It would start, listen, challenge every client, and refuse all of
+        // them. Better to fail at startup than to look healthy and serve nobody.
+        let text = VALID.replace(
+            "[credential]\naccount = 1\nsecret = \
+             00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n",
+            "",
+        );
+        assert!(refusal(&text).contains("no [credential] block"));
+    }
+
+    #[test]
+    fn credentials_that_would_never_be_checked_are_refused() {
+        // Reads as though the venue is secured. It is not.
+        let text = VALID.replace("authentication = required", "authentication = open");
+        assert!(refusal(&text).contains("would never be checked"));
+    }
+
+    #[test]
+    fn a_malformed_secret_names_its_line() {
+        let text = VALID.replace(
+            "secret = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            "secret = abc",
+        );
+        let message = refusal(&text);
+        assert!(message.contains("64 hex characters"), "{message}");
+        assert!(message.contains("line"), "{message}");
+    }
+
+    #[test]
+    fn a_rate_without_a_burst_is_refused() {
+        // A rate with no burst refuses the opening quotes every market maker
+        // sends; a burst with no rate never refills. Half a limiter is worse
+        // than none because it looks configured.
+        let text = VALID.replace("burst_commands = 1000\n", "");
+        assert!(refusal(&text).contains("must be set together"));
+        let text = VALID.replace("max_commands_per_second = 50000\n", "");
+        assert!(refusal(&text).contains("must be set together"));
+    }
+
+    #[test]
+    fn no_rate_limit_at_all_is_a_valid_choice() {
+        let text = VALID
+            .replace("max_commands_per_second = 50000\n", "")
+            .replace("burst_commands = 1000\n", "");
+        assert!(Config::parse(&text).unwrap().rate_limit.is_none());
+    }
+
+    #[test]
+    fn an_unspellable_authentication_mode_is_refused() {
+        let text = VALID.replace("authentication = required", "authentication = yes");
+        assert!(refusal(&text).contains("`required` or `open`"));
     }
 
     #[test]

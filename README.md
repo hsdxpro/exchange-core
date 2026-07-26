@@ -121,14 +121,15 @@ crates/engine/     the matching engine. No dependencies, forbid(unsafe_code).
 crates/protocol/   wire records: fixed 64-byte layouts, asserted at compile time.
 crates/journal/    append-only log, replay, replication with term fencing.
 crates/pipeline/   sequencer, accounts, books, events, snapshots.
-crates/gateway/    framing, sessions, group commit, the TCP server, config.
+crates/gateway/    framing, sessions, admission, group commit, the TCP server, config.
 xtask/             the task runner.
 ```
 
-Twelve crates in the lockfile, and the engine has none of them: it forbids
+Thirty-three crates in the lockfile, and the engine has none of them: it forbids
 `unsafe` and depends on nothing. `protocol`, `journal` and `pipeline` use only
-`zerocopy` for fixed-layout casts. `mio` is in `gateway` alone, for readiness
-notification, so nothing on the matching path can reach a dependency.
+`zerocopy` for fixed-layout casts. Everything else — `mio` for readiness, and
+`hmac`/`sha2`/`getrandom` for the challenge — is in `gateway` alone, so nothing
+on the matching path can reach a dependency.
 
 [`DESIGN.md`](DESIGN.md) is the architecture. [`ENGINEERING.md`](ENGINEERING.md)
 is the decisions, what was rejected and why, and the bugs worth remembering.
@@ -163,6 +164,15 @@ recovery mechanism rather than an approximation, and it constrains every feature
 **Nothing is acknowledged before it is durable.** A group's events are released
 only after the commit succeeds. An acknowledgement that has to be retracted is
 worse than one that took longer.
+
+**The secret never crosses the wire.** Taking no TLS is what decides the shape of
+authentication: anything a client *sends* can be captured and replayed, so a
+bearer token or an API key would be worth exactly as much as reading the wire.
+The venue puts a fresh 16-byte nonce on the connection the moment it is accepted
+and the client returns `HMAC-SHA256` of it. What an eavesdropper gets is a nonce
+that will never be issued again and a tag that answers it. A client may pipeline
+its opening orders directly behind the proof, so admission costs one round trip
+rather than two.
 
 **Cancel-on-disconnect is opt-in.** A market maker cannot manage risk it can no
 longer see, so leaving its quotes in the book after its connection dies is
@@ -204,14 +214,11 @@ Scope boundaries, with reasons rather than apologies:
   and untested platform-specific I/O is worse than none — the measurement also
   said the cost was one syscall *per record*, and batching the writes recovered
   8.6× without leaving `std`.
-- **Session authentication.** A session states the account it acts for and is
-  believed. Every other risk check is real; this one is a placeholder, and it is
-  the first thing to build before this meets a network it does not control. The
-  seam is already right — a subscription uses the session's own account and
-  refuses to take one from inside a message — there is just nothing establishing
-  what that account is.
-- **Per-account rate limiting.** The outbox budget sheds a client the venue
-  cannot write *to*; nothing yet bounds one that writes too much.
+- **Encryption.** Authentication proves who a session is at connect; it does not
+  protect the orders after it. On a link an attacker can *write* to, orders can
+  still be injected into an admitted session. That is the accepted cost of
+  taking no TLS, and the answer is a private link — which is the deployment this
+  transport exists for.
 - **Withdrawals and trading halts.** Venue features rather than exchange-core
   ones.
 - **Fees.** The design puts them at settlement so they never touch matching;
@@ -219,7 +226,7 @@ Scope boundaries, with reasons rather than apologies:
 
 ## Correctness
 
-232 tests. The ones worth looking at:
+269 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed

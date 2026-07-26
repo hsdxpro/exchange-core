@@ -12,7 +12,7 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**232 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**269 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
@@ -20,7 +20,7 @@ timing is not evidence of anything.
 | `bx-protocol` | 12 | Record layout, discriminants, order type, subscription channels. |
 | `bx-journal` | 28 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
 | `bx-pipeline` | 56 | Prices, balances, engine adapter, deltas, hashing, snapshots, and the crossable walk's complexity. |
-| `bx-gateway` | 27 | Framing, the group-commit loop, config parsing and validation. |
+| `bx-gateway` | 47 | Framing, the group-commit loop, the HMAC challenge, token buckets, config parsing and validation. |
 | end-to-end | 20 | Full path with simulated traders and a subscriber. |
 | subscription | 7 | Channels, resume after disconnect, lagging out of the window. |
 | snapshot | 6 | Snapshot/restore equality with a full replay, queue priority. |
@@ -30,6 +30,7 @@ timing is not evidence of anything.
 | failover | 2 | Real processes: promotion recovers acked records, no majority means no service. |
 | idle cost | 2 | An idle connection stays under 120 ns a pass. |
 | many clients | 1 | A million accounts, and the memory that costs. |
+| admission | 15 | Real sockets: an unproven order never reaches the book, a captured proof does not open the next connection, a flood is cut to its allowance. |
 
 ### The end-to-end tests matter most
 
@@ -347,21 +348,20 @@ for the reasons above; nothing here should read as shipped until it is.
 
 Ordered by how much it matters.
 
-1. **No session authentication.** A session states the account it is acting for
-   and is believed. Every other risk check is real; this one is a placeholder,
-   and it is the gap that matters most before this meets a network it does not
-   control. `Channel::requested` already refuses to take an account from inside
-   a message and uses the session's own, so the seam is in the right place --
-   there is simply nothing establishing what the session's account *is*.
-2. **No per-account rate limit.** The outbox budget sheds a client the venue
-   cannot write to; nothing bounds one that writes too much.
-3. **`CancelReplace` is cancel-then-submit** and emits both sets of events. It
+1. **Authentication establishes identity at connect and nothing after it.** The
+   session that follows is neither encrypted nor authenticated, so an attacker
+   who can *write* to the wire can still inject orders on an admitted
+   connection. That is the accepted cost of a transport with no TLS, and the
+   answer is a private link rather than a protocol change -- which is the
+   deployment this transport was chosen for. It is listed here because
+   `Authenticated` is the kind of word a reader assumes means more than it does.
+2. **`CancelReplace` is cancel-then-submit** and emits both sets of events. It
    works, but a client sees a `Canceled` it did not ask for.
-4. **`ingress_ns` is a reserved field that is always zero**, and there is no
+3. **`ingress_ns` is a reserved field that is always zero**, and there is no
    `match_ns`. Deliberate: a timestamp taken in the gateway measures our own
    scheduling jitter rather than arrival, so filling it in would look like the
    feature and be a lie.
-5. **openraft's reported 40 ms blocking issue is unverified** against our
+4. **openraft's reported 40 ms blocking issue is unverified** against our
    batching pattern. Measure before committing to it on the data path.
 
 ---

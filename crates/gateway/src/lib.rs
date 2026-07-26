@@ -5,12 +5,16 @@
 //! and the resulting events back into bytes, without the exchange ever learning
 //! what a socket is.
 
+pub mod auth;
 pub mod codec;
 pub mod config;
+pub mod limit;
 pub mod tcp;
 pub mod venue;
 
+pub use auth::{Credentials, Mode as AuthMode};
 pub use codec::{Decoder, FRAME_LEN, encode};
 pub use config::Config;
+pub use limit::RateLimit;
 pub use tcp::Server;
 pub use venue::Venue;

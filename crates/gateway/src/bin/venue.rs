@@ -17,6 +17,7 @@
 //! instrument. That is a measurement setup, not a deployment: an in-memory log
 //! measures the venue, a real file measures the disk.
 
+use bx_gateway::auth::{Credentials, Mode as AuthMode};
 use bx_gateway::config::Config;
 use bx_gateway::tcp::{Server, SnapshotPolicy};
 use bx_journal::{FileLog, JournalError, LogStorage, MemoryLog, ReplicatedLog};
@@ -54,6 +55,11 @@ fn measurement_config() -> Config {
         ack_timeout: Duration::from_millis(250),
         term: 1,
         max_feed_memory: 64 * 1024 * 1024,
+        // Open, and said out loud at startup. This mode exists to point the load
+        // harness at, and a measurement run has no secrets to distribute.
+        authentication: AuthMode::Open,
+        credentials: Credentials::new(),
+        rate_limit: None,
         instruments,
     }
 }
@@ -75,6 +81,29 @@ fn run<S: LogStorage>(config: &Config, storage: S, fresh: bool) -> std::io::Resu
         config.max_records_per_session,
         config.max_sessions,
     )?;
+
+    match config.authentication {
+        AuthMode::Required => {
+            server.require_authentication(config.credentials.clone());
+            println!(
+                "authentication required, {} account(s) credentialled",
+                config.credentials.len()
+            );
+        }
+        // Loud, because the difference between this and a venue that meant to be
+        // open is a line in a file.
+        AuthMode::Open => {
+            println!("AUTHENTICATION OFF: any session may act for any account");
+        }
+    }
+    if let Some(limit) = config.rate_limit {
+        server.rate_limit(limit);
+        println!(
+            "rate limit {}/sec per account, bursting to {}",
+            limit.per_second(),
+            limit.burst()
+        );
+    }
 
     if fresh {
         for account in ACCOUNTS {

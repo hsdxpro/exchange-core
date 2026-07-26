@@ -35,10 +35,10 @@ cross-venue routing, KYC, fee tiers.
                                          ACK RELEASED
 ```
 
-Two gateway stages named in earlier drafts of this diagram are **not built**:
-authentication and per-account rate limiting. Both belong before the sequencer,
-which is why neither can reach the deterministic path — but neither exists, and a
-diagram that shows them is a diagram that lies.
+The gateway also guards admission: a session proves which account it acts for before it may
+send anything, and each account has a send allowance. Both sit *before* the sequencer, so
+neither a key lookup nor a clock reading can reach the deterministic path, and a command
+that is refused or throttled is never sequenced — replay never has to ask what time it was.
 
 One rule holds the whole thing together: **everything after the sequencer is a
 deterministic function of the sequenced stream.** No clock reads, no randomness, no
@@ -118,13 +118,18 @@ with an explicit, counted, observable policy.
 
 Applied at the risk stage, before matching, in this order:
 
-1. Account exists. **Session authorisation is not built** — a session states its account
-   and is believed. Every check below is real; this one is a placeholder, and it is the
-   first thing to build before this faces a network it does not control.
-2. Order is inside the price band. The instrument's ladder range *is* the band, so the
+1. The session proved which account it acts for, by signing a nonce the venue issued on
+   connect. Nothing else is accepted until it has — not an order, not a subscription.
+2. The account is inside its send allowance. A token bucket per account, refilled once per
+   pass rather than once per command, so a flood is discarded before it is sequenced.
+3. Order is inside the price band. The instrument's ladder range *is* the band, so the
    memory bound and the fat-finger control are one mechanism rather than two.
-3. Sufficient free balance; reserve it.
-4. Order count under the instrument's `max_open_orders` cap.
+4. Sufficient free balance; reserve it.
+5. Order count under the instrument's `max_open_orders` cap.
+
+The first two happen in the gateway, ahead of the sequencer. That is not incidental: a key
+lookup, a nonce and a clock reading must never reach the deterministic path, or replay
+stops reproducing state.
 
 Self-trade prevention runs inside the matching engine, because only the engine sees both
 sides of a potential match. Default cancel-newest: the resting order survives and the
@@ -245,7 +250,7 @@ reality.
 | Matching path | one thread, no async runtime | thread pinning, symbol shards |
 | Encoding | fixed 64-byte records via `zerocopy` | — |
 | Transport | TCP, unencrypted, `mio` readiness | raw UDP or shm for colo |
-| Gateway | sessions, framing, group commit | authentication, per-account rate limits |
+| Gateway | sessions, framing, group commit, HMAC challenge, per-account rate limits | — |
 | Durability | group commit; quorum to followers, fenced by term | — |
 | Consensus | none: safe promotion, but no election | `openraft`, on a leadership log |
 | Journal I/O | buffered `std`, one write and one sync per group | `io_uring`, SQPOLL |
@@ -254,7 +259,7 @@ reality.
 
 Dependencies sit at the edge deliberately. The engine has none, `protocol`/`journal`/
 `pipeline` use only `zerocopy`, and everything the transport needs lives in `gateway` — so
-none of the twelve crates in the lockfile can reach the matching path.
+none of the thirty-three crates in the lockfile can reach the matching path.
 
 Two of the intended choices were deliberately deferred, with reasons in
 [`ENGINEERING.md`](ENGINEERING.md). **`openraft`** because an openraft entry is

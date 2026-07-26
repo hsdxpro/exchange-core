@@ -45,14 +45,18 @@
 //! The same thing happens if a client falls outside the retention window, which
 //! is what makes falling behind recoverable instead of fatal.
 
+use crate::auth::{self, Credentials, Mode};
 use crate::codec::{Decoder, FRAME_LEN, encode};
+use crate::limit::{Bucket, RateLimit};
 use crate::venue::Venue;
 use bx_journal::LogStorage;
+use bx_pipeline::fastmap::FastMap;
 use bx_pipeline::hub::{Channel, Resume};
 use bx_pipeline::instrument::Instruments;
 use bx_pipeline::snapshot::Snapshot;
 use bx_protocol::{
-    AccountId, Command, CommandKind, Event, EventKind, Sequence, Side, SymbolId, Ticks,
+    AccountId, CHALLENGE_LEN, Command, CommandKind, Event, EventKind, RejectReason, Sequence, Side,
+    SymbolId, Ticks,
 };
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
@@ -60,7 +64,7 @@ use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One connected client.
 #[derive(Debug)]
@@ -77,8 +81,15 @@ struct Session {
     max_outbox: usize,
     /// Channels this session follows, and where it has read to.
     cursors: Vec<(Channel, Sequence)>,
-    /// Set by the first command, which is how a session declares who it is.
+    /// Who this session may act for. Proved against a challenge when the venue
+    /// requires authentication, and taken from the first command when it does
+    /// not.
     account: Option<AccountId>,
+    /// The nonce this session must sign, while it still owes an answer.
+    ///
+    /// `Some` means nothing but `Authenticate` is accepted. Cleared once the
+    /// proof checks out, so the ordinary path costs one `Option` test.
+    challenge: Option<[u8; CHALLENGE_LEN]>,
     /// Cancel this account's resting orders when the connection goes.
     ///
     /// Per session, and scoped to the account: two sessions on one account should
@@ -97,8 +108,38 @@ struct Session {
     open: bool,
 }
 
+/// One account's send allowance, shared by every session trading as it.
+#[derive(Clone, Copy, Debug)]
+struct Allowance {
+    bucket: Bucket,
+    /// Live sessions on this account. The entry goes when this reaches zero.
+    sessions: u32,
+}
+
 /// The listener's token. Sessions take `index + 1`, so zero is never a session.
 const LISTENER: Token = Token(0);
+
+/// Tells one client its command was refused before the venue ever saw it.
+///
+/// No sequence, because it never entered the stream: this is the gateway
+/// speaking, not the exchange. A refusal is always sent rather than the command
+/// silently dropped — a client that is told nothing retries forever.
+fn refused_locally(command: &Command, reason: RejectReason) -> Event {
+    Event {
+        sequence: 0,
+        cause_sequence: 0,
+        account: command.account,
+        order_id: command.order_id,
+        counterparty_order_id: 0,
+        quantity: command.quantity,
+        price: command.price,
+        symbol: command.symbol,
+        kind: EventKind::Rejected as u8,
+        side: command.side,
+        reject_reason: reason as u8,
+        _pad: [0; 1],
+    }
+}
 
 fn session_token(index: usize) -> Token {
     Token(index + 1)
@@ -109,7 +150,12 @@ fn session_index(token: Token) -> Option<usize> {
 }
 
 impl Session {
-    fn new(stream: TcpStream, max_records: usize, max_outbox: usize) -> Self {
+    fn new(
+        stream: TcpStream,
+        max_records: usize,
+        max_outbox: usize,
+        challenge: Option<[u8; CHALLENGE_LEN]>,
+    ) -> Self {
         Self {
             stream,
             decoder: Decoder::new(max_records),
@@ -117,10 +163,16 @@ impl Session {
             max_outbox,
             cursors: Vec::new(),
             account: None,
+            challenge,
             cancel_on_disconnect: false,
             queued: false,
             open: true,
         }
+    }
+
+    /// True while the session still owes proof of who it is.
+    const fn unproven(&self) -> bool {
+        self.challenge.is_some()
     }
 
     /// Adds a channel this session will be sent, from the position it is at now.
@@ -306,6 +358,25 @@ pub struct Server<S: LogStorage> {
     /// recover and no less correct.
     snapshots: Option<(SnapshotPolicy, PathBuf)>,
     refused: u64,
+    /// Whether a session must prove who it is, and the secrets it proves
+    /// against. `Open` is for measurement; it is stated in the configuration
+    /// rather than defaulted, so a venue is never open by accident.
+    mode: Mode,
+    credentials: Credentials,
+    /// Sessions dropped for failing to prove who they are, and commands
+    /// discarded for exceeding an allowance. Both are the shape of an attack as
+    /// much as a bug, so they are counted rather than merely acted on.
+    rejected_proofs: u64,
+    throttled: u64,
+    /// How fast one session may send. `None` disables the check entirely, so a
+    /// venue that does not want it pays nothing for it.
+    rate: Option<RateLimit>,
+    /// One allowance per account rather than per connection, so opening ten
+    /// sessions does not buy ten times the rate. Held here rather than on the
+    /// session for that reason, and dropped when an account's last session goes,
+    /// so the table tracks connected accounts rather than every account ever
+    /// seen.
+    allowances: FastMap<AccountId, Allowance>,
     /// Reused across passes so a steady-state loop allocates nothing.
     inbound: Vec<Command>,
     outbound: Vec<Event>,
@@ -368,8 +439,41 @@ impl<S: LogStorage> Server<S> {
             max_outbox: retained_per_channel * FRAME_LEN,
             snapshots: None,
             refused: 0,
+            mode: Mode::Open,
+            credentials: Credentials::new(),
+            rejected_proofs: 0,
+            throttled: 0,
+            rate: None,
+            allowances: FastMap::default(),
         };
         Ok(server)
+    }
+
+    /// Requires every session to prove which account it acts for.
+    ///
+    /// Until this is called the venue is open: a session states its account and
+    /// is believed. That is a measurement setting, and the configuration has to
+    /// name it explicitly so it is never reached by omission.
+    pub fn require_authentication(&mut self, credentials: Credentials) {
+        self.mode = Mode::Required;
+        self.credentials = credentials;
+    }
+
+    /// Bounds how fast one session may send. Unset means unlimited.
+    pub const fn rate_limit(&mut self, limit: RateLimit) {
+        self.rate = Some(limit);
+    }
+
+    /// Sessions dropped for failing to prove who they are.
+    #[must_use]
+    pub const fn rejected_proofs(&self) -> u64 {
+        self.rejected_proofs
+    }
+
+    /// Commands discarded for exceeding an account's allowance.
+    #[must_use]
+    pub const fn throttled(&self) -> u64 {
+        self.throttled
     }
 
     /// # Errors
@@ -497,6 +601,11 @@ impl<S: LogStorage> Server<S> {
         }
 
         self.inbound.clear();
+        // One clock reading for the whole pass, not one per command. A client
+        // that sent a thousand orders in a single write refills its bucket
+        // against this one `Instant::now()`; the per-command cost is a compare
+        // and a decrement. Skipped entirely when nothing is rate limited.
+        let now = self.rate.map(|_| Instant::now());
         for index in ready {
             let start = self.inbound.len();
             let Some(session) = self.sessions.get_mut(index).and_then(Option::as_mut) else {
@@ -513,12 +622,24 @@ impl<S: LogStorage> Server<S> {
                 continue;
             }
 
-            // Attribute each session's account from its *own* first command.
-            // Reading everyone into one buffer first and then handing accounts
-            // out would give a session whoever happened to be at the front.
-            if session.account.is_none()
+            // Nothing from a session that has not proved who it is reaches the
+            // venue -- not an order, not even a subscription.
+            if session.unproven() {
+                self.admit(index, start);
+                let ready = self.sessions[index]
+                    .as_ref()
+                    .is_some_and(|session| session.open && !session.unproven());
+                if !ready {
+                    continue;
+                }
+            } else if session.account.is_none()
                 && let Some(command) = self.inbound.get(start)
             {
+                // Attribute each session's account from its *own* first command.
+                // Reading everyone into one buffer first and then handing
+                // accounts out would give a session whoever happened to be at
+                // the front. Reachable only when the venue runs open: an
+                // authenticated session already knows who it is.
                 let account = command.account;
                 session.account = Some(account);
                 // A session always gets its own private feed; it has to ask for
@@ -526,6 +647,13 @@ impl<S: LogStorage> Server<S> {
                 let channel = Channel::Account(account);
                 let from = self.venue.subscribe(channel);
                 self.session_at(index).follow(channel, from);
+                self.claim_allowance(account, now);
+            }
+
+            // Discarded here, before sequencing, so a flood never reaches the
+            // journal and replay never has to ask what time it was.
+            if let (Some(limit), Some(now)) = (self.rate, now) {
+                self.throttle(index, start, limit, now);
             }
 
             // Control messages belong to the connection, not the venue. Taking
@@ -563,6 +691,121 @@ impl<S: LogStorage> Server<S> {
             .expect("a ready token names a live session")
     }
 
+    /// Lets a session act only once it has proved which account it is.
+    ///
+    /// Works in place over the session's own slice of the group, so a client may
+    /// pipeline its opening orders directly behind the proof — which a market
+    /// maker will, having already spent one round trip collecting the challenge.
+    /// Everything before the proof is refused *with a reason*: a client told
+    /// nothing retries forever.
+    ///
+    /// A wrong proof closes the connection rather than allowing another attempt.
+    /// Retrying costs a reconnect and a fresh nonce, which makes guessing a tag
+    /// pointless without slowing an honest client that has the secret.
+    fn admit(&mut self, index: usize, start: usize) {
+        loop {
+            // Re-read each time: the previous iteration may have proved the
+            // session, and everything after that point is ordinary traffic that
+            // the rest of the pass handles normally.
+            let Some(challenge) = self.sessions[index].as_ref().and_then(|s| s.challenge) else {
+                return;
+            };
+            if start >= self.inbound.len() {
+                return;
+            }
+            let command = self.inbound.remove(start);
+            if command.kind() != Some(CommandKind::Authenticate) {
+                let session = self.session_at(index);
+                encode(
+                    &refused_locally(&command, RejectReason::NotAuthenticated),
+                    &mut session.outbox,
+                );
+                continue;
+            }
+            if !self
+                .credentials
+                .verifies(command.account, &challenge, &command.proof())
+            {
+                self.rejected_proofs += 1;
+                let session = self.session_at(index);
+                encode(
+                    &refused_locally(&command, RejectReason::NotAuthenticated),
+                    &mut session.outbox,
+                );
+                // The write pass runs before the session is dropped, so the
+                // client is told why rather than seeing a bare disconnect.
+                session.open = false;
+                self.closing.push(index);
+                self.inbound.truncate(start);
+                return;
+            }
+
+            let account = command.account;
+            let session = self.session_at(index);
+            session.challenge = None;
+            session.account = Some(account);
+            encode(
+                &Event {
+                    account,
+                    kind: EventKind::Authenticated as u8,
+                    ..Event::default()
+                },
+                &mut session.outbox,
+            );
+            let channel = Channel::Account(account);
+            let from = self.venue.subscribe(channel);
+            self.session_at(index).follow(channel, from);
+            self.claim_allowance(account, Some(Instant::now()));
+        }
+    }
+
+    /// Attaches this session to its account's allowance, creating it if this is
+    /// the account's first connection.
+    fn claim_allowance(&mut self, account: AccountId, now: Option<Instant>) {
+        let (Some(limit), Some(now)) = (self.rate, now) else {
+            return;
+        };
+        self.allowances
+            .entry(account)
+            .and_modify(|held| held.sessions += 1)
+            .or_insert_with(|| Allowance {
+                bucket: Bucket::new(limit, now),
+                sessions: 1,
+            });
+    }
+
+    /// Drops whatever this session sent beyond its account's allowance.
+    ///
+    /// The bucket is refilled once here rather than once per command, which is
+    /// the whole reason the clock is read at the top of the pass.
+    fn throttle(&mut self, index: usize, start: usize, limit: RateLimit, now: Instant) {
+        let Some(account) = self.sessions[index].as_ref().and_then(|s| s.account) else {
+            return;
+        };
+        let Some(allowance) = self.allowances.get_mut(&account) else {
+            return;
+        };
+        allowance.bucket.refill(limit, now);
+
+        let mut cursor = start;
+        let mut discarded = 0_u64;
+        while cursor < self.inbound.len() {
+            if allowance.bucket.take() {
+                cursor += 1;
+                continue;
+            }
+            let command = self.inbound.remove(cursor);
+            discarded += 1;
+            if let Some(session) = self.sessions[index].as_mut() {
+                encode(
+                    &refused_locally(&command, RejectReason::RateLimited),
+                    &mut session.outbox,
+                );
+            }
+        }
+        self.throttled += discarded;
+    }
+
     /// Deregisters and forgets whatever closed this pass.
     ///
     /// Works from the list built while sessions were being visited, so a pass
@@ -575,10 +818,21 @@ impl<S: LogStorage> Server<S> {
         for index in std::mem::take(&mut self.closing) {
             if let Some(mut session) = self.sessions[index].take() {
                 let _ = self.poll.registry().deregister(&mut session.stream);
-                if session.cancel_on_disconnect
-                    && let Some(account) = session.account
-                {
-                    withdraw.push(account);
+                if let Some(account) = session.account {
+                    if session.cancel_on_disconnect {
+                        withdraw.push(account);
+                    }
+                    // The allowance outlives any one session but not the
+                    // account's last, or the table would grow with every client
+                    // that ever connected.
+                    if let std::collections::hash_map::Entry::Occupied(mut held) =
+                        self.allowances.entry(account)
+                    {
+                        held.get_mut().sessions -= 1;
+                        if held.get().sessions == 0 {
+                            held.remove();
+                        }
+                    }
                 }
                 self.free.push(index);
                 self.live -= 1;
@@ -709,8 +963,21 @@ impl<S: LogStorage> Server<S> {
                         continue;
                     }
                     let _ = stream.set_nodelay(true);
-                    let session =
-                        Session::new(stream, self.max_records_per_session, self.max_outbox);
+                    // A fresh nonce per connection, which is what makes a
+                    // captured proof worthless against the next one.
+                    let challenge = (self.mode == Mode::Required).then(auth::nonce);
+                    let mut session = Session::new(
+                        stream,
+                        self.max_records_per_session,
+                        self.max_outbox,
+                        challenge,
+                    );
+                    // Queued before the client has said anything: it cannot
+                    // prove who it is until it knows what to sign.
+                    if let Some(nonce) = challenge {
+                        encode(&Event::challenging(nonce), &mut session.outbox);
+                        session.flush();
+                    }
                     if index == self.sessions.len() {
                         self.sessions.push(Some(session));
                     } else {

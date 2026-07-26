@@ -352,6 +352,12 @@ impl<S: LogStorage> Exchange<S> {
             | CommandKind::CancelOnDisconnect => {
                 self.reject(&command, RejectReason::UnsupportedTimeInForce);
             }
+            // Authentication happens in the gateway, before sequencing, and a
+            // proof in the journal would mean a secret had been written to disk
+            // and replayed on every recovery. Refused here as the last barrier.
+            CommandKind::Authenticate => {
+                self.reject(&command, RejectReason::NotAuthenticated);
+            }
             CommandKind::Deposit => self.accounts.deposit(
                 command.account,
                 command.deposit_asset(),
