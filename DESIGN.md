@@ -17,8 +17,8 @@ subscriptions with gap recovery, replicated journal, crash recovery by replay, a
 that is safe and complete in execution — a promoted node catches up to a majority before it
 serves, and term fencing stops a replaced leader writing.
 
-**Deciding** *when* to promote and *whom* is the piece that is not built: that needs
-consensus, and it is §3.
+**Deciding** *when* to promote and *whom* is `openraft`, on a leadership log the orders
+never enter — §3.
 
 **Out:** settlement and withdrawal, margin and liquidation, auctions, hidden orders,
 cross-venue routing, KYC, fee tiers.
@@ -315,7 +315,7 @@ custom transport becomes the bottleneck.
 | One journal node dies | majority continues; degraded and alarmed |
 | A partition panics | deliberate abort with a state dump, restart from snapshot + replay. The other partitions are untouched, which is the point of them being processes |
 | Subscriber falls behind | ring overwrites, subscriber sees the gap and re-snapshots |
-| Client floods | **not built.** A per-account rate limit belongs at the gateway, before sequencing. What exists is the per-session outbox budget, which sheds a client the venue cannot write *to* — not one that writes too much |
+| Client floods | A token bucket per account at the gateway, before sequencing, so a discarded command is never journalled. Separately, the per-session outbox budget sheds a client the venue cannot write *to*, which is the opposite failure |
 | Order outside price band | rejected at the risk stage |
 | Self-match | cancel-newest; the resting order survives |
 

@@ -6,7 +6,7 @@
 //! here. A cluster that failed over once an hour for a year would hold nine
 //! thousand entries of about a hundred bytes.
 //!
-//! So the log is held in memory and persisted by rewriting one small file,
+//! So the log is  in memory and persisted by rewriting one small file,
 //! rather than by an append format with its own torn-write recovery. The
 //! command log needs all of that and has it; copying it here would be several
 //! hundred lines defending against a file that never grows.
@@ -98,13 +98,6 @@ impl Store {
                 snapshot_index: 0,
             })),
         })
-    }
-
-    /// The node the cluster currently agrees is leader, as this node's state
-    /// machine has it.
-    #[must_use]
-    pub fn leader(&self) -> NodeId {
-        self.inner.lock().map_or(0, |held| held.state.held.leader)
     }
 }
 

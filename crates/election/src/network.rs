@@ -46,6 +46,9 @@ enum Reply {
 /// snapshot of a one-integer state machine is smaller still.
 const MAX_MESSAGE: u32 = 1 << 20;
 
+/// How long to wait before accepting again after the listener refuses.
+const ACCEPT_SETBACK: std::time::Duration = std::time::Duration::from_millis(100);
+
 async fn write_framed<T: Serialize>(stream: &mut TcpStream, value: &T) -> std::io::Result<()> {
     let body = serde_json::to_vec(value)?;
     let length = u32::try_from(body.len())
@@ -94,7 +97,6 @@ impl RaftNetworkFactory<Leadership> for Network {
 
     async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Self::Network {
         Peer {
-            target,
             address: self.address_of(target).unwrap_or_default(),
             stream: None,
         }
@@ -104,7 +106,6 @@ impl RaftNetworkFactory<Leadership> for Network {
 /// One peer, and the connection to it.
 #[derive(Debug)]
 pub struct Peer {
-    target: NodeId,
     address: String,
     stream: Option<TcpStream>,
 }
@@ -118,14 +119,13 @@ impl Peer {
     /// for that decision, not a retry loop buried in the transport.
     async fn exchange(&mut self, request: &Rpc) -> Result<Reply, std::io::Error> {
         for attempt in 0..2 {
-            if self.stream.is_none() {
-                self.stream = Some(TcpStream::connect(&self.address).await?);
-                if let Some(stream) = &self.stream {
+            let stream = match self.stream.as_mut() {
+                Some(stream) => stream,
+                None => {
+                    let stream = TcpStream::connect(&self.address).await?;
                     let _ = stream.set_nodelay(true);
+                    self.stream.insert(stream)
                 }
-            }
-            let Some(stream) = self.stream.as_mut() else {
-                continue;
             };
             match write_framed(stream, request).await {
                 Ok(()) => match read_framed(stream).await {
@@ -142,14 +142,15 @@ impl Peer {
 }
 
 /// Turns a transport failure into the shape openraft expects.
-fn unreachable<E: std::error::Error + 'static, T>(
-    target: NodeId,
-    error: &E,
-) -> RPCError<NodeId, BasicNode, T>
+///
+/// `Unreachable` rather than `Network`: it tells openraft to back off before
+/// trying this peer again, which is the right answer for a node that is down.
+/// Reporting a plain network error instead would have it retry immediately and
+/// keep a dead peer permanently in the hot path.
+fn unreachable<E: std::error::Error + 'static, T>(error: &E) -> RPCError<NodeId, BasicNode, T>
 where
     T: std::error::Error,
 {
-    let _ = target;
     RPCError::Unreachable(Unreachable::new(error))
 }
 
@@ -164,7 +165,7 @@ impl RaftNetwork<Leadership> for Peer {
             Ok(other) => Err(RPCError::Network(NetworkError::new(
                 &std::io::Error::other(format!("peer answered an append with {other:?}")),
             ))),
-            Err(e) => Err(unreachable(self.target, &e)),
+            Err(e) => Err(unreachable(&e)),
         }
     }
 
@@ -178,7 +179,7 @@ impl RaftNetwork<Leadership> for Peer {
             Ok(other) => Err(RPCError::Network(NetworkError::new(
                 &std::io::Error::other(format!("peer answered a vote with {other:?}")),
             ))),
-            Err(e) => Err(unreachable(self.target, &e)),
+            Err(e) => Err(unreachable(&e)),
         }
     }
 
@@ -195,7 +196,7 @@ impl RaftNetwork<Leadership> for Peer {
             Ok(other) => Err(RPCError::Network(NetworkError::new(
                 &std::io::Error::other(format!("peer answered a snapshot with {other:?}")),
             ))),
-            Err(e) => Err(unreachable(self.target, &e)),
+            Err(e) => Err(unreachable(&e)),
         }
     }
 }
@@ -207,8 +208,16 @@ impl RaftNetwork<Leadership> for Peer {
 /// election that does not finish.
 pub async fn serve(listener: TcpListener, raft: Raft<Leadership>) {
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            continue;
+        let (mut stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            // Descriptors exhausted, or a listener that has gone bad. Retrying
+            // instantly would burn a core on a condition that needs time or an
+            // operator, and this node still has to answer votes when it clears
+            // -- so it waits rather than either spinning or giving up.
+            Err(_) => {
+                tokio::time::sleep(ACCEPT_SETBACK).await;
+                continue;
+            }
         };
         let raft = raft.clone();
         tokio::spawn(async move {

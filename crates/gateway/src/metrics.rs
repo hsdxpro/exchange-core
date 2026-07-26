@@ -23,10 +23,10 @@
 //! Counters are increments on paths that are already branching, so those are
 //! exact.
 //!
-//! The histogram is log-linear: a power-of-two bucket with four linear steps
-//! inside it: thirty-two steps, so the worst relative error is one part in
-//! thirty-two, about 3%. Recording is a leading-zero count, a shift and an
-//! increment: no branches on the value, no division.
+//! The histogram is log-linear: a power-of-two bucket split into thirty-two
+//! linear steps, so the worst relative error is one part in thirty-two, about
+//! 3%. Recording is a leading-zero count, a shift and an increment — no branches
+//! on the value, no division.
 
 use std::time::Duration;
 
@@ -46,7 +46,6 @@ const SAMPLE_EVERY: u64 = 64;
 pub struct Histogram {
     buckets: [u64; BUCKETS],
     count: u64,
-    sum: u64,
     max: u64,
 }
 
@@ -55,7 +54,6 @@ impl Default for Histogram {
         Self {
             buckets: [0; BUCKETS],
             count: 0,
-            sum: 0,
             max: 0,
         }
     }
@@ -89,7 +87,6 @@ impl Histogram {
         let index = Self::bucket(value);
         self.buckets[index] += 1;
         self.count += 1;
-        self.sum = self.sum.saturating_add(value);
         if value > self.max {
             self.max = value;
         }
@@ -103,14 +100,6 @@ impl Histogram {
     #[must_use]
     pub const fn max(&self) -> u64 {
         self.max
-    }
-
-    #[must_use]
-    pub const fn mean(&self) -> u64 {
-        if self.count == 0 {
-            return 0;
-        }
-        self.sum / self.count
     }
 
     /// The value at `fraction` of the distribution, 0.0 to 1.0.
@@ -350,8 +339,8 @@ mod tests {
     fn an_empty_histogram_reports_zero_rather_than_dividing_by_it() {
         let held = Histogram::default();
         assert_eq!(held.percentile(0.99), 0);
-        assert_eq!(held.mean(), 0);
         assert_eq!(held.count(), 0);
+        assert_eq!(held.max(), 0);
     }
 
     #[test]

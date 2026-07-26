@@ -98,7 +98,6 @@ fn listed(config: &Config) -> Instruments {
 fn run<S: LogStorage>(
     config: &Config,
     storage: S,
-    fresh: bool,
     leadership: Option<&Leadership>,
 ) -> std::io::Result<()> {
     let mut server = Server::bind(
@@ -137,7 +136,19 @@ fn run<S: LogStorage>(
         );
     }
 
-    if fresh {
+    // Recover first, always, and let the recovered state say whether this venue
+    // has a history rather than asking whether a file happened to exist.
+    //
+    // Asking the file was wrong in the one case that matters most. A promoted
+    // node opens a journal that did not exist a moment ago, then `catch_up`
+    // fills it from a majority — so "the file was missing" was true and "this
+    // venue is new" was false, and the node funded fresh accounts and served
+    // with empty books while holding every record the dead leader had
+    // acknowledged. It had recovered the data and thrown away the state.
+    let replayed = server.recover(config.snapshot.as_deref())?;
+    if server.venue().exchange().next_sequence() == 0 {
+        // Nothing has ever happened here, by any route: no journal, no
+        // snapshot, nothing caught up. Only then is this a new venue.
         for account in ACCOUNTS {
             for instrument in config.instruments.iter() {
                 for asset in [instrument.base, instrument.quote] {
@@ -149,8 +160,10 @@ fn run<S: LogStorage>(
             }
         }
     } else {
-        let replayed = server.recover(config.snapshot.as_deref())?;
-        println!("recovered {replayed} commands");
+        println!(
+            "recovered {replayed} commands, at sequence {}",
+            server.venue().exchange().next_sequence()
+        );
     }
 
     if let Some(path) = config.snapshot.clone() {
@@ -227,19 +240,17 @@ fn start(config: &Config, term: u64, leadership: Option<&Leadership>) -> std::io
 
     match config.journal.as_deref() {
         Some(path) => {
-            let fresh = !path.exists();
             let log = FileLog::open(path).map_err(other)?;
             if config.replicas.is_empty() {
-                run(config, log, fresh, leadership)
+                run(config, log, leadership)
             } else {
-                run(config, promoted(config, log, term)?, fresh, leadership)
+                run(config, promoted(config, log, term)?, leadership)
             }
         }
-        None if config.replicas.is_empty() => run(config, MemoryLog::new(), true, leadership),
+        None if config.replicas.is_empty() => run(config, MemoryLog::new(), leadership),
         None => run(
             config,
             promoted(config, MemoryLog::new(), term)?,
-            true,
             leadership,
         ),
     }

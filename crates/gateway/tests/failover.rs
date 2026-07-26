@@ -169,9 +169,14 @@ fn records(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |m| m.len().saturating_sub(MAGIC_LEN) / RECORD_LEN)
 }
 
-/// Sends `count` resting orders and waits until each is acknowledged, so the test
-/// only measures what a client was actually told.
-fn trade(address: &str, count: u64) -> u64 {
+/// Sends `count` resting orders numbered from `first`, and waits until each is
+/// acknowledged, so the test only counts what a client was actually told.
+///
+/// The starting ID matters after a promotion: the replacement really does hold
+/// the dead leader's resting orders, so reusing their IDs is a duplicate rather
+/// than a new order. That is the venue being right, and a test that reuses them
+/// reads it as the venue being broken.
+fn trade_from(address: &str, first: u64, count: u64) -> u64 {
     use bx_gateway::codec::{FRAME_LEN, encode};
     use bx_pipeline::limit_order;
     use bx_protocol::{Event, EventKind, Side};
@@ -186,7 +191,7 @@ fn trade(address: &str, count: u64) -> u64 {
     let mut bytes = Vec::new();
     for i in 0..count {
         encode(
-            &limit_order(1, 1, i + 1, Side::Bid, 10_000 + (i % 4_000) as i64, 1),
+            &limit_order(1, 1, first + i, Side::Bid, 10_000 + (i % 4_000) as i64, 1),
             &mut bytes,
         );
     }
@@ -216,6 +221,10 @@ fn trade(address: &str, count: u64) -> u64 {
         partial = filled - whole * FRAME_LEN;
     }
     acknowledged
+}
+
+fn trade(address: &str, count: u64) -> u64 {
+    trade_from(address, 1, count)
 }
 
 #[test]
@@ -319,10 +328,73 @@ fn a_promoted_node_recovers_what_the_dead_leader_acknowledged() {
 
     // And it is a working venue, not just a copy of a log.
     assert_eq!(
-        trade("127.0.0.1:7402", 100),
+        trade_from("127.0.0.1:7402", 900_000, 100),
         100,
         "the promoted node does not accept new orders"
     );
+
+    // The assertion that matters, and the one this test did not make for a long
+    // time: the promoted node must have the dead leader's *book*, not merely its
+    // bytes. It held every record and served with empty books, because
+    // freshness was decided by whether the journal file had existed a moment
+    // before `catch_up` created and filled it. Counting records on disk cannot
+    // see that; asking the venue what is resting can.
+    let mut client = TcpStream::connect("127.0.0.1:7402").unwrap();
+    client.set_nodelay(true).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let resting = book_levels(&mut client);
+    assert!(
+        resting >= 100,
+        "the promoted node's book holds {resting} price levels. It recovered \
+         {recovered} records and then did not replay them, so it is serving an \
+         empty market while holding every order a client was told about."
+    );
+}
+
+/// Price levels the venue reports when a client starts following the book.
+fn book_levels(stream: &mut TcpStream) -> usize {
+    use bx_gateway::codec::{FRAME_LEN, encode};
+    use bx_pipeline::subscribe;
+    use bx_protocol::{ChannelKind, Event, EventKind};
+    use zerocopy::FromBytes;
+
+    let mut bytes = Vec::new();
+    encode(&subscribe(1, 1, ChannelKind::Book), &mut bytes);
+    stream.write_all(&bytes).unwrap();
+
+    let mut scratch = vec![0_u8; FRAME_LEN * 512];
+    let mut filled = 0;
+    let mut levels = 0;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let Ok(read) = stream.read(&mut scratch[filled..]) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        filled += read;
+        let whole = filled / FRAME_LEN;
+        for index in 0..whole {
+            let start = index * FRAME_LEN;
+            if let Ok(event) = Event::read_from_bytes(&scratch[start..start + FRAME_LEN])
+                && event.kind == EventKind::BookSnapshot as u8
+            {
+                levels += 1;
+            }
+        }
+        scratch.copy_within(whole * FRAME_LEN..filled, 0);
+        filled -= whole * FRAME_LEN;
+        if filled + FRAME_LEN > scratch.len() {
+            filled = 0;
+        }
+    }
+    levels
 }
 
 #[test]
@@ -529,9 +601,15 @@ fn a_cluster_elects_its_own_leader_and_replaces_it_without_a_person() {
          leader's {first_term}"
     );
 
-    // And it is a working venue, not merely a process that opened a port.
+    // And it is a working venue, not merely a process that opened a port. Fresh
+    // order IDs, because the replacement genuinely holds the dead leader's
+    // resting orders and reusing theirs is a duplicate rather than a new order.
     assert_eq!(
-        trade(&format!("127.0.0.1:{}", client_ports[replacement]), 50),
+        trade_from(
+            &format!("127.0.0.1:{}", client_ports[replacement]),
+            900_000,
+            50
+        ),
         50,
         "the replacement does not accept orders"
     );

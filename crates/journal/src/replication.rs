@@ -13,12 +13,16 @@
 //! so replacing "durable" with "a quorum has it" changes nothing above:
 //! `Exchange<ReplicatedLog<FileLog>>` needs no pipeline changes at all.
 //!
-//! What this deliberately does **not** do is elect a leader. Failover requires
-//! consensus, hand-rolled consensus is how distributed systems lose data
-//! quietly, and the right answer is a reviewed implementation such as
-//! `openraft` rather than a few hundred lines written here. What this does give
-//! is the durability and throughput half — the part the measurement showed
-//! matters — with an explicit boundary where the election belongs.
+//! What this deliberately does **not** do is elect a leader, and that is a
+//! boundary rather than a gap: `bx-election` does it, on a separate leadership
+//! log that no order ever enters. This half is durability and throughput; that
+//! half is consensus. Keeping them apart is what lets the command log stay a
+//! fixed 64-byte record with zero-copy replay, which routing it through a
+//! consensus implementation would cost.
+//!
+//! The two meet at the **term**. Whatever elects a leader hands it one, and Raft
+//! guarantees at most one leader per term — so a term is a fencing token by
+//! construction, and this file only has to enforce it.
 //!
 //! It does, however, **fence**. Every group carries the leader's term, and a
 //! follower refuses anything from a term older than the highest it has seen. That
@@ -229,15 +233,6 @@ impl<L: LogStorage> ReplicatedLog<L> {
     #[must_use]
     pub fn live_followers(&self) -> usize {
         self.followers.iter().filter(|f| f.live).count()
-    }
-
-    /// True once a follower has reported a newer term.
-    ///
-    /// A deposed leader must stop: it cannot reach a quorum any more, and
-    /// pretending otherwise would acknowledge orders the cluster has not kept.
-    #[must_use]
-    pub const fn deposed(&self) -> bool {
-        self.deposed
     }
 
     #[must_use]
@@ -975,8 +970,9 @@ mod tests {
     fn a_replaced_leader_is_refused_and_learns_that_it_was() {
         // The failure fencing exists to prevent: a leader that has been replaced
         // keeps writing, and followers accept it, so two leaders acknowledge
-        // orders into logs that diverge. Election is not built yet, but a
-        // promotion performed by any means has to be safe.
+        // orders into logs that diverge. Checked here without any election in
+        // sight, deliberately — a promotion has to be safe however it was
+        // performed, and this file must not depend on who performed it.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let follower = thread::spawn(move || {
