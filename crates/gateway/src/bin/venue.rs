@@ -44,6 +44,12 @@ const REPORT_EVERY: u64 = 1_000_000;
 /// Not a failure -- a standby that is never elected is a standby doing its job.
 const ELECTION_PATIENCE: Duration = Duration::from_secs(30);
 
+/// How long to wait before standing again after a setback.
+///
+/// Short enough that a real failover is not delayed by it, long enough that a
+/// node which keeps failing to take up the leadership is not spinning a core.
+const SETBACK: Duration = Duration::from_millis(500);
+
 /// What the venue runs as when no configuration file is given: one instrument,
 /// journal in memory. Enough to point the load harness at, and not a deployment.
 fn measurement_config() -> Config {
@@ -268,6 +274,11 @@ fn lead(config: &Config, leadership: &Leadership) -> std::io::Result<()> {
         // order, rather than discovering it could not on the first commit.
         if let Err(e) = leadership.announce() {
             eprintln!("elected but could not reach a majority to announce: {e}");
+            // A pause, because this node may still hold the leadership: without
+            // it the next `await_leadership` returns immediately and the loop
+            // spins on a failing announce as fast as the machine allows, which
+            // is a standby burning a core over a partition it cannot fix.
+            std::thread::sleep(SETBACK);
             continue;
         }
 
@@ -280,6 +291,10 @@ fn lead(config: &Config, leadership: &Leadership) -> std::io::Result<()> {
                 eprintln!("stopped serving term {term}: {e}");
             }
         }
+        // Same reason: a failure that returns at once -- a port not yet released,
+        // a follower still unreachable -- would otherwise be retried in a tight
+        // loop rather than in a moment.
+        std::thread::sleep(SETBACK);
     }
 }
 

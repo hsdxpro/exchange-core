@@ -1234,6 +1234,15 @@ impl<S: LogStorage> Server<S> {
             let Some(session) = self.sessions[index].as_mut() else {
                 continue;
             };
+            // The flag, not the list, is the truth. A slot freed on one pass can
+            // be taken by a new connection on the next while this list still
+            // names it, and that entry now points at somebody else — who has
+            // their own flag saying whether they owe anything. Trusting the list
+            // would flush a stranger and, worse, let the same index be carried
+            // forward twice and accumulate.
+            if !session.owes {
+                continue;
+            }
             session.flush();
             if session.over_budget() {
                 session.open = false;
