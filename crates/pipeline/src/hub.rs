@@ -173,11 +173,6 @@ impl Hub {
         self.channels.remove(&channel);
     }
 
-    #[must_use]
-    pub fn is_subscribed(&self, channel: Channel) -> bool {
-        self.channels.contains_key(&channel)
-    }
-
     /// Routes a batch of venue events to whichever channels are subscribed.
     ///
     /// Events for channels nobody follows are dropped here rather than buffered
@@ -395,9 +390,9 @@ mod tests {
         let mut hub = Hub::new(RETAINED);
         hub.subscribe(Channel::Account(42));
         hub.publish(&[event(EventKind::Filled, 1, 42)]);
-        assert!(hub.is_subscribed(Channel::Account(42)));
+        assert!(hub.next_sequence(Channel::Account(42)).is_some());
         hub.unsubscribe(Channel::Account(42));
-        assert!(!hub.is_subscribed(Channel::Account(42)));
+        assert!(hub.next_sequence(Channel::Account(42)).is_none());
         assert_eq!(
             drain(&hub, Channel::Account(42), 0).0,
             Resume::NotSubscribed

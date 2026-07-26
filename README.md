@@ -40,15 +40,21 @@ Nothing in the code picks a group size. A group is whatever arrived since the
 last pass, so it grows under load — exactly when a sync needs amortising — and
 falls to one when the venue is idle and latency matters more.
 
-Two processes over loopback, which is what a client actually experiences:
+Separate processes over loopback, which is what a client actually experiences.
+The third row is a real cluster: one `venue` and two `replica` processes, a group
+acknowledged once a majority holds it.
 
-| | one pipelined client | 32 concurrent clients |
+| durability | round trip, one order in flight | pipelined |
 |---|---:|---:|
-| durable file journal | 662,951/sec | **928,943/sec** |
-| in-memory journal | 2,962,954/sec | 1,745,152/sec |
+| none (journal in memory) | 8.6 µs | 3,764,252/sec |
+| local disk, one `fsync` per group | 3,066 µs | 662,951/sec |
+| **quorum of two followers** | **54.4 µs** | **931,871/sec** |
 
-Concurrency helps where there is a sync to amortise and costs where there is not,
-which is the group-commit design behaving as intended.
+Reaching two other processes is **56× faster than reaching the platter**, which is
+the whole argument for acknowledging after a quorum, measured end to end rather
+than synthetically. With eight concurrent clients the same cluster does
+1,452,296 orders a second, because a group is whatever arrived since the last
+pass and more clients means larger groups.
 
 ### Does it hold at scale
 
@@ -100,6 +106,12 @@ cargo run --release -p bx-gateway --bin venue -- --config venue.conf
 
 ```bash
 cargo run --release -p bx-gateway --bin load -- 127.0.0.1:7070 --clients 32
+```
+
+To run it replicated, start followers first and list them in the config:
+
+```bash
+cargo run --release -p bx-gateway --bin replica -- 127.0.0.1:7201
 ```
 
 ## Layout

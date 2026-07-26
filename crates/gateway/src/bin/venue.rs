@@ -104,7 +104,11 @@ fn run<S: LogStorage>(config: &Config, storage: S, fresh: bool) -> std::io::Resu
         bx_gateway::config::feed_memory(config.retained_per_channel, symbols) / 1024 / 1024
     );
     if !config.replicas.is_empty() {
-        println!("replicating to {} follower(s)", config.replicas.len());
+        println!(
+            "replicating to {} follower(s) as term {}",
+            config.replicas.len(),
+            config.term
+        );
     }
 
     // Printed only once the port is bound and state is restored, so a parent
