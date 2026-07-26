@@ -61,6 +61,10 @@ pub struct Exchange<S: LogStorage> {
     /// needed and O(log n) tree descents are pure cost.
     reservations: FastMap<OrderId, Reservation>,
     events: Vec<Event>,
+    /// Set once [`Self::commit`] has handed the current batch's events out, so
+    /// the next enqueue knows to start a fresh batch rather than append to one
+    /// the caller has already seen.
+    released: bool,
     event_sequence: Sequence,
     /// Reused across commands. Swapped into the book for the duration of a
     /// call so the book can fill it while `self` stays borrowable.
@@ -82,6 +86,7 @@ impl<S: LogStorage> Exchange<S> {
             books,
             reservations: FastMap::default(),
             events: Vec::new(),
+            released: true,
             event_sequence: 0,
             scratch: Outcome::default(),
         })
@@ -102,10 +107,7 @@ impl<S: LogStorage> Exchange<S> {
         amount: Quantity,
     ) -> bx_journal::Result<()> {
         let mut command = deposit(account, asset, amount);
-        self.journal.append(&mut command)?;
-        self.journal.sync()?;
-        self.events.clear();
-        self.apply(command);
+        self.submit(&mut command)?;
         Ok(())
     }
 
@@ -135,42 +137,69 @@ impl<S: LogStorage> Exchange<S> {
         self.journal.into_storage()
     }
 
-    /// Sequences, journals and applies one command, returning its events.
+    /// Sequences, journals and applies one command **without making it
+    /// durable**, and without releasing its events.
     ///
-    /// The command is durable before it is applied, which is what lets a client
-    /// be told "received" without that ever needing to be retracted.
+    /// This is the hot path, and it deliberately makes no `fsync`. A sync costs
+    /// milliseconds while everything else here costs nanoseconds, so syncing per
+    /// command puts an operation eighteen thousand times the cost of matching
+    /// directly in front of matching. The caller enqueues as much as it has and
+    /// calls [`Self::commit`] once, which is the group commit every venue does.
+    ///
+    /// Events are buffered, not returned: nothing may be shown to a client
+    /// before the command that caused it is durable, because an acknowledgement
+    /// that has to be retracted is worse than one that took longer.
     ///
     /// # Errors
     /// Fails only if the journal cannot be written. A refused command is not an
     /// error: it produces a `Rejected` event.
-    pub fn submit(&mut self, command: &mut Command) -> bx_journal::Result<&[Event]> {
+    pub fn enqueue(&mut self, command: &mut Command) -> bx_journal::Result<()> {
+        if self.released {
+            self.events.clear();
+            self.released = false;
+        }
         self.journal.append(command)?;
-        self.journal.sync()?;
-        self.events.clear();
         self.apply(*command);
+        Ok(())
+    }
+
+    /// Makes everything enqueued durable, then releases its events.
+    ///
+    /// One sync covers the whole group. That is not a weakening of durability:
+    /// no command in the group is acknowledged until every one of them is on
+    /// disk. If the sync fails nothing is released, so no client is ever told
+    /// about a command that is not durable.
+    ///
+    /// # Errors
+    /// Fails if the journal cannot be flushed.
+    pub fn commit(&mut self) -> bx_journal::Result<&[Event]> {
+        self.journal.sync()?;
+        self.released = true;
         Ok(&self.events)
     }
 
-    /// Sequences and journals a whole batch, syncs **once**, then applies it.
+    /// Enqueues one command and commits immediately.
     ///
-    /// This is the throughput path. Durability is per batch rather than per
-    /// command, which is not a weakening: no command in the batch is
-    /// acknowledged until every one of them is durable. On a real disk the sync
-    /// dominates everything else, so batching is the difference between tens of
-    /// thousands and millions of commands per second.
+    /// The right thing when a command arrives alone, but it pays a full sync
+    /// for a single command. Anything driving real traffic should enqueue a
+    /// group and [`Self::commit`] once.
+    ///
+    /// # Errors
+    /// Fails only if the journal cannot be written.
+    pub fn submit(&mut self, command: &mut Command) -> bx_journal::Result<&[Event]> {
+        self.enqueue(command)?;
+        self.commit()
+    }
+
+    /// Enqueues a whole batch and commits once. The throughput path.
     ///
     /// # Errors
     /// Fails only if the journal cannot be written.
     pub fn submit_batch(&mut self, commands: &mut [Command]) -> bx_journal::Result<&[Event]> {
         for command in commands.iter_mut() {
-            self.journal.append(command)?;
+            self.enqueue(command)?;
         }
-        self.journal.sync()?;
-        self.events.clear();
-        for command in commands.iter() {
-            self.apply(*command);
-        }
-        Ok(&self.events)
+        self.commit()
     }
 
     /// Rebuilds state by replaying the whole journal. Events are not
@@ -208,6 +237,7 @@ impl<S: LogStorage> Exchange<S> {
             self.apply(command);
         }
         self.events.clear();
+        self.released = true;
         self.event_sequence = 0;
         count
     }

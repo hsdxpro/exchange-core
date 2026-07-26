@@ -469,6 +469,82 @@ fn a_crash_before_sync_loses_nothing_that_was_acknowledged() {
 }
 
 #[test]
+fn an_enqueued_command_is_not_durable_until_it_is_committed() {
+    let mut exchange = funded();
+    let committed = exchange.next_sequence();
+
+    // Enqueued, applied, but never committed.
+    let mut order = limit_order(1, SYMBOL, 101, Side::Bid, 10_100, 5);
+    exchange.enqueue(&mut order).unwrap();
+    assert_eq!(
+        exchange.book(SYMBOL).unwrap().depth(Side::Bid, 10),
+        vec![(10_100, 5)],
+        "the order should be live in memory"
+    );
+
+    // Power loss before the commit.
+    let mut storage = exchange.into_storage();
+    storage.crash();
+
+    let mut recovered = Exchange::new(storage, instruments()).unwrap();
+    assert_eq!(
+        recovered.recover().unwrap(),
+        committed,
+        "an uncommitted command survived, so it was acknowledged too early"
+    );
+    assert!(
+        recovered
+            .book(SYMBOL)
+            .unwrap()
+            .depth(Side::Bid, 10)
+            .is_empty()
+    );
+}
+
+#[test]
+fn one_commit_makes_a_whole_group_durable() {
+    let mut exchange = funded();
+    for i in 0..20 {
+        let mut order = limit_order(1, SYMBOL, 100 + i, Side::Bid, 10_000 + i as Ticks, 1);
+        exchange.enqueue(&mut order).unwrap();
+    }
+    // Every event in the group is released at once, and only now.
+    let released = exchange.commit().unwrap().len();
+    assert!(released >= 20, "expected the whole group's events");
+
+    let expected = exchange.next_sequence();
+    let bids = exchange.book(SYMBOL).unwrap().depth(Side::Bid, 100);
+
+    let mut storage = exchange.into_storage();
+    storage.crash();
+    let mut recovered = Exchange::new(storage, instruments()).unwrap();
+    assert_eq!(
+        recovered.recover().unwrap(),
+        expected,
+        "a committed command was lost"
+    );
+    assert_eq!(recovered.book(SYMBOL).unwrap().depth(Side::Bid, 100), bids);
+}
+
+#[test]
+fn events_accumulate_across_a_group_and_reset_after_it_is_released() {
+    let mut exchange = funded();
+    let mut first = limit_order(1, SYMBOL, 101, Side::Bid, 10_100, 1);
+    let mut second = limit_order(1, SYMBOL, 102, Side::Bid, 10_090, 1);
+    exchange.enqueue(&mut first).unwrap();
+    exchange.enqueue(&mut second).unwrap();
+    let group = exchange.commit().unwrap().len();
+
+    let mut third = limit_order(1, SYMBOL, 103, Side::Bid, 10_080, 1);
+    exchange.enqueue(&mut third).unwrap();
+    let next = exchange.commit().unwrap().len();
+    assert!(
+        next < group,
+        "the second group still carried the first group's events"
+    );
+}
+
+#[test]
 fn cancel_replace_of_an_unknown_order_must_not_create_one() {
     let mut exchange = funded();
 

@@ -240,6 +240,12 @@ These were argued out. Do not relitigate without new information.
 
 ### Things learned the hard way
 
+- **The hot path was making an fsync per command.** `submit` appended, synced
+  and only then matched, so an operation costing milliseconds sat directly in
+  front of one costing nanoseconds -- eighteen thousand times the cost of the
+  thing it was protecting. Split into `enqueue` (no sync, events buffered) and
+  `commit` (one sync, events released). `submit` and `submit_batch` are now
+  three-line wrappers over the pair, so the two durability paths cannot drift.
 - **A restart that recovers every order but none of the money is not a
   restart.** Deposits lived only in memory, so replay rebuilt the books and left
   the balances at zero. It looked correct only because every recovery test
