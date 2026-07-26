@@ -146,15 +146,24 @@ and falls to one when the venue is idle and latency does.
 
 ### What a client actually experiences
 
-`venue` and `load` as separate processes over loopback TCP:
+`venue` and `load` as separate processes over loopback TCP.
 
-| journal | round trip, one order in flight | pipelined |
+| | one pipelined client | 32 concurrent clients |
 |---|---:|---:|
-| in memory | 8.7 us | 2.9M orders/sec |
-| real file, no replicas | 2,915 us | 127k orders/sec |
+| durable file journal | 662,951 orders/sec | **928,943 orders/sec** |
+| in-memory journal | 2,962,954 orders/sec | 1,745,152 orders/sec |
 
-The second row is one fsync per group and matches the table above. The first is
-**not a durable number** and must not be quoted as one.
+Concurrency helps exactly where there is a sync to amortise and costs where
+there is not. On the durable path more clients mean larger groups per pass, so
+32 of them beat one pipelined client by 1.4x. With the journal in memory there
+is nothing to amortise and 32 sockets only add syscalls, so the same test runs
+at 0.6x. That is the group-commit design working, and it is the reason nothing
+in the code picks a batch size.
+
+Round trip, one order in flight: **9.0 us** in memory, **3,066 us** against a
+real file. The second is one fsync and matches the durability table above. The
+first is **not a durable number** and must not be quoted as one; the durable
+answer for a single order in flight is quorum, at 51 us.
 
 ### Restart time
 

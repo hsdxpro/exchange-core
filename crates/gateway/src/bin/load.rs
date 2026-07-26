@@ -12,8 +12,13 @@
 //!   The group grows on its own under this load, which is the behaviour worth
 //!   measuring.
 //!
+//! - **Concurrent throughput** is many clients at once, which is what a venue
+//!   actually faces and the only shape where the group grows on its own: the
+//!   group is whatever arrived since the last pass, so more clients means larger
+//!   groups and a sync amortised further. One pipelined client understates it.
+//!
 //! ```text
-//! load [address] [--orders N]
+//! load [address] [--orders N] [--clients N]
 //! ```
 
 use bx_gateway::codec::{FRAME_LEN, encode};
@@ -127,6 +132,87 @@ fn throughput(address: &str, orders: u64, first_order: u64) -> std::io::Result<(
     Ok((orders as f64 / elapsed, received))
 }
 
+/// Many clients at once, each on its own account and its own slice of the
+/// ladder so orders rest rather than crossing. Returns aggregate orders a second
+/// and how many were acknowledged.
+fn concurrent_throughput(
+    address: &str,
+    clients: u64,
+    orders_each: u64,
+    first_order: u64,
+) -> std::io::Result<(f64, u64)> {
+    let ready = std::sync::Arc::new(std::sync::Barrier::new(clients as usize + 1));
+    let mut workers = Vec::with_capacity(clients as usize);
+
+    for client in 0..clients {
+        let address = address.to_string();
+        let gate = std::sync::Arc::clone(&ready);
+        workers.push(std::thread::spawn(move || -> std::io::Result<u64> {
+            // Accounts the venue funds at startup. Clients sharing an account is
+            // fine here: every order is a resting bid in its own price band, so
+            // nothing crosses and nothing self-matches.
+            let account = 1 + client % 16;
+            let base = FLOOR + 1_000 + (client as Ticks) * 37;
+            let mut stream = connect(&address)?;
+            let mut reader = stream.try_clone()?;
+
+            let mut bytes = Vec::with_capacity(orders_each as usize * FRAME_LEN);
+            for i in 0..orders_each {
+                let order = first_order + client * orders_each + i;
+                let price = base + (i % 31) as Ticks;
+                encode(
+                    &limit_order(account, SYMBOL, order, Side::Bid, price, 1),
+                    &mut bytes,
+                );
+            }
+
+            // Read on another thread, or a client blocks against its own receive
+            // buffer and measures itself rather than the venue.
+            let drain = std::thread::spawn(move || -> std::io::Result<u64> {
+                let mut scratch = vec![0_u8; FRAME_LEN * 256];
+                let mut seen = 0_u64;
+                let mut partial = 0_usize;
+                while seen < orders_each {
+                    let bytes = reader.read(&mut scratch[partial..])?;
+                    if bytes == 0 {
+                        break;
+                    }
+                    let filled = partial + bytes;
+                    let whole = filled / FRAME_LEN;
+                    for index in 0..whole {
+                        let start = index * FRAME_LEN;
+                        if let Ok(event) =
+                            Event::read_from_bytes(&scratch[start..start + FRAME_LEN])
+                            && event.kind == EventKind::Received as u8
+                        {
+                            seen += 1;
+                        }
+                    }
+                    scratch.copy_within(whole * FRAME_LEN..filled, 0);
+                    partial = filled - whole * FRAME_LEN;
+                }
+                Ok(seen)
+            });
+
+            // Every client starts writing at the same moment, so the venue sees
+            // real concurrency rather than a staggered ramp.
+            gate.wait();
+            stream.write_all(&bytes)?;
+            stream.flush()?;
+            drain.join().expect("reader thread panicked")
+        }));
+    }
+
+    ready.wait();
+    let started = Instant::now();
+    let mut acknowledged = 0;
+    for worker in workers {
+        acknowledged += worker.join().expect("client thread panicked")?;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    Ok(((clients * orders_each) as f64 / elapsed, acknowledged))
+}
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let address = args
@@ -134,12 +220,15 @@ fn main() -> std::io::Result<()> {
         .filter(|a| !a.starts_with("--"))
         .cloned()
         .unwrap_or_else(|| "127.0.0.1:7070".to_string());
-    let orders: u64 = args
-        .iter()
-        .position(|a| a == "--orders")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(200_000);
+    let number = |name: &str, fallback: u64| -> u64 {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(fallback)
+    };
+    let orders = number("--orders", 200_000);
+    let clients = number("--clients", 32);
 
     println!("\nClient-observed latency against {address}");
     println!("{}", "-".repeat(72));
@@ -156,7 +245,22 @@ fn main() -> std::io::Result<()> {
         "pipelined throughput", per_second
     );
     println!("{:<40}{received:>10} of {orders}", "orders acknowledged");
+
+    let each = (orders / clients).max(1);
+    let (concurrent, acknowledged) = concurrent_throughput(&address, clients, each, 20_000_000)?;
+    println!(
+        "{:<40}{concurrent:>10.0} orders/sec",
+        format!("{clients} clients at once, {each} each")
+    );
+    println!(
+        "{:<40}{acknowledged:>10} of {}",
+        "orders acknowledged",
+        clients * each
+    );
     println!("{}", "-".repeat(72));
+    if acknowledged < clients * each {
+        eprintln!("warning: not every concurrent order was acknowledged");
+    }
 
     if received < orders {
         eprintln!("warning: the venue returned fewer events than orders sent");

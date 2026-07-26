@@ -1,14 +1,15 @@
 //! What an idle connection costs the venue.
 //!
 //! A venue open to the public holds far more connections than are active at any
-//! instant. The loop reads every session each pass, so an idle session is not
-//! free: it is a syscall per pass, plus a cursor check per channel it follows.
-//! That cost is paid by every active client, because it lands in the same pass.
+//! instant, and whatever an idle one costs is paid by every *active* client,
+//! because it lands in the same pass.
 //!
-//! This measures it rather than assuming it, because the answer decides whether
-//! the loop needs readiness notification. A number here that grows linearly and
-//! steeply means the venue cannot hold many connections whatever else is true of
-//! it.
+//! Reading every socket every pass cost 422 ns per idle session. Sessions are
+//! now found by readiness, which took that to 23 ns -- and the numbers below are
+//! the guard on it. A regression to scanning would still return every correct
+//! answer, so only a measurement catches it, and the threshold here is set close
+//! enough to the measured cost to fail if that happened rather than merely
+//! somewhere below absurd.
 
 use bx_gateway::codec::encode;
 use bx_gateway::tcp::Server;
@@ -88,7 +89,7 @@ fn idle_poll_cost(idle: usize, subscribed: bool) -> f64 {
 }
 
 #[test]
-fn an_idle_connection_costs_the_venue_a_syscall_every_pass() {
+fn an_idle_connection_costs_almost_nothing() {
     // Reported rather than merely asserted: the shape of this curve is the point.
     let mut measured = Vec::new();
     for idle in [1_usize, 16, 64, 256] {
@@ -100,31 +101,24 @@ fn an_idle_connection_costs_the_venue_a_syscall_every_pass() {
         );
     }
 
-    // Split the cost: a session that follows no public channel pays only for the
-    // read, one that follows two also pays a cursor check each. Knowing which
-    // half dominates decides what is worth changing.
-    let with_feeds = idle_poll_cost(256, true);
-    let without = idle_poll_cost(256, false);
-    println!(
-        "256 sessions: {with_feeds:.0} ns with feeds, {without:.0} ns without          -> read {:.0} ns each, cursors {:.0} ns each",
-        without / 256.0,
-        (with_feeds - without) / 256.0
-    );
-
     let (_, one) = measured[0];
     let (many, lots) = measured[measured.len() - 1];
     let per_session = (lots - one) / many as f64;
     println!("marginal cost of an idle session: {per_session:.0} ns per pass");
 
-    // The venue must still make progress. This is the assertion that matters:
-    // whatever the per-session cost, a pass with 256 idle sessions has to stay
-    // fast enough that an active client is not waiting behind them.
+    // Set against the measured 23 ns with room for a loaded machine, but well
+    // under the 422 ns that scanning every socket cost. A revert to scanning has
+    // to fail here, and a threshold picked to be safely absurd would not notice.
+    const BUDGET_PER_SESSION: f64 = 120.0;
     assert!(
-        lots < 5_000_000.0,
-        "256 idle sessions cost {lots:.0} ns a pass, which an active client pays for"
+        per_session < BUDGET_PER_SESSION,
+        "an idle session costs {per_session:.0} ns a pass, over the {BUDGET_PER_SESSION:.0} ns \
+         budget. Sessions are supposed to be found by readiness; a cost near 400 ns \
+         means every socket is being read every pass again, and every active \
+         client is paying for it."
     );
-    // And the cost has to be roughly linear rather than worse: a superlinear
-    // curve would mean the loop is doing something quadratic in connections.
+    // And the cost has to stay roughly linear: a superlinear curve would mean
+    // something in the loop had become quadratic in connections.
     let ratio = lots / one.max(1.0);
     assert!(
         ratio < many as f64 * 4.0,
