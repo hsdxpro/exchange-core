@@ -7,6 +7,7 @@
 
 pub mod codec;
 pub mod config;
+pub mod quic;
 pub mod tcp;
 pub mod venue;
 

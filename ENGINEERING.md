@@ -1,64 +1,16 @@
-# Where this project is
+# Engineering notes
 
-Working notes: what we are building, what exists, what was decided and why, and
-what comes next. [`DESIGN.md`](DESIGN.md) is the architecture; this is the state
-of play.
+Why the code is shaped the way it is: the decisions that were argued out, the
+alternatives that were rejected and on what grounds, and the bugs that changed
+the design. [`README.md`](README.md) is the entry point and
+[`DESIGN.md`](DESIGN.md) is the architecture.
 
----
+The measurements below were taken on one desktop and drift by a factor of two or
+more on a loaded machine, so they are reported as minimum-of-N and any A/B
+comparison here was run interleaved against checksummed binaries. A single
+timing is not evidence of anything.
 
-## 1. Objective
-
-Build a production-shaped crypto exchange around the existing matching engine.
-Binary protocol, reliable transport open to the public internet, 1000+ symbols,
-replicated durability, automatic failover, deterministic crash recovery, and a
-subscription feed that clients can resume after a disconnect.
-
-Guiding constraints, in the user's words: **best modern practice, no invented
-constants, no overcomplication, least layers and code that still meets the
-requirement, everything runnable locally with no CI.**
-
----
-
-## 2. Repository layout
-
-Three folders on disk, deliberately separate:
-
-| Path | What it is | Touch it? |
-|---|---|---|
-| `D:\Code\matching_engine` | This project. Git repo, active work. | Yes |
-| `D:\Code\bitmap-exchange` | The finished engine, zipped and sent as a job-application code sample. | **No — frozen** |
-| `D:\Code\bitmap-exchange-cpp` | The C++23 cross-implementation, kept for reference. | Reference only |
-
-Two branches:
-
-- **`matching_engine`** — one commit, the engine exactly as it was sent.
-- **`matching_engine_with_subscription`** — current work. All commits below.
-
-```
-bea8c29  Bitmap-ladder matching engine and order book
-3f6195e  Design for the subscription exchange
-5902386  Resolve the remaining design decisions
-4b19a7f  Cut the invented complexity from the design
-0092e1f  Workspace, wire protocol, and journal
-3658d4b  Exchange pipeline, end-to-end tests, and a local runner
-```
-
-### Crates
-
-```
-crates/engine/     bx-engine     the matching engine. ZERO dependencies,
-                                 forbid(unsafe_code). Keep it that way.
-crates/protocol/   bx-protocol   wire types. Depends only on zerocopy.
-crates/journal/    bx-journal    append-only log, replay, replication.
-crates/pipeline/   bx-pipeline   sequencer, accounts, books, events, snapshots.
-crates/gateway/    bx-gateway    framing, sessions, group commit, TCP server,
-                                 config. Binaries: venue, load.
-xtask/             xtask         local task runner. Replaces CI.
-```
-
----
-
-## 3. What exists and is tested
+## What exists, and what proves it
 
 **211 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
@@ -179,9 +131,9 @@ book and the snapshot saves almost nothing.
 
 ---
 
-## 4. Decisions already made
+## Decisions
 
-These were argued out. Do not relitigate without new information.
+Each of these was settled against a specific alternative, noted below.
 
 ### Architecture
 
@@ -300,7 +252,7 @@ These were argued out. Do not relitigate without new information.
   fat-finger control are the same mechanism. Implemented in
   `instrument.rs::to_slot`.
 
-### Things learned the hard way
+### Bugs that changed the design
 
 - **The hot path was making an fsync per command.** `submit` appended, synced
   and only then matched, so an operation costing milliseconds sat directly in
@@ -338,7 +290,7 @@ These were argued out. Do not relitigate without new information.
 
 ---
 
-## 5. Known debt
+## Known debt
 
 Ordered by how much it matters.
 
@@ -349,7 +301,7 @@ Ordered by how much it matters.
 
 ---
 
-## 6. What is left
+## What is left
 
 Two items, both deliberate rather than forgotten:
 
@@ -364,53 +316,3 @@ Two items, both deliberate rather than forgotten:
 Smaller, if wanted: MBO for colocated clients, fee schedules at settlement,
 per-account rate limits.
 
-## 7. Earlier plan, now done
-
-The disk measurement reordered this list. Per-command compute is no longer the
-constraint, so **openraft moved up from last to second**: reaching a quorum in
-memory over a LAN is two orders of magnitude faster than an fsync, which makes
-replication a throughput decision, not only a fault-tolerance one.
-
-1. **Subscription channels.** `book.{symbol}`, `trades.{symbol}`, `bbo.{symbol}`,
-   and the private per-account channels. Per-channel sequence numbers, a
-   fixed-size ring buffer, and `RESUME {channel, last_seq}` that replays from the
-   ring or forces a fresh snapshot. The `Subscriber` in the e2e tests already
-   models the client side of this.
-4. **Snapshots.** Serialize book plus balances at a sequence, so recovery does
-   not replay from zero. Cadence derived from a recovery-time target, not picked.
-5. **QUIC gateway.** `quinn`, binary framing, session handling. **The e2e
-   scenarios were written transport-agnostic on purpose** — the same assertions
-   should run over real sockets.
-6. **Multi-process local tests.** Separate gateway and core processes, real
-   sockets, same scenarios.
-7. **Deterministic simulation.** Fake clock and lossy network behind the traits
-   that already exist, whole cluster in one process, failure injection,
-   reproducible from a seed.
-
----
-
-## 7. How to run
-
-```bash
-cargo x            # fmt check, clippy -D warnings, all tests
-cargo x test       # tests only
-cargo x e2e        # end-to-end, with output
-cargo x latency    # pipeline latency
-cargo x engine     # the engine's own 43 checks and benchmark
-cargo x all        # everything
-```
-
-Requires rustup only. `rust-toolchain.toml` pins 1.97.1 and rustup fetches it.
-There is no CI and nothing to install.
-
----
-
-## 8. Working preferences
-
-Established over this project:
-
-- Plain language over jargon. Explain the concept before the term.
-- No invented constants. Derive them, measure them, or say they are arbitrary.
-- Own mistakes plainly and fix them; do not defend a bad call.
-- Report what is verified separately from what is assumed.
-- Keep the engine crate dependency-free and `forbid(unsafe_code)`.
