@@ -1,10 +1,16 @@
 //! A server over real sockets.
 //!
-//! One thread, non-blocking sockets, no locks. Matching a symbol is inherently
-//! single-writer, so a thread per connection would only add contention around a
-//! section that cannot run in parallel anyway. The loop reads whatever has
-//! arrived from every session, applies it as one group, commits once, and
-//! writes each session whatever it has not yet seen.
+//! One thread, no locks. Matching a symbol is inherently single-writer, so a
+//! thread per connection would only add contention around a section that cannot
+//! run in parallel anyway. The loop takes whatever arrived, applies it as one
+//! group, commits once, and writes each session whatever it has not yet seen.
+//!
+//! Sessions are found by readiness rather than by scanning. Reading every socket
+//! every pass cost a syscall per idle connection -- measured at 428 ns, linear --
+//! and an active client paid for all of them because the scan landed in the same
+//! pass. A thousand idle connections put 428 microseconds in front of every
+//! order. `mio` gives epoll, IOCP or kqueue depending on the platform, so an idle
+//! connection now costs nothing until it speaks.
 //!
 //! That shape is what makes group commit real rather than something a test
 //! calls by hand: the group is however many commands happened to arrive since
@@ -31,9 +37,11 @@ use bx_pipeline::hub::{Channel, Resume};
 use bx_pipeline::instrument::Instruments;
 use bx_pipeline::snapshot::Snapshot;
 use bx_protocol::{AccountId, Command, CommandKind, Event, Sequence};
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll, Token};
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -55,6 +63,17 @@ struct Session {
     /// Set by the first command, which is how a session declares who it is.
     account: Option<AccountId>,
     open: bool,
+}
+
+/// The listener's token. Sessions take `index + 1`, so zero is never a session.
+const LISTENER: Token = Token(0);
+
+fn session_token(index: usize) -> Token {
+    Token(index + 1)
+}
+
+fn session_index(token: Token) -> Option<usize> {
+    (token != LISTENER).then(|| token.0 - 1)
 }
 
 impl Session {
@@ -84,6 +103,8 @@ impl Session {
 
     /// Reads one buffer's worth, appending decoded commands to `out`.
     ///
+    /// Returns true if the socket may still hold more.
+    ///
     /// Deliberately **one** read per pass rather than draining the socket. A
     /// pass that read until the socket blocked would let one client hand the
     /// venue an unbounded group: a client pushing a hundred thousand orders in
@@ -93,19 +114,38 @@ impl Session {
     /// never been given a chance to read. Bounding the pass bounds the events
     /// one group can produce, and it shares the venue fairly between sessions
     /// instead of serving whoever writes hardest.
-    fn read_into(&mut self, out: &mut Vec<Command>) {
-        if self.decoder.is_full() {
-            return;
+    ///
+    /// Readiness is edge-triggered: a socket is reported once when it becomes
+    /// readable, and not again until it has been read to exhaustion. Stopping
+    /// after one buffer therefore cannot rely on another event -- so the session
+    /// stays in the ready set until a read genuinely returns `WouldBlock`. The
+    /// cost is one extra read after a session's last data, which is far cheaper
+    /// than scanning every connection, and the alternative is a session that
+    /// goes silent forever because nothing will wake it again.
+    fn read_into(&mut self, out: &mut Vec<Command>) -> bool {
+        if self.decoder.writable().is_empty() {
+            return true;
         }
         match self.stream.read(self.decoder.writable()) {
             // A read of zero on a stream socket means the peer closed.
-            Ok(0) => self.open = false,
+            Ok(0) => {
+                self.open = false;
+                false
+            }
             Ok(bytes) => {
                 self.decoder.advance(bytes);
                 self.decoder.drain(out);
+                // Not "bytes == room". A short read does not prove the socket is
+                // empty, and only `WouldBlock` re-arms the notification.
+                true
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {}
-            Err(_) => self.open = false,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                false
+            }
+            Err(_) => {
+                self.open = false;
+                false
+            }
         }
     }
 
@@ -198,9 +238,20 @@ impl SnapshotPolicy {
 /// The venue, listening.
 #[derive(Debug)]
 pub struct Server<S: LogStorage> {
+    poll: Poll,
+    events: Events,
     listener: TcpListener,
     venue: Venue<S>,
-    sessions: Vec<Session>,
+    /// Indexed by token, so a session's identity is stable while its neighbours
+    /// come and go. A scanning loop could use a plain `Vec` and compact it;
+    /// readiness hands back a token and needs the index to still mean something.
+    sessions: Vec<Option<Session>>,
+    free: Vec<usize>,
+    live: usize,
+    /// Sessions whose sockets may still hold data the last pass did not take.
+    /// Edge-triggered readiness will not mention them again, so the loop
+    /// remembers them itself.
+    still_readable: Vec<usize>,
     /// Unsent bytes one session may owe. Derived from the retention window
     /// rather than chosen: a session further behind than the window cannot be
     /// caught up whatever the venue does.
@@ -215,16 +266,16 @@ pub struct Server<S: LogStorage> {
     max_records_per_session: usize,
     /// Connections this venue will hold at once.
     ///
-    /// The loop reads every session each pass, so an idle connection costs a
-    /// syscall per pass -- measured at about 444 ns. That is linear and cheap in
-    /// isolation, but it is paid by every *active* client, because it lands in
-    /// the same pass: a thousand idle connections put 444 microseconds in front
-    /// of every order. Beyond a few hundred, this loop needs readiness
-    /// notification rather than a scan, and that is a different design.
+    /// An idle connection costs 23 ns a pass -- measured -- now that sessions are
+    /// found by readiness instead of by scanning. It was 422 ns when every socket
+    /// was read every pass. What remains is userspace: a cursor check and a
+    /// liveness check per session, no syscalls.
     ///
-    /// Refusing past the ceiling turns an invisible cliff into a stated policy.
-    /// A venue that accepts ten thousand connections and then serves all of them
-    /// slowly is worse than one that accepts what it can serve.
+    /// It is still linear, and still paid by every *active* client because it
+    /// lands in the same pass, so there is still a ceiling: 4,096 connections is
+    /// about 94 microseconds of scanning in front of an order. Past the ceiling
+    /// the venue refuses rather than accepting everyone and serving all of them
+    /// slowly, and counts the refusals so an operator knows to add a gateway.
     max_sessions: usize,
 }
 
@@ -242,15 +293,27 @@ impl<S: LogStorage> Server<S> {
         max_records_per_session: usize,
         max_sessions: usize,
     ) -> io::Result<Self> {
-        let listener = TcpListener::bind(address)?;
-        listener.set_nonblocking(true)?;
+        let parsed: SocketAddr = address
+            .parse()
+            .map_err(|_| io::Error::other(format!("`{address}` is not an address")))?;
+        let mut listener = TcpListener::bind(parsed)?;
+        let poll = Poll::new()?;
+        poll.registry()
+            .register(&mut listener, LISTENER, Interest::READABLE)?;
         let venue = Venue::new(storage, instruments, retained_per_channel)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         let server = Self {
+            poll,
+            // One pass hands back at most this many ready sockets; the rest wait
+            // for the next, which is fair and bounds the work a pass can take.
+            events: Events::with_capacity(1_024),
             listener,
             venue,
             sessions: Vec::new(),
+            free: Vec::new(),
+            live: 0,
+            still_readable: Vec::new(),
             inbound: Vec::new(),
             outbound: Vec::new(),
             max_records_per_session,
@@ -278,8 +341,8 @@ impl<S: LogStorage> Server<S> {
     }
 
     #[must_use]
-    pub fn sessions(&self) -> usize {
-        self.sessions.len()
+    pub const fn sessions(&self) -> usize {
+        self.live
     }
 
     /// Writes a snapshot to `path` whenever `policy` says one is due.
@@ -353,33 +416,64 @@ impl<S: LogStorage> Server<S> {
     /// # Errors
     /// Fails only if the journal cannot be written or flushed.
     pub fn poll(&mut self) -> bx_journal::Result<usize> {
-        self.accept_pending();
+        // Which sessions to look at: the ones readiness named, plus the ones the
+        // previous pass left with data still in the socket.
+        let mut ready = std::mem::take(&mut self.still_readable);
+        let mut accept = false;
+        // A zero timeout keeps this a poll rather than a wait, so a caller that
+        // busy-polls a pinned core still can. A deployment that would rather
+        // yield the core can afford a small timeout at the cost of that much
+        // latency.
+        if self
+            .poll
+            .poll(&mut self.events, Some(Duration::ZERO))
+            .is_ok()
+        {
+            for event in self.events.iter() {
+                match session_index(event.token()) {
+                    None => accept = true,
+                    Some(index) => {
+                        if !ready.contains(&index) {
+                            ready.push(index);
+                        }
+                    }
+                }
+            }
+        }
+        if accept {
+            self.accept_pending();
+        }
 
         self.inbound.clear();
-        for index in 0..self.sessions.len() {
+        for index in ready {
             let start = self.inbound.len();
-            self.sessions[index].read_into(&mut self.inbound);
+            let Some(session) = self.sessions.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
+            if session.read_into(&mut self.inbound) {
+                self.still_readable.push(index);
+            }
 
             // Attribute each session's account from its *own* first command.
             // Reading everyone into one buffer first and then handing accounts
             // out would give a session whoever happened to be at the front.
-            if self.sessions[index].account.is_none()
+            if session.account.is_none()
                 && let Some(command) = self.inbound.get(start)
             {
                 let account = command.account;
-                self.sessions[index].account = Some(account);
+                session.account = Some(account);
                 // A session always gets its own private feed; it has to ask for
                 // anything public.
                 let channel = Channel::Account(account);
                 let from = self.venue.subscribe(channel);
-                self.sessions[index].follow(channel, from);
+                self.session_at(index).follow(channel, from);
             }
 
             // Control messages belong to the connection, not the venue. Taking
             // them out here is what keeps them out of the journal: a
             // subscription replayed after a restart would resurrect a feed for a
             // connection that no longer exists.
-            let account = self.sessions[index].account.unwrap_or_default();
+            let account = self.session_at(index).account.unwrap_or_default();
             let mut cursor = start;
             while cursor < self.inbound.len() {
                 if self.inbound[cursor].is_session_control() {
@@ -400,8 +494,32 @@ impl<S: LogStorage> Server<S> {
         }
 
         self.push_updates();
-        self.sessions.retain(|session| session.open);
+        self.drop_closed();
         Ok(applied)
+    }
+
+    fn session_at(&mut self, index: usize) -> &mut Session {
+        self.sessions[index]
+            .as_mut()
+            .expect("a ready token names a live session")
+    }
+
+    /// Deregisters and forgets whatever closed this pass.
+    fn drop_closed(&mut self) {
+        for index in 0..self.sessions.len() {
+            let closed = self.sessions[index]
+                .as_ref()
+                .is_some_and(|session| !session.open);
+            if closed {
+                if let Some(mut session) = self.sessions[index].take() {
+                    let _ = self.poll.registry().deregister(&mut session.stream);
+                }
+                self.free.push(index);
+                self.live -= 1;
+            }
+        }
+        self.still_readable
+            .retain(|index| self.sessions[*index].is_some());
     }
 
     /// Starts or stops one session's feed. A channel that does not decode is
@@ -413,9 +531,9 @@ impl<S: LogStorage> Server<S> {
         let channel = Channel::requested(kind, command.symbol, account);
         if command.kind() == Some(CommandKind::Subscribe) {
             let from = self.venue.subscribe(channel);
-            self.sessions[index].follow(channel, from);
+            self.session_at(index).follow(channel, from);
         } else {
-            self.sessions[index].stop_following(channel);
+            self.session_at(index).stop_following(channel);
         }
     }
 
@@ -429,21 +547,33 @@ impl<S: LogStorage> Server<S> {
     fn accept_pending(&mut self) {
         loop {
             match self.listener.accept() {
-                Ok((stream, _)) => {
+                Ok((mut stream, _)) => {
                     // Accepted and dropped, so the client learns immediately
                     // rather than waiting on a venue that will not read it.
-                    if self.sessions.len() >= self.max_sessions {
+                    if self.live >= self.max_sessions {
                         self.refused += 1;
                         drop(stream);
                         continue;
                     }
-                    if stream.set_nonblocking(true).is_ok() && stream.set_nodelay(true).is_ok() {
-                        self.sessions.push(Session::new(
-                            stream,
-                            self.max_records_per_session,
-                            self.max_outbox,
-                        ));
+                    let index = self.free.pop().unwrap_or(self.sessions.len());
+                    if self
+                        .poll
+                        .registry()
+                        .register(&mut stream, session_token(index), Interest::READABLE)
+                        .is_err()
+                    {
+                        self.free.push(index);
+                        continue;
                     }
+                    let _ = stream.set_nodelay(true);
+                    let session =
+                        Session::new(stream, self.max_records_per_session, self.max_outbox);
+                    if index == self.sessions.len() {
+                        self.sessions.push(Some(session));
+                    } else {
+                        self.sessions[index] = Some(session);
+                    }
+                    self.live += 1;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
@@ -453,7 +583,7 @@ impl<S: LogStorage> Server<S> {
 
     /// Sends each session everything on its channels it has not seen.
     fn push_updates(&mut self) {
-        for session in &mut self.sessions {
+        for session in self.sessions.iter_mut().filter_map(Option::as_mut) {
             for (channel, cursor) in &mut session.cursors {
                 self.outbound.clear();
                 match self.venue.resume(*channel, *cursor, &mut self.outbound) {
@@ -480,7 +610,11 @@ impl<S: LogStorage> Server<S> {
 ///
 /// # Errors
 /// Returns the underlying I/O error.
-pub fn read_events(stream: &mut TcpStream, want: usize, out: &mut Vec<Event>) -> io::Result<()> {
+pub fn read_events(
+    stream: &mut std::net::TcpStream,
+    want: usize,
+    out: &mut Vec<Event>,
+) -> io::Result<()> {
     let mut buffer = vec![0_u8; want * FRAME_LEN];
     let mut filled = 0;
     while out.len() < want {

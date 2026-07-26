@@ -232,15 +232,21 @@ These were argued out. Do not relitigate without new information.
   answers it in one lookup and never touches the book.
 - **MBP public, MBO colocated only.** MBO leaks trading patterns and is 10–100×
   the volume.
-- **An idle connection is not free, and the active clients pay for it.** The
-  loop reads every session each pass, measured at **425 ns per idle session per
-  pass** and perfectly linear. 512 connections put ~220 us of scanning in front
-  of every order; 10,000 would put 4.25 ms. This is the loop's hard limit, and
-  the fix beyond a few hundred connections is readiness notification (epoll or
-  IOCP, i.e. `mio`) rather than a scan -- a different design, not a tuning knob.
-  Until then `max_sessions` makes the ceiling a stated policy: the venue refuses
-  past it and counts the refusals, instead of accepting everyone and serving
-  them all slowly.
+- **An idle connection is not free, and the active clients pay for it.** Reading
+  every socket every pass measured **422 ns per idle session**, perfectly linear,
+  and it lands in the same pass as real orders -- 10,000 connections would have
+  put 4.25 ms in front of every order, invisibly. Sessions are now found by
+  readiness (`mio`: epoll, IOCP or kqueue), which took the marginal cost to
+  **23 ns**, an 18x reduction, and the residue is userspace rather than syscalls.
+  A ceiling still exists because the cost is still linear, so `max_sessions`
+  refuses past it and counts the refusals.
+- **Edge-triggered readiness means reading until `WouldBlock`, not once.** The
+  loop deliberately reads one buffer per session per pass, for fairness. With
+  edge triggering that is not enough on its own: a socket is reported readable
+  once and not again until exhausted, so a session that stopped mid-buffer went
+  silent forever. It now stays in the ready set until a read actually returns
+  `WouldBlock`, which keeps the fairness bound and costs one extra read after a
+  session's last data.
 - **A per-channel cost multiplies by the instrument list.** The retention window
   is 64 bytes an event per channel and there are two public channels per symbol,
   so the shipped default of 65,536 wanted 7.8 GiB across a thousand

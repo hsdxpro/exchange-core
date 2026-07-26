@@ -387,7 +387,7 @@ target_recovery_ms = 2000
 replay_rate = 7600000
 retained_per_channel = 65536
 max_records_per_session = 4096
-max_sessions = 512
+max_sessions = 4096
 ack_timeout_ms = 250
 max_feed_memory_mb = 64
 replica = 10.0.0.2:7100
@@ -412,7 +412,7 @@ max_open_orders = 1000000
         assert_eq!(config.replay_rate, 7_600_000);
         assert_eq!(config.retained_per_channel, 65_536);
         assert_eq!(config.max_records_per_session, 4_096);
-        assert_eq!(config.max_sessions, 512);
+        assert_eq!(config.max_sessions, 4_096);
         assert_eq!(config.ack_timeout, Duration::from_millis(250));
         assert_eq!(config.max_feed_memory, 64 * 1024 * 1024);
         assert_eq!(config.replicas, vec!["10.0.0.2:7100", "10.0.0.3:7100"]);

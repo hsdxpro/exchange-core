@@ -100,6 +100,17 @@ fn an_idle_connection_costs_the_venue_a_syscall_every_pass() {
         );
     }
 
+    // Split the cost: a session that follows no public channel pays only for the
+    // read, one that follows two also pays a cursor check each. Knowing which
+    // half dominates decides what is worth changing.
+    let with_feeds = idle_poll_cost(256, true);
+    let without = idle_poll_cost(256, false);
+    println!(
+        "256 sessions: {with_feeds:.0} ns with feeds, {without:.0} ns without          -> read {:.0} ns each, cursors {:.0} ns each",
+        without / 256.0,
+        (with_feeds - without) / 256.0
+    );
+
     let (_, one) = measured[0];
     let (many, lots) = measured[measured.len() - 1];
     let per_session = (lots - one) / many as f64;

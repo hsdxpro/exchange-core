@@ -44,7 +44,7 @@ fn measurement_config() -> Config {
         replay_rate: 7_600_000,
         retained_per_channel: 1 << 16,
         max_records_per_session: 4_096,
-        max_sessions: 512,
+        max_sessions: 4_096,
         replicas: Vec::new(),
         ack_timeout: Duration::from_millis(250),
         max_feed_memory: 64 * 1024 * 1024,
