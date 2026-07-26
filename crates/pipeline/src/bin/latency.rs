@@ -12,12 +12,13 @@
 //! desktop the median moves by a factor of two or more between runs; the
 //! minimum barely moves.
 
-use bx_journal::{FileLog, MemoryLog};
+use bx_journal::{FileLog, MemoryLog, Replica, ReplicatedLog};
 use bx_pipeline::hub::{Channel, Hub};
 use bx_pipeline::instrument::{AssetId, Instrument, Instruments};
 use bx_pipeline::{Exchange, limit_order, market_order};
 use bx_protocol::{Command, CommandKind, Side, Ticks, TimeInForce};
 use std::hint::black_box;
+use std::net::TcpListener;
 use std::time::Instant;
 
 const BTC: AssetId = 1;
@@ -406,6 +407,70 @@ fn recovery() -> (f64, f64, u64) {
     (full_ms, snapshot_ms, snapshot.orders.len() as u64)
 }
 
+/// The same traffic, acknowledged by a quorum instead of by an fsync.
+///
+/// This is the comparison the whole durability design rests on. `on_disk` above
+/// waits for the platter; this waits for another process to confirm it holds the
+/// group. The follower here is on loopback, so this is the floor rather than a
+/// realistic network -- a real LAN adds tens of microseconds. The point is the
+/// shape: the leader stops waiting on its own disk.
+fn replicated(sink: &mut u64, batch: usize) -> Vec<f64> {
+    const SYNCS: u64 = 48;
+    let count: u64 = SYNCS * batch as u64;
+    let mut samples = Vec::with_capacity(3);
+
+    for run in 0..3 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let follower = std::thread::spawn(move || {
+            let mut replica = Replica::new(MemoryLog::new(), false);
+            let _ = replica.serve_one(&listener);
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "bx-replicated-{}-{batch}-{run}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut instruments = Instruments::new();
+        instruments.insert(Instrument::new(
+            SYMBOL,
+            BTC,
+            USD,
+            FLOOR,
+            1_000_000_000,
+            MAX_OPEN_ORDERS,
+        ));
+        let local = FileLog::open(&path).unwrap();
+        let log = ReplicatedLog::connect(local, std::slice::from_ref(&address)).unwrap();
+        let mut exchange = Exchange::new(log, instruments).unwrap();
+        for account in 1..=16 {
+            exchange.deposit(account, USD, u64::MAX).unwrap();
+            exchange.deposit(account, BTC, u64::MAX).unwrap();
+        }
+
+        let mut commands: Vec<Command> = (0..count)
+            .map(|i| {
+                let price = FLOOR + 1_000 + (i % 4_000) as Ticks;
+                limit_order(1 + i % 16, SYMBOL, i + 1, Side::Bid, price, 1)
+            })
+            .collect();
+
+        let started = Instant::now();
+        for chunk in commands.chunks_mut(batch) {
+            let events = exchange.submit_batch(chunk).unwrap();
+            *sink = sink.wrapping_add(events.len() as u64);
+        }
+        samples.push(started.elapsed().as_secs_f64() * 1e9 / count as f64);
+
+        drop(exchange);
+        let _ = follower.join();
+        let _ = std::fs::remove_file(&path);
+    }
+    samples
+}
+
 fn main() {
     let whole_run = Instant::now();
     println!("\nExchange pipeline latency");
@@ -450,6 +515,17 @@ fn main() {
         report(
             &format!("on disk, batch {batch}"),
             &mut on_disk(&mut sink, batch),
+            "per command",
+        );
+    }
+
+    println!();
+    println!("Acknowledged by a quorum instead, follower on loopback:");
+    println!("{}", "-".repeat(80));
+    for batch in [1_usize, 16, 256] {
+        report(
+            &format!("replicated, batch {batch}"),
+            &mut replicated(&mut sink, batch),
             "per command",
         );
     }
