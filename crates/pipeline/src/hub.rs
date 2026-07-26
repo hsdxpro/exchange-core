@@ -21,6 +21,7 @@
 
 use crate::fastmap::FastMap;
 use bx_protocol::{AccountId, ChannelKind, Event, EventKind, Sequence, SymbolId};
+use zerocopy::IntoBytes;
 
 /// What a subscriber can follow.
 ///
@@ -142,6 +143,29 @@ impl Ring {
         }
         Resume::Delivered { next: self.next }
     }
+
+    /// The same, straight into a byte buffer.
+    ///
+    /// An event is a fixed 64 bytes with a declared layout, and the frame on the
+    /// wire is exactly those bytes — so going through a `Vec<Event>` first meant
+    /// copying every event twice on the one path that runs for every subscriber
+    /// on every message. Nothing is written when the read fails, so a lagging
+    /// subscriber's buffer is left exactly as it was.
+    fn read_bytes_from(&self, from: Sequence, out: &mut Vec<u8>) -> Resume {
+        let oldest = self.oldest();
+        if from < oldest {
+            return Resume::Lagged { oldest };
+        }
+        let mut sequence = from.min(self.next);
+        // Reserved once rather than grown per event, so a subscriber catching up
+        // on a window's worth does not walk the doubling.
+        out.reserve((self.next - sequence) as usize * size_of::<Event>());
+        while sequence < self.next {
+            out.extend_from_slice(self.slots[(sequence & self.mask) as usize].as_bytes());
+            sequence += 1;
+        }
+        Resume::Delivered { next: self.next }
+    }
 }
 
 /// Fan-out to subscribed channels, with a bounded replay window on each.
@@ -205,6 +229,20 @@ impl Hub {
         self.channels
             .get(&channel)
             .map_or(Resume::NotSubscribed, |ring| ring.read_from(from, out))
+    }
+
+    /// Everything a subscriber missed, written straight into its outbound bytes.
+    ///
+    /// What [`Self::resume`] does, without the intermediate `Vec<Event>`. A
+    /// gateway wants bytes and the ring holds records that already *are* those
+    /// bytes; the copy between them was work done once per event, per subscriber,
+    /// forever.
+    pub fn resume_bytes(&self, channel: Channel, from: Sequence, out: &mut Vec<u8>) -> Resume {
+        self.channels
+            .get(&channel)
+            .map_or(Resume::NotSubscribed, |ring| {
+                ring.read_bytes_from(from, out)
+            })
     }
 
     /// Sequence the next event on `channel` will take.

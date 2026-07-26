@@ -402,7 +402,6 @@ pub struct Server<S: LogStorage> {
     timestamps: bool,
     /// Reused across passes so a steady-state loop allocates nothing.
     inbound: Vec<Command>,
-    outbound: Vec<Event>,
     max_records_per_session: usize,
     /// Connections this venue will hold at once.
     ///
@@ -456,7 +455,6 @@ impl<S: LogStorage> Server<S> {
             still_readable: Vec::new(),
             closing: Vec::new(),
             inbound: Vec::new(),
-            outbound: Vec::new(),
             max_records_per_session,
             max_sessions,
             max_outbox: retained_per_channel * FRAME_LEN,
@@ -1101,14 +1099,17 @@ impl<S: LogStorage> Server<S> {
             .filter_map(|(index, slot)| slot.as_mut().map(|session| (index, session)))
         {
             for (channel, cursor) in &mut session.cursors {
-                self.outbound.clear();
-                match self.venue.resume(*channel, *cursor, &mut self.outbound) {
+                // Straight from the ring into the bytes that go on the wire. The
+                // events already *are* those bytes, so the `Vec<Event>` that used
+                // to sit between them copied every event a second time, once per
+                // subscriber, on every message.
+                match self
+                    .venue
+                    .resume_bytes(*channel, *cursor, &mut session.outbox)
+                {
                     Resume::Delivered { next } => *cursor = next,
                     Resume::Lagged { .. } => lagged.push((index, *channel)),
                     Resume::NotSubscribed => {}
-                }
-                for event in &self.outbound {
-                    encode(event, &mut session.outbox);
                 }
             }
             session.flush();

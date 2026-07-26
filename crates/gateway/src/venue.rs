@@ -68,6 +68,15 @@ impl<S: LogStorage> Venue<S> {
         self.hub.resume(channel, from, out)
     }
 
+    /// The same, straight into a session's outbound bytes.
+    ///
+    /// What the server actually wants: the frame on the wire is the event's own
+    /// bytes, so a `Vec<Event>` in between was a second copy of every event, for
+    /// every subscriber, on every message.
+    pub fn resume_bytes(&self, channel: Channel, from: Sequence, out: &mut Vec<u8>) -> Resume {
+        self.hub.resume_bytes(channel, from, out)
+    }
+
     /// # Errors
     /// Fails only if the journal cannot be written.
     pub fn deposit(
