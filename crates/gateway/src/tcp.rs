@@ -29,6 +29,13 @@
 //! difference is invisible; at a thousand, sending every session every book
 //! would multiply the venue's outbound traffic by the number of instruments
 //! nobody asked about.
+//!
+//! A client following a book is sent the current levels before any increments.
+//! Increments alone are not enough to build a book -- a subscriber has no idea
+//! what was resting before it arrived -- so the venue states the levels as
+//! `BookSnapshot` at the sequence the feed resumes from, and `BookDelta` follows.
+//! The same thing happens if a client falls outside the retention window, which
+//! is what makes falling behind recoverable instead of fatal.
 
 use crate::codec::{Decoder, FRAME_LEN, encode};
 use crate::venue::Venue;
@@ -36,7 +43,9 @@ use bx_journal::LogStorage;
 use bx_pipeline::hub::{Channel, Resume};
 use bx_pipeline::instrument::Instruments;
 use bx_pipeline::snapshot::Snapshot;
-use bx_protocol::{AccountId, Command, CommandKind, Event, Sequence};
+use bx_protocol::{
+    AccountId, Command, CommandKind, Event, EventKind, Sequence, Side, SymbolId, Ticks,
+};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use std::fs::File;
@@ -109,6 +118,15 @@ impl Session {
 
     fn stop_following(&mut self, channel: Channel) {
         self.cursors.retain(|(held, _)| *held != channel);
+    }
+
+    /// Moves a followed channel's cursor, for a session being resynchronised.
+    fn reposition(&mut self, channel: Channel, to: Sequence) {
+        for (held, cursor) in &mut self.cursors {
+            if *held == channel {
+                *cursor = to;
+            }
+        }
     }
 
     /// Reads one buffer's worth, appending decoded commands to `out`.
@@ -559,8 +577,53 @@ impl<S: LogStorage> Server<S> {
         if command.kind() == Some(CommandKind::Subscribe) {
             let from = self.venue.subscribe(channel);
             self.session_at(index).follow(channel, from);
+            if let Channel::Book(symbol) = channel {
+                self.send_book_state(index, symbol, from);
+            }
         } else {
             self.session_at(index).stop_following(channel);
+        }
+    }
+
+    /// Writes the book's current levels to one session as `BookSnapshot`.
+    ///
+    /// `at` is the channel sequence the increments will resume from, and every
+    /// snapshot event carries it, so a client knows precisely where state ends
+    /// and change begins. Taken in the same pass as the cursor, so the two cannot
+    /// disagree.
+    fn send_book_state(&mut self, index: usize, symbol: SymbolId, at: Sequence) {
+        let Some(book) = self.venue.book(symbol) else {
+            return;
+        };
+        // Owned, so the borrow of the venue ends before the session is written.
+        let levels: Vec<(Side, Ticks, u64)> = [Side::Bid, Side::Ask]
+            .into_iter()
+            .flat_map(|side| {
+                book.depth(side, usize::MAX)
+                    .into_iter()
+                    .map(move |(price, quantity)| (side, price, quantity))
+            })
+            .collect();
+
+        let session = self.session_at(index);
+        for (side, price, quantity) in levels {
+            encode(
+                &Event {
+                    sequence: at,
+                    cause_sequence: 0,
+                    account: 0,
+                    order_id: 0,
+                    counterparty_order_id: 0,
+                    quantity,
+                    price,
+                    symbol,
+                    kind: EventKind::BookSnapshot as u8,
+                    side: side as u8,
+                    reject_reason: 0,
+                    _pad: [0; 1],
+                },
+                &mut session.outbox,
+            );
         }
     }
 
@@ -611,6 +674,8 @@ impl<S: LogStorage> Server<S> {
     /// Sends each session everything on its channels it has not seen.
     fn push_updates(&mut self) {
         let mut closed = Vec::new();
+        // Channels that fell outside the window, handled after the borrow ends.
+        let mut lagged: Vec<(usize, Channel)> = Vec::new();
         for (index, session) in self
             .sessions
             .iter_mut()
@@ -621,10 +686,7 @@ impl<S: LogStorage> Server<S> {
                 self.outbound.clear();
                 match self.venue.resume(*channel, *cursor, &mut self.outbound) {
                     Resume::Delivered { next } => *cursor = next,
-                    // The session fell outside the retention window. It is told
-                    // by being dropped rather than being fed a hole; a real
-                    // client reconnects and takes a snapshot.
-                    Resume::Lagged { .. } => session.open = false,
+                    Resume::Lagged { .. } => lagged.push((index, *channel)),
                     Resume::NotSubscribed => {}
                 }
                 for event in &self.outbound {
@@ -640,6 +702,59 @@ impl<S: LogStorage> Server<S> {
             }
         }
         self.closing.append(&mut closed);
+        self.resynchronise(&lagged);
+    }
+
+    /// Puts a session that fell outside the retention window back on its feet.
+    ///
+    /// Rarely reached, and worth saying why: a cursor advances every pass whether
+    /// or not the client is reading, so a session only falls outside the window if
+    /// a single group produced more events than the window holds. The ordinary
+    /// overload path is the outbox budget, which sheds the session -- and what
+    /// makes *that* survivable is that reconnecting restates the book.
+    ///
+    /// What is possible depends on what the channel carries, and the three cases
+    /// are genuinely different rather than three spellings of one:
+    ///
+    /// - **A book** is state, so it can be restated: send the current levels and
+    ///   resume from there. Falling behind costs the client the increments it
+    ///   missed and nothing else.
+    /// - **A tape** is history. The prints are gone, and no snapshot brings them
+    ///   back, so the cursor jumps to the present. The tape is informational, so
+    ///   a hole in it is a loss of information rather than of correctness.
+    /// - **An account feed** is neither. Its missed events are the client's own
+    ///   fills, and skipping them would leave the client believing a position it
+    ///   does not hold. Nothing here can repair that, so the session is dropped:
+    ///   a client that knows it is broken can reconcile, one that was quietly
+    ///   skipped forward cannot. An order-status query is what would fix this
+    ///   properly, and there is not one yet.
+    fn resynchronise(&mut self, lagged: &[(usize, Channel)]) {
+        for (index, channel) in lagged.iter().copied() {
+            match channel {
+                Channel::Book(symbol) => {
+                    let at = self.venue.hub().next_sequence(channel).unwrap_or_default();
+                    if let Some(session) = self.sessions[index].as_mut() {
+                        session.reposition(channel, at);
+                        // Anything already queued describes a book the client is
+                        // about to be told afresh.
+                        session.outbox.clear();
+                    }
+                    self.send_book_state(index, symbol, at);
+                }
+                Channel::Trades(_) => {
+                    let at = self.venue.hub().next_sequence(channel).unwrap_or_default();
+                    if let Some(session) = self.sessions[index].as_mut() {
+                        session.reposition(channel, at);
+                    }
+                }
+                Channel::Account(_) => {
+                    if let Some(session) = self.sessions[index].as_mut() {
+                        session.open = false;
+                    }
+                    self.closing.push(index);
+                }
+            }
+        }
     }
 }
 

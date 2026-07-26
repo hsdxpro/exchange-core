@@ -437,6 +437,155 @@ fn a_client_that_never_reads_is_dropped_instead_of_growing_the_venue() {
 }
 
 #[test]
+fn a_client_joining_a_book_that_is_already_trading_can_rebuild_it() {
+    // Increments alone cannot build a book: a subscriber has no idea what was
+    // resting before it arrived. The venue states the current levels first.
+    // Every end-to-end test before this one happened to subscribe while the book
+    // was empty, where an empty book plus increments is accidentally correct.
+    let venue = Running::start();
+
+    // One client builds a book.
+    let mut maker = venue.connect();
+    send(
+        &mut maker,
+        &[
+            limit_order(1, SYMBOL, 101, Side::Bid, 10_100, 5),
+            limit_order(1, SYMBOL, 102, Side::Bid, 10_090, 3),
+            limit_order(1, SYMBOL, 103, Side::Ask, 10_200, 7),
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(80));
+
+    // A second client arrives afterwards and asks for the book.
+    let mut latecomer = venue.connect();
+    watch_public(&mut latecomer, 4);
+
+    let events = collect_until(&mut latecomer, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::BookSnapshot as u8)
+            .count()
+            >= 3
+    });
+    let state: Vec<(u8, Ticks, u64)> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::BookSnapshot as u8)
+        .map(|e| (e.side, e.price, e.quantity))
+        .collect();
+
+    assert_eq!(
+        state.len(),
+        3,
+        "the venue did not state the book it already had: {events:?}"
+    );
+    assert!(state.contains(&(Side::Bid as u8, 10_100, 5)));
+    assert!(state.contains(&(Side::Bid as u8, 10_090, 3)));
+    assert!(state.contains(&(Side::Ask as u8, 10_200, 7)));
+
+    // And increments follow from the same position, so the two compose.
+    send(
+        &mut maker,
+        &[limit_order(1, SYMBOL, 104, Side::Bid, 10_095, 2)],
+    );
+    let after = collect_until(&mut latecomer, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::BookDelta)
+    });
+    let delta = after
+        .iter()
+        .find(|e| e.kind == EventKind::BookDelta as u8)
+        .expect("no increment arrived after the snapshot");
+    assert_eq!((delta.price, delta.quantity), (10_095, 2));
+}
+
+#[test]
+fn a_client_shed_for_being_slow_can_reconnect_and_rebuild_the_book() {
+    // This is the recovery story end to end. A client too slow to read is shed,
+    // because the alternative is queueing for it without limit. What makes that
+    // survivable is that reconnecting restates the book, so the client comes back
+    // with a correct picture rather than a stream of increments against a book it
+    // no longer knows.
+    let venue = Running::start();
+
+    // A silent client: subscribed, never reading.
+    let mut silent = venue.connect();
+    send(
+        &mut silent,
+        &[limit_order(3, SYMBOL, 7_001, Side::Bid, 10_050, 1)],
+    );
+    watch_public(&mut silent, 3);
+
+    // A maker that reads, generating far more feed than the silent client's
+    // queue is allowed to hold.
+    let mut maker = venue.connect();
+    let mut maker_reader = maker.try_clone().unwrap();
+    let sending = Arc::new(AtomicBool::new(true));
+    let still_sending = Arc::clone(&sending);
+    let drain = std::thread::spawn(move || {
+        let mut scratch = Vec::new();
+        while still_sending.load(Ordering::Relaxed) {
+            scratch.clear();
+            if read_events(&mut maker_reader, 1, &mut scratch).is_err() || scratch.is_empty() {
+                break;
+            }
+        }
+    });
+
+    for round in 0..80_u64 {
+        let commands: Vec<Command> = (0..500)
+            .map(|i| {
+                limit_order(
+                    1,
+                    SYMBOL,
+                    round * 500 + i + 1,
+                    Side::Bid,
+                    FLOOR + 1_000 + ((round * 500 + i) % 4_000) as Ticks,
+                    1,
+                )
+            })
+            .collect();
+        send(&mut maker, &commands);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    sending.store(false, Ordering::Relaxed);
+    let _ = drain.join();
+
+    // The silent one is gone; the venue did not queue for it forever.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while venue.sessions_hint() > 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        venue.sessions_hint() <= 1,
+        "the slow client was never shed, so its queue was unbounded"
+    );
+    drop(silent);
+
+    // It comes back, and is told the book as it now stands.
+    let mut returning = venue.connect();
+    watch_public(&mut returning, 3);
+    let events = collect_until(&mut returning, Duration::from_secs(10), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::BookSnapshot as u8)
+            .count()
+            > 100
+    });
+    let levels = events
+        .iter()
+        .filter(|e| e.kind == EventKind::BookSnapshot as u8)
+        .count();
+    assert!(
+        levels > 100,
+        "a reconnecting client got {levels} levels of book state, so it cannot          rebuild what it missed"
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::BookSnapshot as u8)
+            .all(|e| e.quantity > 0),
+        "an empty level was sent as state"
+    );
+}
+
+#[test]
 fn a_channel_nobody_asked_for_is_never_delivered() {
     // A session gets its own acknowledgements and nothing else until it asks.
     // At a thousand instruments, handing every session every book would

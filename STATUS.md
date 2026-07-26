@@ -241,6 +241,18 @@ These were argued out. Do not relitigate without new information.
   answers it in one lookup and never touches the book.
 - **MBP public, MBO colocated only.** MBO leaks trading patterns and is 10–100×
   the volume.
+- **A subscriber cannot build a book out of increments.** It has no idea what
+  was resting before it arrived. Every end-to-end test happened to subscribe
+  while the book was empty, where empty-plus-increments is accidentally correct,
+  so this went unnoticed: a client joining a live venue could never construct the
+  book at all. Subscribing now sends the current levels as `BookSnapshot` stamped
+  with the sequence the increments resume from, so state and change compose
+  exactly.
+- **A cursor advances whether or not the client reads.** Which means falling
+  outside the retention window is nearly unreachable, and the real overload path
+  is the per-session outbox budget -- that sheds the connection. Both are fine
+  now that reconnecting restates the book; before, a shed client came back to a
+  stream of increments against a book it no longer knew.
 - **An idle connection is not free, and the active clients pay for it.** Reading
   every socket every pass measured **422 ns per idle session**, perfectly linear,
   and it lands in the same pass as real orders -- 10,000 connections would have

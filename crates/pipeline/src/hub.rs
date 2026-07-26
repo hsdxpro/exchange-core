@@ -59,7 +59,7 @@ impl Channel {
     #[must_use]
     pub fn of(event: &Event) -> Option<Self> {
         Some(match event.kind()? {
-            EventKind::BookDelta => Self::Book(event.symbol),
+            EventKind::BookDelta | EventKind::BookSnapshot => Self::Book(event.symbol),
             EventKind::Trade => Self::Trades(event.symbol),
             EventKind::Received
             | EventKind::Rejected

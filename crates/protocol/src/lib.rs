@@ -188,6 +188,15 @@ pub enum EventKind {
     /// One price level changed. The unit of the depth feed.
     BookDelta = 5,
     Trade = 6,
+    /// One price level as it stands right now, not a change to it.
+    ///
+    /// Sent when a client starts following a book, and again if it falls outside
+    /// the retention window. A subscriber cannot build a book out of increments
+    /// alone -- it has no idea what was there before it arrived -- so the venue
+    /// states the current levels first and increments follow. Every one carries
+    /// the channel sequence the snapshot is taken at, so a client knows exactly
+    /// where the increments resume.
+    BookSnapshot = 7,
 }
 
 // ---------------------------------------------------------------- records
@@ -258,6 +267,7 @@ impl Event {
             4 => Some(EventKind::Canceled),
             5 => Some(EventKind::BookDelta),
             6 => Some(EventKind::Trade),
+            7 => Some(EventKind::BookSnapshot),
             _ => None,
         }
     }
@@ -605,6 +615,7 @@ mod tests {
             (4, EventKind::Canceled),
             (5, EventKind::BookDelta),
             (6, EventKind::Trade),
+            (7, EventKind::BookSnapshot),
         ] {
             let event = Event {
                 kind: byte,
@@ -614,7 +625,7 @@ mod tests {
         }
         assert!(
             Event {
-                kind: 7,
+                kind: 8,
                 ..Event::default()
             }
             .kind()
