@@ -118,6 +118,39 @@ fn crossing_orders(sink: &mut u64) -> Vec<f64> {
     samples
 }
 
+/// The same crossing path, but for an account that is also resting on the
+/// symbol, so the self-match check actually runs.
+///
+/// `crossing_orders` above measures a taker with nothing resting, which is the
+/// common case and skips the check in one lookup. That leaves the expensive
+/// branch unmeasured, and an unmeasured branch is where the last two hundred
+/// fold regression lived. Here the taker keeps a resting order of its own two
+/// levels away, so every order pays for the walk.
+fn crossing_with_self_check(sink: &mut u64) -> Vec<f64> {
+    const COUNT: u64 = 50_000;
+    let mut samples = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut exchange = venue();
+        // Account 2 takes, and also rests an ask far behind the best.
+        let mut own = limit_order(2, SYMBOL, u64::MAX, Side::Ask, FLOOR + 900, 1);
+        exchange.submit(&mut own).unwrap();
+        for i in 0..COUNT {
+            let mut maker = limit_order(1, SYMBOL, i + 1, Side::Ask, FLOOR + 500, 1);
+            exchange.submit(&mut maker).unwrap();
+        }
+
+        let started = Instant::now();
+        for i in 0..COUNT {
+            let mut taker = market_order(2, SYMBOL, COUNT + i + 1, Side::Bid, 1);
+            let events = exchange.submit(&mut taker).unwrap();
+            *sink = sink.wrapping_add(events.len() as u64);
+        }
+        samples.push(started.elapsed().as_secs_f64() * 1e9 / COUNT as f64);
+        black_box(&exchange);
+    }
+    samples
+}
+
 /// Cancel by client order ID, which pays for the hash lookup the engine's dense
 /// index avoids internally.
 fn cancels(sink: &mut u64) -> Vec<f64> {
@@ -492,6 +525,11 @@ fn main() {
     report(
         "crossing order, one fill",
         &mut crossing_orders(&mut sink),
+        "per order",
+    );
+    report(
+        "crossing, self-match check runs",
+        &mut crossing_with_self_check(&mut sink),
         "per order",
     );
     report("cancel by order id", &mut cancels(&mut sink), "per cancel");

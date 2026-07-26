@@ -555,6 +555,115 @@ mod tests {
         assert_eq!(per_book, 2 << 20, "per-book level table changed");
     }
 
+    /// Counts how many resting orders a crossable walk actually touches.
+    ///
+    /// Counting visits rather than timing is the point: a walk that visits the
+    /// whole book still returns the right answer, so only a count catches it.
+    /// The regression this guards cost 35.8 microseconds against 175
+    /// nanoseconds and every test still passed.
+    fn crossable_visits(
+        book: &Book,
+        side: Side,
+        limit: Ticks,
+        market: bool,
+        stop_after: usize,
+    ) -> usize {
+        let mut visits = 0;
+        book.for_each_crossable(side, limit, market, |_| {
+            visits += 1;
+            visits < stop_after
+        });
+        visits
+    }
+
+    #[test]
+    fn a_crossable_walk_stops_when_the_caller_says_so() {
+        // A level can hold every order in the book, so a caller that needs only
+        // the front of the queue must not pay for the rest of it.
+        let mut book = book();
+        for order in 1..=1_000 {
+            rest(&mut book, order, Side::Ask, 1_500, 1);
+        }
+        assert_eq!(
+            crossable_visits(&book, Side::Bid, 1_500, false, 1),
+            1,
+            "the walk did not stop inside the level"
+        );
+        assert_eq!(crossable_visits(&book, Side::Bid, 1_500, false, 7), 7);
+    }
+
+    #[test]
+    fn a_crossable_walk_never_visits_a_level_it_cannot_reach() {
+        let mut book = book();
+        // Asks at 1_500, 1_600, 1_700, one order each.
+        for (index, price) in [1_500, 1_600, 1_700].iter().enumerate() {
+            rest(&mut book, index as u64 + 1, Side::Ask, *price, 1);
+        }
+
+        // A bid at 1_500 reaches one level, not three.
+        assert_eq!(
+            crossable_visits(&book, Side::Bid, 1_500, false, usize::MAX),
+            1
+        );
+        assert_eq!(
+            crossable_visits(&book, Side::Bid, 1_600, false, usize::MAX),
+            2
+        );
+        assert_eq!(
+            crossable_visits(&book, Side::Bid, 1_700, false, usize::MAX),
+            3
+        );
+        // A bid below every ask reaches nothing at all.
+        assert_eq!(
+            crossable_visits(&book, Side::Bid, 1_400, false, usize::MAX),
+            0
+        );
+        // A market order carries no limit and reaches all of them.
+        assert_eq!(crossable_visits(&book, Side::Bid, 0, true, usize::MAX), 3);
+    }
+
+    #[test]
+    fn a_crossable_walk_yields_orders_in_the_order_they_would_be_consumed() {
+        let mut book = book();
+        // Two levels, two orders each, resting in a known sequence.
+        rest(&mut book, 1, Side::Ask, 1_500, 1);
+        rest(&mut book, 2, Side::Ask, 1_500, 1);
+        rest(&mut book, 3, Side::Ask, 1_600, 1);
+        rest(&mut book, 4, Side::Ask, 1_600, 1);
+
+        let mut seen = Vec::new();
+        book.for_each_crossable(Side::Bid, 1_600, false, |resting| {
+            seen.push(resting.order);
+            true
+        });
+        assert_eq!(
+            seen,
+            vec![1, 2, 3, 4],
+            "price-then-time order is what makes a self-match check correct"
+        );
+    }
+
+    #[test]
+    fn a_crossable_walk_on_the_other_side_reads_prices_the_other_way() {
+        let mut book = book();
+        for (index, price) in [1_500, 1_400, 1_300].iter().enumerate() {
+            rest(&mut book, index as u64 + 1, Side::Bid, *price, 1);
+        }
+        // An ask at 1_500 reaches only the best bid; at 1_300 it reaches all.
+        assert_eq!(
+            crossable_visits(&book, Side::Ask, 1_500, false, usize::MAX),
+            1
+        );
+        assert_eq!(
+            crossable_visits(&book, Side::Ask, 1_300, false, usize::MAX),
+            3
+        );
+        assert_eq!(
+            crossable_visits(&book, Side::Ask, 1_600, false, usize::MAX),
+            0
+        );
+    }
+
     #[test]
     fn there_is_no_limit_on_orders_at_one_price_level() {
         // A price level is a head and tail index into one shared pool, not an
