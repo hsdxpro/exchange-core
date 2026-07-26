@@ -257,6 +257,140 @@ fn a_book_is_stated_before_its_increments() {
 }
 
 #[test]
+fn a_client_that_disconnects_reconnects_and_rebuilds_what_it_missed() {
+    // The disconnect/reconnect path end to end. A client trades, drops entirely,
+    // the venue keeps trading without it, and it comes back to a book it can
+    // reconstruct -- which needs the state, not just the changes since it left.
+    let venue = Running::start();
+    runtime().block_on(async {
+        {
+            let mut early = connect(&venue).await;
+            send(
+                &mut early,
+                &[limit_order(1, SYMBOL, 101, Side::Bid, 10_100, 5)],
+            )
+            .await;
+            collect_until(&mut early.acks, Duration::from_secs(5), |seen| {
+                !seen.is_empty()
+            })
+            .await;
+            // Connection dropped: no close handshake, just gone.
+        }
+
+        // The venue carries on, and the book moves while nobody is watching.
+        let mut other = connect(&venue).await;
+        send(
+            &mut other,
+            &[
+                limit_order(2, SYMBOL, 201, Side::Bid, 10_090, 4),
+                limit_order(2, SYMBOL, 202, Side::Ask, 10_300, 6),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Back again, on a fresh connection, asking for the book.
+        let mut returning = connect(&venue).await;
+        send(
+            &mut returning,
+            &[
+                limit_order(1, SYMBOL, 999, Side::Bid, 10_000, 1),
+                subscribe(1, SYMBOL, ChannelKind::Book),
+            ],
+        )
+        .await;
+        let mut feed = returning
+            .connection
+            .accept_uni()
+            .await
+            .expect("no feed stream after reconnecting");
+        // Collected once, until the first increment arrives. The snapshot is sent
+        // before any increment, so a BookDelta means the state is complete --
+        // and collecting twice would have the first pass drain the increment the
+        // second is waiting for.
+        let events = collect_until(&mut feed, Duration::from_secs(10), |seen| {
+            seen.iter().any(|e| e.kind == EventKind::BookDelta as u8)
+        })
+        .await;
+        let state: Vec<(u8, Ticks, u64)> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::BookSnapshot as u8)
+            .map(|e| (e.side, e.price, e.quantity))
+            .collect();
+
+        // Everything that was resting when it subscribed, including what moved
+        // while it was away and its own order from before the disconnect.
+        assert!(state.contains(&(Side::Bid as u8, 10_100, 5)), "{state:?}");
+        assert!(state.contains(&(Side::Bid as u8, 10_090, 4)), "{state:?}");
+        assert!(state.contains(&(Side::Ask as u8, 10_300, 6)), "{state:?}");
+
+        // Its own new order was in the same batch as the subscription, so it
+        // belongs *after* the snapshot: state is taken at the sequence the
+        // increments resume from, and anything later arrives as an increment.
+        // The split between state and change is exact rather than approximate.
+        assert!(
+            !state.contains(&(Side::Bid as u8, 10_000, 1)),
+            "an order placed after the snapshot point appeared inside it: {state:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == EventKind::BookDelta as u8 && e.price == 10_000),
+            "the order placed after the snapshot never arrived as an increment"
+        );
+    });
+}
+
+#[test]
+fn a_venue_serves_many_connections_at_once_without_crossing_their_feeds() {
+    const CLIENTS: u64 = 32;
+    let venue = Running::start();
+    runtime().block_on(async {
+        let mut clients = Vec::new();
+        for account in 1..=CLIENTS.min(8) {
+            let mut client = connect(&venue).await;
+            // Own price band, so orders rest rather than crossing.
+            let base = FLOOR + 1_000 + (account as Ticks) * 300;
+            let commands: Vec<Command> = (0..50)
+                .map(|i| {
+                    limit_order(
+                        account,
+                        SYMBOL,
+                        account * 10_000 + i,
+                        Side::Bid,
+                        base + i as Ticks,
+                        1,
+                    )
+                })
+                .collect();
+            send(&mut client, &commands).await;
+            clients.push((account, client));
+        }
+
+        for (account, client) in &mut clients {
+            let events = collect_until(&mut client.acks, Duration::from_secs(15), |seen| {
+                seen.iter()
+                    .filter(|e| e.kind == EventKind::Received as u8)
+                    .count()
+                    >= 50
+            })
+            .await;
+            let acknowledged = events
+                .iter()
+                .filter(|e| e.kind == EventKind::Received as u8)
+                .count();
+            assert_eq!(acknowledged, 50, "account {account} lost orders");
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e.account == 0 || e.account == *account),
+                "account {account} received another account's private events"
+            );
+        }
+    });
+}
+
+#[test]
 fn a_stalled_market_data_stream_does_not_block_order_acknowledgements() {
     // The reason this transport was chosen. The client subscribes to depth and
     // then never reads that stream, while continuing to trade. On one TCP socket

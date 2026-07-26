@@ -145,6 +145,20 @@ impl Accounts {
     /// Trading moves value between accounts; it never creates or destroys it.
     /// Tests assert this is invariant across a whole session, which catches a
     /// whole class of accounting bug that per-operation checks miss.
+    /// Holdings the venue is tracking: one per account per asset it has touched.
+    ///
+    /// Memory is per *holding*, not per registered user, which is what makes a
+    /// large user base cheap: an account that has never traded costs nothing.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.balances.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.balances.is_empty()
+    }
+
     /// Every non-empty holding, sorted, so a snapshot of the same state is
     /// byte-identical no matter what order the balances were created in.
     #[must_use]

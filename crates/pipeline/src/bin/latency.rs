@@ -290,6 +290,64 @@ fn mixed_stream(sink: &mut u64) -> Vec<f64> {
     samples
 }
 
+/// The same traffic, spread over a million accounts.
+///
+/// Latency is measured everywhere else with sixteen accounts, which keeps the
+/// balance map in cache and flatters it. A venue with a million registered users
+/// does not, and the command path touches that map several times per order, so
+/// this is where a scale claim either holds or does not.
+///
+/// Returns the samples and how many balance records the venue is holding, since
+/// memory is the other half of the question.
+fn mixed_stream_at_scale(sink: &mut u64, accounts: u64) -> (Vec<f64>, usize) {
+    // Under the order pool, so every command rests and none is measured on the
+    // reject path. The assertion below is what keeps that true.
+    const COUNT: u64 = 100_000;
+    let mut samples = Vec::with_capacity(3);
+    let mut records = 0;
+    for _ in 0..3 {
+        let mut instruments = Instruments::new();
+        instruments.insert(Instrument::new(
+            SYMBOL,
+            BTC,
+            USD,
+            FLOOR,
+            1_000_000_000,
+            MAX_OPEN_ORDERS,
+        ));
+        let mut exchange = Exchange::new(MemoryLog::new(), instruments).unwrap();
+        for account in 1..=accounts {
+            exchange.deposit(account, USD, u64::MAX / 4).unwrap();
+            exchange.deposit(account, BTC, u64::MAX / 4).unwrap();
+        }
+        records = exchange.accounts().len();
+
+        // Every command is a different account, spread by a multiplicative hash,
+        // so the map is walked rather than sitting in cache.
+        let mut commands: Vec<Command> = (0..COUNT)
+            .map(|i| {
+                let account = 1 + i.wrapping_mul(2_654_435_761) % accounts;
+                let price = FLOOR + 1_000 + (i % 4_000) as Ticks;
+                limit_order(account, SYMBOL, i + 1, Side::Bid, price, 1)
+            })
+            .collect();
+
+        let started = Instant::now();
+        for chunk in commands.chunks_mut(1_024) {
+            let events = exchange.submit_batch(chunk).unwrap();
+            *sink = sink.wrapping_add(events.len() as u64);
+        }
+        samples.push(started.elapsed().as_secs_f64() * 1e9 / COUNT as f64);
+        assert_eq!(
+            exchange.open_orders() as u64,
+            COUNT,
+            "orders were rejected, so this measured the reject path"
+        );
+        black_box(&exchange);
+    }
+    (samples, records)
+}
+
 /// The same mixed traffic, with subscribers attached.
 ///
 /// Fan-out is on the event path, so it is part of what a command costs. Three
@@ -585,6 +643,21 @@ fn main() {
         &mut batched_stream(&mut sink, 1_024),
         "per command",
     );
+
+    println!();
+    println!("Does it hold at scale? Same traffic, spread over more accounts:");
+    println!("{}", "-".repeat(80));
+    for accounts in [16_u64, 100_000, 1_000_000] {
+        let (mut samples, records) = mixed_stream_at_scale(&mut sink, accounts);
+        samples.sort_by(f64::total_cmp);
+        let holdings = records * (size_of::<(u64, u32)>() + size_of::<[u128; 2]>());
+        println!(
+            "{:<38}{:>9.0} ns   {records} holdings, ~{} MiB",
+            format!("{accounts} accounts"),
+            samples[0],
+            holdings / 1024 / 1024
+        );
+    }
 
     println!();
     println!("Durable throughput. How fast can the venue acknowledge?");
