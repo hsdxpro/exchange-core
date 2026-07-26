@@ -52,29 +52,30 @@ impl Session {
         }
     }
 
-    /// Reads whatever has arrived, appending decoded commands to `out`.
+    /// Reads one buffer's worth, appending decoded commands to `out`.
+    ///
+    /// Deliberately **one** read per pass rather than draining the socket. A
+    /// pass that read until the socket blocked would let one client hand the
+    /// venue an unbounded group: a client pushing a hundred thousand orders in
+    /// one write produced more events in a single pass than the subscription
+    /// rings retain, so the ring wrapped before anyone was sent anything and
+    /// every session was then dropped for lagging -- including clients that had
+    /// never been given a chance to read. Bounding the pass bounds the events
+    /// one group can produce, and it shares the venue fairly between sessions
+    /// instead of serving whoever writes hardest.
     fn read_into(&mut self, out: &mut Vec<Command>) {
-        loop {
-            if self.decoder.is_full() {
-                break;
+        if self.decoder.is_full() {
+            return;
+        }
+        match self.stream.read(self.decoder.writable()) {
+            // A read of zero on a stream socket means the peer closed.
+            Ok(0) => self.open = false,
+            Ok(bytes) => {
+                self.decoder.advance(bytes);
+                self.decoder.drain(out);
             }
-            match self.stream.read(self.decoder.writable()) {
-                // A read of zero on a stream socket means the peer closed.
-                Ok(0) => {
-                    self.open = false;
-                    break;
-                }
-                Ok(bytes) => {
-                    self.decoder.advance(bytes);
-                    self.decoder.drain(out);
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(_) => {
-                    self.open = false;
-                    break;
-                }
-            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => self.open = false,
         }
     }
 

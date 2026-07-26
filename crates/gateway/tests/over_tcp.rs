@@ -23,7 +23,10 @@ const BTC: u32 = 1;
 const USD: u32 = 2;
 const SYMBOL: u32 = 1;
 const FLOOR: Ticks = 10_000;
-const RETAINED: usize = 4_096;
+/// Retention window. Sized so the burst test below stays inside it when a pass
+/// is bounded (a few hundred events at a time) and would blow straight through
+/// it if a pass were unbounded, which is the regression being guarded.
+const RETAINED: usize = 32_768;
 const MAX_RECORDS: usize = 256;
 
 fn instruments() -> Instruments {
@@ -49,12 +52,16 @@ impl Running {
             MAX_RECORDS,
         )
         .unwrap();
+        // Funded well beyond anything these tests spend. An underfunded account
+        // rejects for insufficient balance part way through a run, which looks
+        // exactly like the venue dropping commands.
         for account in 1..=4 {
-            server
-                .venue_mut()
-                .deposit(account, USD, 100_000_000)
-                .unwrap();
-            server.venue_mut().deposit(account, BTC, 10_000).unwrap();
+            for asset in [USD, BTC] {
+                server
+                    .venue_mut()
+                    .deposit(account, asset, u64::MAX / 4)
+                    .unwrap();
+            }
         }
         let address = server.address().unwrap().to_string();
         let stop = Arc::new(AtomicBool::new(false));
@@ -205,6 +212,60 @@ fn many_orders_pushed_at_once_are_applied_as_one_group_and_all_arrive() {
     assert_eq!(
         deltas, ORDERS,
         "a command was lost between the socket and the book"
+    );
+}
+
+#[test]
+fn a_burst_larger_than_the_retention_window_does_not_drop_the_client() {
+    // The venue used to read a socket until it blocked, so one client pushing a
+    // large write handed it a group big enough to wrap the subscription rings
+    // inside a single pass: 8,192 orders produce about 24,000 events against a
+    // 32,768 window, which one unbounded pass overruns and bounded passes of a
+    // few hundred never approach. Everyone was then dropped for lagging, including
+    // clients that had not been sent anything yet. A pass is now bounded, so
+    // the feed keeps up with the book however hard one client writes.
+    const ORDERS: usize = 8_192;
+    let venue = Running::start();
+    let mut writer = venue.connect();
+    let mut reader = writer.try_clone().unwrap();
+
+    // Read on another thread. A client that writes half a megabyte without
+    // reading deadlocks against its own receive buffer, which is a bug in the
+    // client and would hide the one being tested for.
+    let counter = std::thread::spawn(move || {
+        let mut acknowledged = 0;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while acknowledged < ORDERS && Instant::now() < deadline {
+            let mut batch = Vec::new();
+            if read_events(&mut reader, 1, &mut batch).is_err() || batch.is_empty() {
+                break;
+            }
+            acknowledged += batch
+                .iter()
+                .filter(|e| e.kind == EventKind::Received as u8)
+                .count();
+        }
+        acknowledged
+    });
+
+    let commands: Vec<Command> = (0..ORDERS)
+        .map(|i| {
+            limit_order(
+                1,
+                SYMBOL,
+                100 + i as u64,
+                Side::Bid,
+                FLOOR + 1_000 + (i % 4_000) as Ticks,
+                1,
+            )
+        })
+        .collect();
+    send(&mut writer, &commands);
+
+    assert_eq!(
+        counter.join().unwrap(),
+        ORDERS,
+        "the venue dropped a client that was reading as fast as it could"
     );
 }
 
