@@ -254,6 +254,20 @@ Each of these was settled against a specific alternative, noted below.
 
 ### Bugs that changed the design
 
+- **Replication had no notion of leadership.** A follower accepted whatever any
+  leader sent, so a partitioned leader that had been replaced would keep
+  appending and two leaders would acknowledge orders into divergent logs.
+  Election was not the first thing missing; safe promotion was. Groups now carry
+  the leader's term and a follower refuses anything older, replying with the term
+  that won so the stale leader stops.
+- **A stream per channel is not a stream per channel if one task writes them
+  all.** The QUIC session dispatched every stream from a single loop, so a feed
+  stalled on flow control held up the acknowledgements queued behind it -- exactly
+  the head-of-line blocking separate streams exist to prevent, rebuilt one layer
+  up. The test written for the property caught it on its first run; every other
+  test passed. It is now a writer task per stream and the dispatcher never awaits
+  a write.
+
 - **The hot path was making an fsync per command.** `submit` appended, synced
   and only then matched, so an operation costing milliseconds sat directly in
   front of one costing nanoseconds -- eighteen thousand times the cost of the

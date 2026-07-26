@@ -23,6 +23,7 @@ cross-venue routing, KYC, fee tiers.
 
 ```
   clients ──QUIC──► Gateway ──► Sequencer ──► Journal ──► Risk ──► Matching ──► Publisher
+           (a stream per channel: acks and market data never block each other)
                     decode      assigns seq   replicated  balance   the engine   deltas,
                     auth        single        3 nodes     reserve   unchanged    trades,
                     rate limit  writer        ↓                                  private
@@ -54,7 +55,9 @@ distributed lock.
 **Ack once the order is on a majority of three journal nodes.** A crash then loses nothing
 a client was told we had.
 
-**Consensus: `openraft`.** `raft-rs` entered maintenance mode; openraft is where new Rust
+**Consensus: `openraft` — intended, not built.** What exists is quorum durability with term fencing: a group is acknowledged once a majority holds it, measured 59x faster than a local fsync, and a follower refuses a group from a replaced leader. So no acknowledged order is lost when a leader dies and no two leaders can diverge; what is missing is noticing and promoting automatically.
+
+**Why openraft when it is built.** `raft-rs` entered maintenance mode; openraft is where new Rust
 work is pointed, and it is the consensus engine behind Databend in production.
 
 The number that decides the design: openraft handles **33k writes/sec for a single writer
@@ -128,7 +131,7 @@ make the engine depend on account state and break the determinism rule.
 
 ## 6. Transport
 
-**QUIC only.** One way in, for retail and professionals alike.
+**QUIC only.** One way in, for retail and professionals alike. Order entry and each market-data channel take their own stream, so a client reading its feed slowly stalls that feed and not its own fills. The 5-20 us QUIC adds over raw TCP is invisible beneath a 51 us quorum acknowledgement.
 
 QUIC runs over UDP, so it is fast, but re-sends anything lost, so nothing goes missing. It
 uses independent streams, so one lost packet does not stall everything behind it the way
@@ -203,16 +206,33 @@ busy-polling threads with single-producer single-consumer ring buffers between t
 async runtime there buys nothing and costs scheduling jitter. Async lives in the gateway,
 where the problem is connection count rather than per-message latency.
 
-| Concern | Choice |
-|---|---|
-| Language | Rust 1.97+, edition 2024 |
-| Matching path | pinned threads, busy-poll, no runtime |
-| Between stages | SPSC ring buffers |
-| Gateway | `tokio` + `quinn` |
-| Consensus | `openraft`, batched |
-| Journal I/O | `io_uring`, SQPOLL |
-| Encoding | hand-rolled fixed-layout structs |
-| Metrics | HdrHistogram, sampled off the hot path |
+Two columns, because a design document that does not separate what exists from what is
+intended is worse than none: a reader cannot tell which parts have been tested against
+reality.
+
+| Concern | Built | Intended |
+|---|---|---|
+| Language | Rust 1.97+, edition 2024 | — |
+| Matching path | one thread, no async runtime | thread pinning |
+| Encoding | fixed 64-byte records via `zerocopy` | — |
+| Gateway | QUIC via `quinn` + `tokio`, a stream per channel | — |
+| Durability | group commit; quorum to followers, fenced by term | — |
+| Consensus | none: safe promotion, but no election | `openraft`, on a leadership log |
+| Journal I/O | buffered `std`, one write and one sync per group | `io_uring`, SQPOLL |
+| Metrics | none | histograms sampled off the hot path |
+
+Dependencies sit at the edge deliberately. The engine has none, `protocol`/`journal`/
+`pipeline` use only `zerocopy`, and everything the transport needs lives in `gateway` — so
+the eighty crates in the lockfile cannot reach the matching path.
+
+Two of the intended choices were deliberately deferred, with reasons in
+[`ENGINEERING.md`](ENGINEERING.md). **`openraft`** because an openraft entry is
+variable-length and heterogeneous, so routing the command log through it would cost the
+zero-copy replay and O(1) sequence seek that make a 1.3 ms restart possible; election belongs
+on a separate leadership log whose term feeds the fencing that already exists.
+**`io_uring`** because the measurement said the cost was one syscall *per record* rather than
+the syscall mechanism, and batching the writes recovered 8.6x without leaving `std`;
+`LogStorage` is the seam it goes behind when a Linux deployment wants it.
 
 **Considered and rejected.** `monoio` lags io_uring feature parity with little recent
 maintenance. `glommio` has an interesting dedicated latency ring but a small ecosystem, and
@@ -228,7 +248,7 @@ custom transport becomes the bottleneck.
 | Failure | Behaviour |
 |---|---|
 | Gateway dies | clients reconnect elsewhere, resume from `last_seq` |
-| Leader dies | openraft elects a new one; the journal is already on a majority; no acked order lost |
+| Leader dies | The journal is already on a majority, so no acknowledged order is lost, and term fencing stops the old leader writing if it returns. Promotion is manual until election is built |
 | One journal node dies | majority continues; degraded and alarmed |
 | Matching shard panics | deliberate abort with a state dump, restart from snapshot + replay |
 | Subscriber falls behind | ring overwrites, subscriber sees the gap and re-snapshots |
