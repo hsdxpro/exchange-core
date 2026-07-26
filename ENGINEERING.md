@@ -152,6 +152,24 @@ Each of these was settled against a specific alternative, noted below.
 
 ### Rejected, with reasons
 
+- **QUIC — built, measured, removed.** A stream per channel does solve real head-of-line
+  blocking: acknowledgements and market data stop sharing a queue, so a slow feed reader no
+  longer backs up its own fills. It also reaches clients behind NAT and survives mobile
+  handoff. Measured against the same venue, same journal, same traffic:
+
+  | | TCP | QUIC |
+  |---|---:|---:|
+  | round trip, one order in flight | **8.6 us** | 38.6 us |
+  | pipelined throughput | **3.76M/sec** | 1.48M/sec |
+
+  4.5x the latency and 40% of the throughput, for properties a venue serving market makers
+  does not need. TLS 1.3 is not optional in QUIC either -- packet protection is part of the
+  transport, so there is no unencrypted mode to fall back to, and a market maker on a
+  cross-connect wants nothing between it and the book. Removing it also deleted a second copy
+  of every session feature, which is where a session leak had already lived in one transport
+  and not the other. The consequence kept: one socket per session means the outbox bound and
+  shedding a slow client are load-bearing rather than belt-and-braces.
+
 - **Windowed ladder with re-centring — deleted.** It solved a memory problem
   that does not exist: 1000 symbols is ~2 GB of level tables on a machine with
   256 GB+. An invented crisis with an invented 4,096 constant and a re-centring

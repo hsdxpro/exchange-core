@@ -1,6 +1,6 @@
 # A crypto exchange core, in Rust
 
-A matching engine and the venue around it: a binary protocol over QUIC, order
+A matching engine and the venue around it: a binary protocol over TCP, order
 books on a bitmap price ladder, balance reservation, an append-only journal that
 is the single source of truth, a resumable market-data feed, snapshots, and
 replication with quorum acknowledgement.
@@ -86,7 +86,7 @@ Requires `rustup` and nothing else. There is no CI; `xtask` is the task runner.
 cargo x
 ```
 
-That is format, `clippy -D warnings`, and all 233 tests. Also:
+That is format, `clippy -D warnings`, and all 223 tests. Also:
 
 ```bash
 cargo x latency
@@ -109,34 +109,31 @@ crates/engine/     the matching engine. No dependencies, forbid(unsafe_code).
 crates/protocol/   wire records: fixed 64-byte layouts, asserted at compile time.
 crates/journal/    append-only log, replay, replication with term fencing.
 crates/pipeline/   sequencer, accounts, books, events, snapshots.
-crates/gateway/    framing, sessions, group commit, QUIC and TCP, config.
+crates/gateway/    framing, sessions, group commit, the TCP server, config.
 xtask/             the task runner.
 ```
 
-Dependencies are concentrated at the edge on purpose. The engine has none and
-forbids `unsafe`; `protocol`, `journal` and `pipeline` use only `zerocopy` for
-fixed-layout casts. Everything else — `quinn`, `rustls`, `tokio`, `mio` — is in
-`gateway`, so the 80 crates in the lockfile buy transport and none of them can
-reach the matching path.
+Twelve crates in the lockfile, and the engine has none of them: it forbids
+`unsafe` and depends on nothing. `protocol`, `journal` and `pipeline` use only
+`zerocopy` for fixed-layout casts. `mio` is in `gateway` alone, for readiness
+notification, so nothing on the matching path can reach a dependency.
 
 [`DESIGN.md`](DESIGN.md) is the architecture. [`ENGINEERING.md`](ENGINEERING.md)
 is the decisions, what was rejected and why, and the bugs worth remembering.
 
 ## Things worth knowing about the design
 
-**QUIC, with a stream per channel.** Order acknowledgements and each market-data
-channel get their own stream and their own flow control, so a client reading its
-depth feed slowly no longer backs up its own fills — which one connection
-carrying both cannot avoid. QUIC costs 5–20 µs more per exchange than raw TCP for
-crypto and userspace work, which is invisible beneath a 51 µs quorum
-acknowledgement. Optimising the transport below the sync would be optimising the
-wrong thing.
+**One transport, unencrypted, as fast as the machine allows.** Fixed 64-byte
+records over TCP with no TLS, so a market maker can be given a direct connection
+with nothing between it and the book. QUIC was built and then removed: measured
+against the same venue it cost 38.6 µs of round trip against TCP's 8.6 µs, and
+1.48M orders a second against 3.76M. It buys NAT traversal, mobile resilience and
+per-stream flow control, none of which is worth 4.5x the latency here.
 
-**Async at the edge, one writer at the core.** Matching a book is a sequential
-dependency — each order changes what the next one sees — so there is no
-parallelism in it to take, and it stays one thread with no runtime. Connections
-run on tokio and hand commands across a queue, which is also where the group
-comes from.
+**One thread, no async runtime.** Matching a book is a sequential dependency —
+each order changes what the next one sees — so there is no parallelism in it to
+take. Sessions are found by readiness notification rather than scanned, which is
+what keeps an idle connection at 23 ns a pass.
 
 **The price ladder is the price band.** An instrument's book covers 65,536 ticks
 from its floor. A price the ladder cannot address is a price the venue refuses, so
@@ -202,7 +199,7 @@ Scope boundaries, with reasons rather than apologies:
 
 ## Correctness
 
-233 tests. The ones worth looking at:
+223 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed
@@ -210,9 +207,9 @@ Scope boundaries, with reasons rather than apologies:
 - `crates/pipeline/tests/snapshot.rs` — a restart from a snapshot lands in
   exactly the state a full replay of the same journal does, including queue
   position, not merely the same depth.
-- `crates/gateway/tests/over_quic.rs` — real QUIC, including a client that drops
-  with no close handshake and reconnects to a book it can rebuild, and a stalled
-  market-data stream that must not block order acknowledgements.
+- `crates/gateway/tests/over_tcp.rs` — real sockets, including a record torn
+  across two writes, a client shed for being slow that reconnects and rebuilds,
+  and cancel-on-disconnect withdrawing every quote.
 - `crates/journal/src/replication.rs` — a replaced leader is refused and its
   write never reaches the follower's log.
 - `crates/gateway/tests/idle_cost.rs` — a benchmark that fails if an idle

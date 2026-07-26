@@ -25,6 +25,14 @@
 //! subscription belongs to a connection and connections do not survive a
 //! restart.
 //!
+//! One socket carries a session's acknowledgements and its market data, so a
+//! client that reads its feed slowly does back up its own fills. QUIC was built
+//! to avoid that -- a stream per channel, each with its own flow control -- and
+//! then removed, because measured against the same venue it cost 38.6 us of round
+//! trip against this transport's 8.6 us, and 1.48M orders a second against 3.76M.
+//! The bounded outbox and shedding a session that exceeds it are what handle the
+//! consequence instead, and a shed client rebuilds from a snapshot on reconnect.
+//!
 //! Public feeds are opt-in rather than given to everyone. At one instrument the
 //! difference is invisible; at a thousand, sending every session every book
 //! would multiply the venue's outbound traffic by the number of instruments

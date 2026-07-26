@@ -587,6 +587,133 @@ fn a_client_shed_for_being_slow_can_reconnect_and_rebuild_the_book() {
     );
 }
 
+/// Asks the venue what `account` still has working, on a fresh connection.
+///
+/// Drained rather than stopped at the first reply: the count is the answer, and a
+/// predicate that stops early truncates a reply of several events to one.
+fn working_orders(venue: &Running, account: u64) -> Vec<u64> {
+    let mut client = venue.connect();
+    send(&mut client, &[query_open_orders(account, SYMBOL)]);
+    collect_until(&mut client, Duration::from_millis(600), |_| false)
+        .iter()
+        .filter(|e| e.kind == EventKind::OrderState as u8)
+        .map(|e| e.order_id)
+        .collect()
+}
+
+#[test]
+fn a_reconnecting_client_can_recover_the_orders_it_still_has_working() {
+    // A book can be rebuilt from a snapshot; a client's own orders cannot, and
+    // that is the one thing a trader must know before acting again.
+    let venue = Running::start();
+    {
+        let mut before = venue.connect();
+        send(
+            &mut before,
+            &[
+                limit_order(1, SYMBOL, 101, Side::Bid, 10_100, 5),
+                limit_order(1, SYMBOL, 102, Side::Bid, 10_090, 7),
+                limit_order(1, SYMBOL, 103, Side::Ask, 10_400, 2),
+            ],
+        );
+        collect_until(&mut before, Duration::from_secs(5), |seen| {
+            seen.iter()
+                .filter(|e| e.kind == EventKind::Resting as u8)
+                .count()
+                >= 3
+        });
+    } // gone, three orders still working
+
+    // Someone else takes one of them while it is away.
+    let mut other = venue.connect();
+    send(
+        &mut other,
+        &[limit_order(2, SYMBOL, 201, Side::Ask, 10_100, 5)],
+    );
+    std::thread::sleep(Duration::from_millis(150));
+
+    let working = working_orders(&venue, 1);
+    assert!(
+        !working.contains(&101),
+        "an order that was filled while away was reported as working: {working:?}"
+    );
+    assert!(working.contains(&102), "{working:?}");
+    assert!(working.contains(&103), "{working:?}");
+}
+
+#[test]
+fn a_departed_session_is_forgotten_rather_than_held_forever() {
+    // Sessions that are never freed are a leak per disconnect, and nothing
+    // notices unless something counts them.
+    let venue = Running::start();
+    for _ in 0..4 {
+        let mut client = venue.connect();
+        send(
+            &mut client,
+            &[limit_order(5, SYMBOL, 1, Side::Bid, 10_010, 1)],
+        );
+        collect_until(&mut client, Duration::from_secs(5), |seen| !seen.is_empty());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while venue.sessions_hint() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        venue.sessions_hint(),
+        0,
+        "connections that closed are still being held"
+    );
+}
+
+#[test]
+fn without_cancel_on_disconnect_orders_survive_the_connection() {
+    // The default. A retail client that loses its connection expects to come back
+    // to the order it left.
+    let venue = Running::start();
+    {
+        let mut client = venue.connect();
+        send(
+            &mut client,
+            &[limit_order(3, SYMBOL, 601, Side::Bid, 10_120, 4)],
+        );
+        collect_until(&mut client, Duration::from_secs(5), |seen| {
+            seen.iter().any(|e| e.kind == EventKind::Resting as u8)
+        });
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    assert!(
+        working_orders(&venue, 3).contains(&601),
+        "an order was cancelled without being asked for"
+    );
+}
+
+#[test]
+fn turning_cancel_on_disconnect_back_off_takes_effect() {
+    let venue = Running::start();
+    {
+        let mut client = venue.connect();
+        send(
+            &mut client,
+            &[
+                cancel_on_disconnect(4, true),
+                limit_order(4, SYMBOL, 701, Side::Bid, 10_140, 3),
+                cancel_on_disconnect(4, false),
+            ],
+        );
+        collect_until(&mut client, Duration::from_secs(5), |seen| {
+            seen.iter().any(|e| e.kind == EventKind::Resting as u8)
+        });
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    assert!(
+        working_orders(&venue, 4).contains(&701),
+        "the order was cancelled after the setting was turned off"
+    );
+}
+
 #[test]
 fn cancel_on_disconnect_withdraws_every_quote_not_just_one() {
     let venue = Running::start();
