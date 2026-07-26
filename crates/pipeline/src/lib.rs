@@ -23,7 +23,6 @@ use bx_protocol::{
 use fastmap::FastMap;
 use instrument::{Instrument, Instruments};
 use snapshot::{Snapshot, balance_of};
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Every reason an order can be refused, so a count can be reported against a
@@ -52,6 +51,55 @@ const REASONS: [RejectReason; 18] = [
 
 /// Slots in the reject table, one per reason.
 pub const REJECT_REASONS: usize = REASONS.len();
+
+/// The books, in a table indexed by symbol.
+///
+/// A `BTreeMap` here cost a tree descent on the one lookup *every* command
+/// performs: about ten branchy comparisons and as many pointer hops at a
+/// thousand instruments. Measured, that was 175 ns a command at one symbol
+/// against 352 at a thousand — a venue paying twice as much per order for the
+/// crime of listing a realistic number of instruments.
+///
+/// Instruments were already held exactly this way and the books beside them were
+/// not, which is the kind of asymmetry that survives only because nothing
+/// measured the wide case.
+///
+/// Symbols are venue-assigned and `MAX_SYMBOL` refuses a sparse numbering, so a
+/// dense table is bounded by the listing rather than by the largest identifier
+/// anybody typed. Iterating it in index order is ascending by symbol, which is
+/// the same order the tree gave — so snapshots stay byte-identical.
+#[derive(Debug, Default)]
+struct Books {
+    by_symbol: Vec<Option<book::Book>>,
+}
+
+impl Books {
+    fn insert(&mut self, symbol: SymbolId, book: book::Book) {
+        let index = symbol as usize;
+        if index >= self.by_symbol.len() {
+            self.by_symbol.resize_with(index + 1, || None);
+        }
+        self.by_symbol[index] = Some(book);
+    }
+
+    #[inline]
+    fn get(&self, symbol: SymbolId) -> Option<&book::Book> {
+        self.by_symbol.get(symbol as usize)?.as_ref()
+    }
+
+    #[inline]
+    fn get_mut(&mut self, symbol: SymbolId) -> Option<&mut book::Book> {
+        self.by_symbol.get_mut(symbol as usize)?.as_mut()
+    }
+
+    /// Every listed book, ascending by symbol.
+    fn iter(&self) -> impl Iterator<Item = (SymbolId, &book::Book)> {
+        self.by_symbol
+            .iter()
+            .enumerate()
+            .filter_map(|(symbol, held)| held.as_ref().map(|book| (symbol as SymbolId, book)))
+    }
+}
 
 /// Accounting operations that failed when they should have been impossible.
 /// Any non-zero value means value was created or destroyed; tests assert it
@@ -88,8 +136,8 @@ pub struct Exchange<S: LogStorage> {
     journal: Journal<S>,
     accounts: Accounts,
     instruments: Instruments,
-    /// Ordered, so any iteration is deterministic.
-    books: BTreeMap<SymbolId, book::Book>,
+    /// A table indexed by symbol, so finding a book is a bounds check.
+    books: Books,
     /// Keyed by client order ID. A hash map, not a tree: this is looked up
     /// several times per command and nothing iterates it, so ordering is not
     /// needed and O(log n) tree descents are pure cost.
@@ -134,7 +182,7 @@ impl<S: LogStorage> Exchange<S> {
     /// # Errors
     /// Fails if the journal cannot be read.
     pub fn new(storage: S, instruments: Instruments) -> bx_journal::Result<Self> {
-        let mut books = BTreeMap::new();
+        let mut books = Books::default();
         for instrument in instruments.iter() {
             books.insert(instrument.symbol, book::Book::new(*instrument));
         }
@@ -180,7 +228,7 @@ impl<S: LogStorage> Exchange<S> {
 
     #[must_use]
     pub fn book(&self, symbol: SymbolId) -> Option<&book::Book> {
-        self.books.get(&symbol)
+        self.books.get(symbol)
     }
 
     #[must_use]
@@ -311,7 +359,7 @@ impl<S: LogStorage> Exchange<S> {
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         let mut orders = Vec::new();
-        for (symbol, book) in &self.books {
+        for (symbol, book) in self.books.iter() {
             book.for_each_resting(|resting| {
                 let held = self.reservations.get(&resting.order);
                 orders.push(SnapshotOrder {
@@ -320,7 +368,7 @@ impl<S: LogStorage> Exchange<S> {
                     account: held.map_or(0, |r| r.account),
                     quantity: resting.quantity,
                     price: resting.price,
-                    symbol: *symbol,
+                    symbol,
                     side: resting.side as u8,
                     _pad: [0; 11],
                 });
@@ -360,7 +408,7 @@ impl<S: LogStorage> Exchange<S> {
                 Self::violation();
                 continue;
             };
-            let restored = self.books.get_mut(&record.symbol).is_some_and(|book| {
+            let restored = self.books.get_mut(record.symbol).is_some_and(|book| {
                 book.restore(record.order_id, side, record.price, record.quantity)
             });
             if !restored {
@@ -513,7 +561,7 @@ impl<S: LogStorage> Exchange<S> {
         );
 
         let mut outcome = std::mem::take(&mut self.scratch);
-        let Some(book) = self.books.get_mut(&command.symbol) else {
+        let Some(book) = self.books.get_mut(command.symbol) else {
             self.scratch = outcome;
             self.release_all(command.order_id);
             self.reject(command, RejectReason::UnknownSymbol);
@@ -553,7 +601,7 @@ impl<S: LogStorage> Exchange<S> {
     /// trader needs after reconnecting before it can act.
     #[must_use]
     pub fn open_orders_for(&self, account: AccountId, symbol: SymbolId) -> Vec<book::Resting> {
-        let Some(book) = self.books.get(&symbol) else {
+        let Some(book) = self.books.get(symbol) else {
             return Vec::new();
         };
         self.resting_per_account
@@ -587,7 +635,7 @@ impl<S: LogStorage> Exchange<S> {
         {
             return false;
         }
-        let Some(book) = self.books.get(&command.symbol) else {
+        let Some(book) = self.books.get(command.symbol) else {
             return false;
         };
         let mut remaining = command.quantity;
@@ -611,7 +659,7 @@ impl<S: LogStorage> Exchange<S> {
     /// Returns whether the order was actually cancelled.
     fn apply_cancel(&mut self, command: &Command) -> bool {
         let mut outcome = std::mem::take(&mut self.scratch);
-        let Some(book) = self.books.get_mut(&command.symbol) else {
+        let Some(book) = self.books.get_mut(command.symbol) else {
             self.scratch = outcome;
             self.reject(command, RejectReason::UnknownSymbol);
             return false;
@@ -631,7 +679,7 @@ impl<S: LogStorage> Exchange<S> {
 
     fn apply_amend(&mut self, command: &Command) {
         let mut outcome = std::mem::take(&mut self.scratch);
-        let Some(book) = self.books.get_mut(&command.symbol) else {
+        let Some(book) = self.books.get_mut(command.symbol) else {
             self.scratch = outcome;
             self.reject(command, RejectReason::UnknownSymbol);
             return;
@@ -736,7 +784,7 @@ impl<S: LogStorage> Exchange<S> {
             // A maker the engine fully consumed releases whatever is left.
             let maker_gone = !self
                 .books
-                .get(&command.symbol)
+                .get(command.symbol)
                 .is_some_and(|b| b.contains(execution.resting_order));
             if maker_gone {
                 self.release_all(execution.resting_order);

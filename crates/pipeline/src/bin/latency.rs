@@ -69,6 +69,72 @@ fn report_throughput(name: &str, per_op_ns: &mut [f64]) {
     println!("{name:<38}{best:>12.0} ns{:>16.0} cmd/sec", per_second);
 }
 
+/// A venue listing `symbols` instruments, numbered densely from one.
+///
+/// The pool is divided among them, so the total memory is what a one-symbol run
+/// costs and the comparison is about *finding* the book rather than about having
+/// more of them.
+fn wide_venue(symbols: u32) -> Exchange<MemoryLog> {
+    let mut instruments = Instruments::new();
+    let per_book = (MAX_OPEN_ORDERS / symbols).max(16);
+    for symbol in 1..=symbols {
+        instruments.insert(Instrument::new(
+            symbol,
+            BTC,
+            USD,
+            FLOOR,
+            1_000_000_000,
+            per_book,
+        ));
+    }
+    let mut exchange = Exchange::new(MemoryLog::new(), instruments).unwrap();
+    for account in 1..=16 {
+        exchange.deposit(account, USD, u64::MAX).unwrap();
+        exchange.deposit(account, BTC, u64::MAX).unwrap();
+    }
+    exchange
+}
+
+/// The same traffic spread over a listing of `symbols`.
+///
+/// A venue that lists a thousand instruments has to find the right book on every
+/// single command, and what that lookup costs is a property of how the books are
+/// held rather than of how many orders arrive. Measuring one symbol only ever
+/// measures the case where the answer is already in cache.
+fn across_symbols(symbols: u32, sink: &mut u64) -> Vec<f64> {
+    const COUNT: u64 = 100_000;
+    let mut samples = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut exchange = wide_venue(symbols);
+        // Round-robin across the listing, so no two consecutive commands share a
+        // book and the lookup is never answered from the previous one.
+        let commands: Vec<Command> = (0..COUNT)
+            .map(|i| {
+                let symbol = 1 + (i % u64::from(symbols)) as u32;
+                let price = FLOOR + 1_000 + (i % 4_000) as Ticks;
+                limit_order(1 + i % 16, symbol, i + 1, Side::Bid, price, 1)
+            })
+            .collect();
+
+        let started = Instant::now();
+        for mut command in commands {
+            let events = exchange.submit(&mut command).unwrap();
+            *sink = sink.wrapping_add(events.len() as u64);
+        }
+        samples.push(started.elapsed().as_secs_f64() * 1e9 / COUNT as f64);
+
+        // Every order rested. Without this the run could be measuring rejects,
+        // which is faster and means nothing.
+        assert_eq!(
+            exchange.open_orders(),
+            COUNT as usize,
+            "orders went missing, so this is measuring the reject path"
+        );
+        black_box(&exchange);
+    }
+    samples
+}
+
 /// Passive limit orders that never cross, so this is the pure resting path.
 fn resting_orders(sink: &mut u64) -> Vec<f64> {
     const COUNT: u64 = 100_000;
@@ -643,6 +709,17 @@ fn main() {
         &mut batched_stream(&mut sink, 1_024),
         "per command",
     );
+
+    println!();
+    println!("Same traffic, spread over a larger listing:");
+    println!("{}", "-".repeat(80));
+    for symbols in [1_u32, 100, 1_000] {
+        report(
+            &format!("{symbols} symbols"),
+            &mut across_symbols(symbols, &mut sink),
+            "per order",
+        );
+    }
 
     println!();
     println!("Does it hold at scale? Same traffic, spread over more accounts:");
