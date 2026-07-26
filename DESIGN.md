@@ -1,18 +1,24 @@
 # Exchange with subscriptions — design
 
-A venue built around the existing matching engine: binary protocol over the public
-internet, 1000+ symbols, replicated durability, automatic failover, deterministic recovery.
+A venue built around the existing matching engine: a binary protocol, 1000+ symbols,
+replicated durability, safe failover, deterministic recovery.
 
 The guiding constraint is least code that meets the requirement. Where a number appears it
-is derived or measured, not chosen.
+is derived or measured, not chosen. Where a section describes something that is not built
+it says so in its first sentence — a design document whose reader cannot tell the two apart
+is worse than none.
 
 ---
 
 ## 1. Scope
 
 **In:** order entry, matching, balance reservation, market data and private event
-subscriptions with gap recovery, replicated journal, automatic failover, crash recovery by
-replay.
+subscriptions with gap recovery, replicated journal, crash recovery by replay, and failover
+that is safe and complete in execution — a promoted node catches up to a majority before it
+serves, and term fencing stops a replaced leader writing.
+
+**Deciding** *when* to promote and *whom* is the piece that is not built: that needs
+consensus, and it is §3.
 
 **Out:** settlement and withdrawal, margin and liquidation, auctions, hidden orders,
 cross-venue routing, KYC, fee tiers.
@@ -22,13 +28,17 @@ cross-venue routing, KYC, fee tiers.
 ## 2. Pipeline
 
 ```
-  clients ──QUIC──► Gateway ──► Sequencer ──► Journal ──► Risk ──► Matching ──► Publisher
-           (a stream per channel: acks and market data never block each other)
-                    decode      assigns seq   replicated  balance   the engine   deltas,
-                    auth        single        3 nodes     reserve   unchanged    trades,
-                    rate limit  writer        ↓                                  private
-                                          ACK RELEASED
+  clients ──TCP──► Gateway ──► Sequencer ──► Journal ──► Risk ──► Matching ──► Publisher
+                   decode      assigns seq   replicated  balance   the engine   deltas,
+                   frame       single        quorum      reserve   unchanged    trades,
+                   sessions    writer        ↓                                  private
+                                         ACK RELEASED
 ```
+
+Two gateway stages named in earlier drafts of this diagram are **not built**:
+authentication and per-account rate limiting. Both belong before the sequencer,
+which is why neither can reach the deterministic path — but neither exists, and a
+diagram that shows them is a diagram that lies.
 
 One rule holds the whole thing together: **everything after the sequencer is a
 deterministic function of the sequenced stream.** No clock reads, no randomness, no
@@ -108,11 +118,13 @@ with an explicit, counted, observable policy.
 
 Applied at the risk stage, before matching, in this order:
 
-1. Account exists, session authorised.
-2. Order is inside the price band — a percentage either side of a reference price. This is
-   fat-finger protection. It is a range comparison, not a data structure.
+1. Account exists. **Session authorisation is not built** — a session states its account
+   and is believed. Every check below is real; this one is a placeholder, and it is the
+   first thing to build before this faces a network it does not control.
+2. Order is inside the price band. The instrument's ladder range *is* the band, so the
+   memory bound and the fat-finger control are one mechanism rather than two.
 3. Sufficient free balance; reserve it.
-4. Per-account and per-symbol order count under cap.
+4. Order count under the instrument's `max_open_orders` cap.
 
 Self-trade prevention runs inside the matching engine, because only the engine sees both
 sides of a potential match. Default cancel-newest: the resting order survives and the
@@ -131,20 +143,29 @@ make the engine depend on account state and break the determinism rule.
 
 ## 6. Transport
 
-**QUIC only.** One way in, for retail and professionals alike. Order entry and each market-data channel take their own stream, so a client reading its feed slowly stalls that feed and not its own fills. The 5-20 us QUIC adds over raw TCP is invisible beneath a 51 us quorum acknowledgement.
+**TCP only, unencrypted.** One way in, for retail and market makers alike: fixed 64-byte
+records with nothing between the client and the book.
 
-QUIC runs over UDP, so it is fast, but re-sends anything lost, so nothing goes missing. It
-uses independent streams, so one lost packet does not stall everything behind it the way
-TCP does. It reconnects in a single round trip, and a client changing network keeps its
-session.
+This reverses an earlier decision in this document, and the measurement is the reason.
+QUIC was built, benchmarked against the same venue and the same traffic, and removed:
 
-It reaches 95–99% of networks; the failures are some corporate proxies and mobile carriers
-that block UDP on port 443. A TCP fallback for those is a known, deferred piece of work,
-added when a customer actually hits it.
+| | TCP | QUIC |
+|---|---:|---:|
+| round trip, one order in flight | **8.6 us** | 38.6 us |
+| pipelined throughput | **3.76M/sec** | 1.48M/sec |
 
-A raw UDP or shared-memory path for colocated clients sits behind the same trait and gets
-built when someone needs it. Building it now would mean two protocol implementations to
-keep in step for a benefit nobody has asked for yet.
+A stream per channel does solve real head-of-line blocking, and QUIC does survive NAT and
+mobile handoff. None of that is worth 4.5x the round trip here. The earlier claim that
+QUIC's overhead is "invisible beneath a 51 us quorum acknowledgement" was wrong twice over:
+30 us against a 54 us path is not invisible, and it is charged on every order rather than
+amortised over a group the way the quorum cost is.
+
+TLS 1.3 also is not optional in QUIC — packet protection is part of the transport, so there
+is no unencrypted mode — and a market maker on a cross-connect wants nothing in the path.
+Encryption for clients that need it belongs in front of the venue, not inside it.
+
+A raw UDP or shared-memory path for colocated clients sits behind the same seam and gets
+built when someone needs it. `tcp.rs` is that seam: `venue` and `codec` do not change.
 
 **One binary encoding** on whatever carries it: fixed-layout structs, little-endian,
 version byte in the header, zero-copy decode. No serialization framework on the hot path.
@@ -154,13 +175,16 @@ version byte in the header, zero-copy decode. No serialization framework on the 
 ## 7. Subscriptions and recovery
 
 ```
-book.{symbol}      depth deltas
+book.{symbol}      depth deltas, and a snapshot on subscribe
 trades.{symbol}    executions
-bbo.{symbol}       top of book only — cheapest, and what most clients want
-orders.{account}   private
-fills.{account}    private
-balance.{account}  private
+account            private: this session's own order lifecycle and fills
 ```
+
+Three channels rather than the six an earlier draft listed. The private ones collapsed
+because a client wanting its fills wants its order states too, and splitting them costs a
+second subscription to learn the same story. `bbo.{symbol}` is the one worth adding back:
+top-of-book is the cheapest feed and what most clients actually want, and the engine
+already caches it — but nothing publishes it yet.
 
 Every message carries `(channel, sequence)`, so a client detects a gap by arithmetic rather
 than by waiting for a timeout.
@@ -181,12 +205,17 @@ count actually forces it, not before.
 
 ## 8. Time
 
-Two timestamps travel with every order and are published:
+**Intended, not built.** Two timestamps should travel with every order and be published:
 
-| | Source | Meaning |
-|---|---|---|
-| `ingress_ns` | NIC hardware timestamp | when the packet reached the venue |
-| `match_ns` | matching shard | when it executed or rested |
+| | Source | Meaning | State |
+|---|---|---|---|
+| `ingress_ns` | NIC hardware timestamp | when the packet reached the venue | field exists, always zero |
+| `match_ns` | matching shard | when it executed or rested | not present |
+
+The field is reserved in the record rather than populated, because the value has to come
+from the NIC to be worth anything: a timestamp taken in the gateway measures our own
+scheduling jitter, not arrival. Filling it in with `Instant::now()` would look like the
+feature and be a lie a regulator could read.
 
 AWS Nitro stamps every inbound packet with 64-bit nanoseconds **at the NIC, before the
 kernel or our process sees it**, disciplined by the Amazon Time Sync PTP hardware clock.
@@ -213,17 +242,19 @@ reality.
 | Concern | Built | Intended |
 |---|---|---|
 | Language | Rust 1.97+, edition 2024 | — |
-| Matching path | one thread, no async runtime | thread pinning |
+| Matching path | one thread, no async runtime | thread pinning, symbol shards |
 | Encoding | fixed 64-byte records via `zerocopy` | — |
-| Gateway | QUIC via `quinn` + `tokio`, a stream per channel | — |
+| Transport | TCP, unencrypted, `mio` readiness | raw UDP or shm for colo |
+| Gateway | sessions, framing, group commit | authentication, per-account rate limits |
 | Durability | group commit; quorum to followers, fenced by term | — |
 | Consensus | none: safe promotion, but no election | `openraft`, on a leadership log |
 | Journal I/O | buffered `std`, one write and one sync per group | `io_uring`, SQPOLL |
+| Timestamps | none published | `ingress_ns` from the NIC, `match_ns` from the shard |
 | Metrics | none | histograms sampled off the hot path |
 
 Dependencies sit at the edge deliberately. The engine has none, `protocol`/`journal`/
 `pipeline` use only `zerocopy`, and everything the transport needs lives in `gateway` — so
-the eighty crates in the lockfile cannot reach the matching path.
+none of the twelve crates in the lockfile can reach the matching path.
 
 Two of the intended choices were deliberately deferred, with reasons in
 [`ENGINEERING.md`](ENGINEERING.md). **`openraft`** because an openraft entry is
@@ -252,7 +283,7 @@ custom transport becomes the bottleneck.
 | One journal node dies | majority continues; degraded and alarmed |
 | Matching shard panics | deliberate abort with a state dump, restart from snapshot + replay |
 | Subscriber falls behind | ring overwrites, subscriber sees the gap and re-snapshots |
-| Client floods | per-account rate limit at the gateway, before sequencing |
+| Client floods | **not built.** A per-account rate limit belongs at the gateway, before sequencing. What exists is the per-session outbox budget, which sheds a client the venue cannot write *to* — not one that writes too much |
 | Order outside price band | rejected at the risk stage |
 | Self-match | cancel-newest; the resting order survives |
 
@@ -269,10 +300,14 @@ that stops.
 2. **Sequencer, journal, replay, single node.** Prove replay reproduces state
    bit-identically, extending the existing golden-hash check.
 3. **Accounts, reservation, risk checks.** Including the price band and the 32-byte slot.
-4. **QUIC gateway and binary protocol.**
+4. **Gateway and binary protocol.** Built on QUIC, measured, moved to TCP.
 5. **Subscriptions.** Snapshot, delta, resume, ring buffer.
-6. **openraft replication and quorum ack.**
+6. **Quorum replication and term fencing.** Done. Election is not — see §3.
 7. **Scale-out.** Split fanout from publisher when connection count demands it.
+
+Steps 1–6 exist, except election. Step 7 is untouched: one process still holds the
+publisher and the fanout, which the idle-connection measurement says is right until the
+connection count rather than the order rate is what hurts.
 
 Each step leaves the system runnable and verifiable. The existing approach — differential
 tests against an independently written model, plus a golden replay hash — extends to every
@@ -287,9 +322,11 @@ and expensive to be wrong about.
 
 - **openraft under our batching pattern**, and whether the reported 40 ms blocking
   reproduces. Decides whether consensus stays on the data path.
-- **Replay throughput**, which sets the snapshot cadence.
-- **QUIC overhead in-datacenter**, which decides whether a raw path for colocated clients is
-  ever worth building.
 - **Hugepage benefit** on the level tables at realistic symbol counts.
 - **32-byte versus 24-byte slot**, on the target hardware with a pinned core — the earlier
   attempt on a loaded desktop could not resolve it and reversed sign between runs.
+
+Two came off this list by being measured, and both changed a decision. **QUIC's overhead**
+was assumed negligible and is 4.5x the round trip, so the transport is TCP. **Replay
+throughput** was the free variable in the snapshot cadence and is 7.6M commands/sec, so the
+cadence is now derived from a stated recovery target rather than picked.

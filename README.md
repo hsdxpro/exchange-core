@@ -204,6 +204,14 @@ Scope boundaries, with reasons rather than apologies:
   and untested platform-specific I/O is worse than none — the measurement also
   said the cost was one syscall *per record*, and batching the writes recovered
   8.6× without leaving `std`.
+- **Session authentication.** A session states the account it acts for and is
+  believed. Every other risk check is real; this one is a placeholder, and it is
+  the first thing to build before this meets a network it does not control. The
+  seam is already right — a subscription uses the session's own account and
+  refuses to take one from inside a message — there is just nothing establishing
+  what that account is.
+- **Per-account rate limiting.** The outbox budget sheds a client the venue
+  cannot write *to*; nothing yet bounds one that writes too much.
 - **Withdrawals and trading halts.** Venue features rather than exchange-core
   ones.
 - **Fees.** The design puts them at settlement so they never touch matching;
@@ -211,7 +219,7 @@ Scope boundaries, with reasons rather than apologies:
 
 ## Correctness
 
-227 tests. The ones worth looking at:
+232 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed
@@ -226,3 +234,9 @@ Scope boundaries, with reasons rather than apologies:
   write never reaches the follower's log.
 - `crates/gateway/tests/idle_cost.rs` — a benchmark that fails if an idle
   connection ever costs more than 120 ns a pass again.
+- `crates/gateway/tests/failover.rs` — the same binaries a deployment runs: the
+  leader is killed mid-session and a node with an empty log is promoted at a
+  higher term, then checked against everything the dead leader acknowledged.
+  This is the one property that cannot be tested in a single process, and it
+  found a leader whose journal held nothing but its magic bytes after ten
+  thousand acknowledged orders.

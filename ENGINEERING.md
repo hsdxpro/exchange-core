@@ -12,21 +12,24 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**227 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**232 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
 | `bx-engine` | 44 | The engine's own suite. |
-| `bx-protocol` | 11 | Record layout, discriminants, order type, subscription channels. |
-| `bx-journal` | 22 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
-| `bx-pipeline` | 57 | Prices, balances, engine adapter, deltas, hashing, snapshots, and the crossable walk's complexity. |
-| `bx-gateway` | 24 | Framing, the group-commit loop, config parsing and validation. |
-| end-to-end | 19 | Full path with simulated traders and a subscriber. |
+| `bx-protocol` | 12 | Record layout, discriminants, order type, subscription channels. |
+| `bx-journal` | 28 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
+| `bx-pipeline` | 56 | Prices, balances, engine adapter, deltas, hashing, snapshots, and the crossable walk's complexity. |
+| `bx-gateway` | 27 | Framing, the group-commit loop, config parsing and validation. |
+| end-to-end | 20 | Full path with simulated traders and a subscriber. |
 | subscription | 7 | Channels, resume after disconnect, lagging out of the window. |
 | snapshot | 6 | Snapshot/restore equality with a full replay, queue priority. |
 | simulation | 4 | Seeded crash injection, torn writes, dead device, replay determinism. |
-| over sockets | 9 | Real TCP: split records, disconnects, bursts, selective subscription. |
+| over sockets | 16 | Real TCP: split records, disconnects, bursts, selective subscription. |
 | venue snapshots | 7 | Cadence from a recovery target, atomic replace, corrupt snapshot refused. |
+| failover | 2 | Real processes: promotion recovers acked records, no majority means no service. |
+| idle cost | 2 | An idle connection stays under 120 ns a pass. |
+| many clients | 1 | A million accounts, and the memory that costs. |
 
 ### The end-to-end tests matter most
 
@@ -188,15 +191,21 @@ Each of these was settled against a specific alternative, noted below.
 
 ### Chosen stack
 
-| Concern | Choice |
-|---|---|
-| Matching path | pinned threads, busy-poll, **no async runtime** |
-| Between stages | SPSC ring buffers |
-| Gateway / fanout | `tokio` + `quinn` (connection-bound tier, maturity wins) |
-| Consensus | `openraft`, **batching mandatory** — 33k writes/sec unbatched, 5.6M batched |
-| Journal I/O | `io_uring`, SQPOLL |
-| Encoding | hand-rolled fixed-layout structs via `zerocopy` |
-| Transport | QUIC on UDP/443 for everyone; raw UDP/shm for colo later |
+Two columns, because a table that does not separate what runs from what is
+planned cannot be checked against the code.
+
+| Concern | Built | Intended |
+|---|---|---|
+| Matching path | one thread, **no async runtime** | pinned, busy-poll, symbol shards |
+| Between stages | one process, direct calls | SPSC ring buffers |
+| Encoding | hand-rolled fixed-layout structs via `zerocopy` | — |
+| Transport | TCP, unencrypted | raw UDP or shm for colo |
+| Consensus | quorum + term fencing, no election | `openraft`, **batching mandatory** — 33k writes/sec unbatched, 5.6M batched |
+| Journal I/O | buffered `std`, one write and one sync per group | `io_uring`, SQPOLL |
+
+QUIC was in this table's Built column while the code had none, which is the
+failure mode a single-column table invites. It was built, measured and removed
+for the reasons above; nothing here should read as shipped until it is.
 
 ### Product rules
 
@@ -338,25 +347,37 @@ Each of these was settled against a specific alternative, noted below.
 
 Ordered by how much it matters.
 
-4. **`CancelReplace` is cancel-then-submit** and emits both sets of events. It
+1. **No session authentication.** A session states the account it is acting for
+   and is believed. Every other risk check is real; this one is a placeholder,
+   and it is the gap that matters most before this meets a network it does not
+   control. `Channel::requested` already refuses to take an account from inside
+   a message and uses the session's own, so the seam is in the right place --
+   there is simply nothing establishing what the session's account *is*.
+2. **No per-account rate limit.** The outbox budget sheds a client the venue
+   cannot write to; nothing bounds one that writes too much.
+3. **`CancelReplace` is cancel-then-submit** and emits both sets of events. It
    works, but a client sees a `Canceled` it did not ask for.
-7. **openraft's reported 40 ms blocking issue is unverified** against our
+4. **`ingress_ns` is a reserved field that is always zero**, and there is no
+   `match_ns`. Deliberate: a timestamp taken in the gateway measures our own
+   scheduling jitter rather than arrival, so filling it in would look like the
+   feature and be a lie.
+5. **openraft's reported 40 ms blocking issue is unverified** against our
    batching pattern. Measure before committing to it on the data path.
 
 ---
 
 ## What is left
 
-Two items, both deliberate rather than forgotten:
-
 1. **Leader election.** Quorum durability is implemented and measured;
    automatic failover is not. It needs consensus, hand-written consensus is how
    distributed systems lose data quietly, and the right answer is `openraft`.
    `ReplicatedLog` is the boundary where it belongs.
-2. **QUIC in place of TCP.** The transport is TCP. Swapping it is a `tcp.rs`
-   replacement -- `venue` and `codec` do not change -- which is why they are
-   separate.
+2. **Sharding across cores.** One book is single-writer by nature, so the
+   parallelism is across symbols -- but an account trading two of them shares
+   one balance, which needs a two-stage account/symbol split rather than a lock.
+3. **A `bbo` channel.** Top of book is the cheapest feed and what most clients
+   want, and the engine already caches it; nothing publishes it.
 
 Smaller, if wanted: MBO for colocated clients, fee schedules at settlement,
-per-account rate limits.
+`io_uring` behind `LogStorage`, trading halts.
 
