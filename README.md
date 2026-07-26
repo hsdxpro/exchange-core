@@ -217,7 +217,10 @@ Scope boundaries, with reasons rather than apologies:
   leader and promoting a replacement needs consensus, and that means `openraft`.
   It belongs on a *separate* leadership log: an openraft entry is variable-length
   and heterogeneous, so putting the command log through it would cost the
-  zero-copy replay and the O(1) seek that make a 1.3 ms restart possible.
+  zero-copy replay and the O(1) seek that make a 2.0 ms restart possible. Started
+  and stopped deliberately: its storage and network traits want twenty-three
+  methods, a log for variable-length entries, and a `tokio` runtime, and a
+  half-built consensus layer is worse than none.
 - **Sharding across cores.** One book is single-writer by nature. Different
   symbols could run as independent engines, but an account trading two of them
   shares one balance, so that needs a two-stage account/symbol split rather than

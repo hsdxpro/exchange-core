@@ -371,16 +371,39 @@ Ordered by how much it matters.
 
 ## What is left
 
-1. **Leader election.** Quorum durability is implemented and measured;
-   automatic failover is not. It needs consensus, hand-written consensus is how
-   distributed systems lose data quietly, and the right answer is `openraft`.
-   `ReplicatedLog` is the boundary where it belongs.
+Two, and both are their own piece of work rather than an afternoon.
+
+1. **Leader election.** Everything around it is built and tested by real
+   processes: a group is acknowledged once a majority holds it, a promoted node
+   catches up to the longest log a majority holds *before* it serves, and a
+   follower refuses a term older than the highest it has seen. What is missing
+   is only the half that notices a dead leader and picks the replacement.
+
+   That half is consensus and `openraft` should do it, because the failure mode
+   is two nodes each believing they lead, both acknowledging orders into logs
+   that never agree again. It was started and stopped deliberately: openraft
+   0.9.24 resolves and its type macro compiles against the leadership types, but
+   `RaftLogStorage` and `RaftStateMachine` together want fifteen methods, and
+   `RaftLogReader`, `RaftSnapshotBuilder`, `RaftNetworkFactory` and `RaftNetwork`
+   want eight more. On top of the traits it needs a log that holds
+   variable-length entries — `FileLog` is fixed 64-byte records and cannot back
+   it — an RPC transport for openraft's own message types, and a `tokio`
+   runtime.
+
+   The shape is settled and should not be rediscovered. openraft runs a
+   **separate leadership log** whose state machine holds one fact: who leads,
+   under what term. The command log stays exactly as it is, because routing it
+   through openraft would cost the fixed record and with it the zero-copy replay
+   and O(1) sequence seek. The elected term feeds the fencing that already
+   exists, and the new leader calls `catch_up` before serving.
+
 2. **Sharding across cores.** One book is single-writer by nature, so the
    parallelism is across symbols -- but an account trading two of them shares
    one balance, which needs a two-stage account/symbol split rather than a lock.
-3. **A `bbo` channel.** Top of book is the cheapest feed and what most clients
-   want, and the engine already caches it; nothing publishes it.
+   It touches replay determinism, snapshots and the golden hash, so it is a
+   change to the core rather than an addition beside it.
 
 Smaller, if wanted: MBO for colocated clients, fee schedules at settlement,
-`io_uring` behind `LogStorage`, trading halts.
+`io_uring` behind `LogStorage`, trading halts, NIC hardware timestamping behind
+the `ingress_ns` field.
 
