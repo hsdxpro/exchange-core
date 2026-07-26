@@ -199,32 +199,36 @@ impl<L: LogStorage> ReplicatedLog<L> {
         let mut longest = (self.local_len()?, usize::MAX);
         let deadline = Instant::now() + within;
 
-        // Retried against a deadline rather than asked once. A follower serves one
-        // leader at a time, so at the moment of a promotion it may still be
-        // finishing with the leader that just died; giving up on the first attempt
-        // would fail a promotion for a reason that resolves itself.
-        for index in 0..self.followers.len() {
-            loop {
-                match self.ask(index, QUERY, &[]) {
-                    Ok((_, held)) => {
-                        answered += 1;
-                        if held > longest.0 {
-                            longest = (held, index);
-                        }
-                        break;
+        // Every follower is asked once per pass, and the passes repeat until the
+        // deadline. Retrying matters because a follower serves one leader at a
+        // time and may still be finishing with the one that just died. Going
+        // round rather than exhausting one at a time matters because otherwise a
+        // single unreachable node spends the entire window before a node that is
+        // up and ready is asked at all.
+        let mut pending: Vec<usize> = (0..self.followers.len()).collect();
+        while !pending.is_empty() {
+            let last_pass = Instant::now() >= deadline;
+            pending.retain(|&index| match self.ask(index, QUERY, &[]) {
+                Ok((_, held)) => {
+                    answered += 1;
+                    if held > longest.0 {
+                        longest = (held, index);
                     }
-                    Err(_) if Instant::now() < deadline => {
-                        // Reconnect: the socket is no longer usable after a
-                        // timeout, and the follower may be free by now.
-                        if self.reconnect(index).is_err() {
-                            std::thread::sleep(RETRY_PAUSE);
-                        }
-                    }
-                    Err(_) => {
-                        self.followers[index].live = false;
-                        break;
-                    }
+                    false
                 }
+                Err(_) if last_pass => {
+                    self.followers[index].live = false;
+                    false
+                }
+                // A timed-out socket cannot be reused: the late reply would be
+                // read as the answer to the next question.
+                Err(_) => {
+                    let _ = self.reconnect(index);
+                    true
+                }
+            });
+            if !pending.is_empty() && !last_pass {
+                std::thread::sleep(RETRY_PAUSE);
             }
         }
 
@@ -276,17 +280,9 @@ impl<L: LogStorage> ReplicatedLog<L> {
         Ok(())
     }
 
-    /// Bytes this node's own log holds, excluding the file header.
+    /// Bytes of records this node's own log holds, excluding the file header.
     fn local_len(&self) -> io::Result<u64> {
-        let mut probe = [0_u8; RECORD_LEN];
-        let mut offset = HEADER_OFFSET;
-        loop {
-            let read = self.local.read_at(offset, &mut probe)?;
-            if read < RECORD_LEN {
-                return Ok(offset - HEADER_OFFSET);
-            }
-            offset += RECORD_LEN as u64;
-        }
+        Ok(self.local.end()?.saturating_sub(HEADER_OFFSET))
     }
 
     /// Sends one request and reads the fixed reply.
@@ -394,6 +390,10 @@ impl<L: LogStorage> LogStorage for ReplicatedLog<L> {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         self.local.read_at(offset, buf)
+    }
+
+    fn end(&self) -> io::Result<u64> {
+        self.local.end()
     }
 
     fn truncate(&mut self, len: u64) -> io::Result<()> {

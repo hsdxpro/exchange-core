@@ -106,6 +106,20 @@ pub trait LogStorage {
     /// Returns the underlying I/O error if the read fails.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
 
+    /// Byte offset one past the last byte: where the next append will land.
+    ///
+    /// Named for the position rather than a length, because a log always carries a
+    /// header and "empty" would be ambiguous about whether that counts.
+    ///
+    /// Asked for directly rather than found by probing. A promotion needs to know
+    /// how far behind it is before it can catch up, and walking the log a record
+    /// at a time to measure it turned that into one syscall per record -- minutes
+    /// on a large log, on the one path where the venue is already down.
+    ///
+    /// # Errors
+    /// Returns the underlying I/O error if the length cannot be read.
+    fn end(&self) -> io::Result<u64>;
+
     /// Discards everything past `len`, so a partial trailing record left by a
     /// crash is removed before anything is appended after it.
     ///
@@ -195,6 +209,12 @@ impl LogStorage for FileLog {
             self.pending.clear();
         }
         Ok(())
+    }
+
+    fn end(&self) -> io::Result<u64> {
+        // The file, not the buffer: a pending append is not part of the log until
+        // it is written, which is the same boundary reads already see.
+        self.file.metadata().map(|m| m.len())
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
@@ -290,6 +310,10 @@ impl LogStorage for MemoryLog {
     fn sync(&mut self) -> io::Result<()> {
         self.synced_len = self.bytes.len() as u64;
         Ok(())
+    }
+
+    fn end(&self) -> io::Result<u64> {
+        Ok(self.bytes.len() as u64)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
