@@ -62,6 +62,15 @@ struct Session {
     cursors: Vec<(Channel, Sequence)>,
     /// Set by the first command, which is how a session declares who it is.
     account: Option<AccountId>,
+    /// Already in the set of sessions this pass will read.
+    ///
+    /// A flag rather than a search. Readiness can name a session the previous
+    /// pass already left pending, so the two sources have to be merged, and
+    /// checking membership by scanning made that merge quadratic in ready
+    /// sessions: a thousand events against a thousand carried-over sessions is a
+    /// million comparisons, about a millisecond, on the pass that is already the
+    /// busiest.
+    queued: bool,
     open: bool,
 }
 
@@ -85,6 +94,7 @@ impl Session {
             max_outbox,
             cursors: Vec::new(),
             account: None,
+            queued: false,
             open: true,
         }
     }
@@ -252,6 +262,9 @@ pub struct Server<S: LogStorage> {
     /// Edge-triggered readiness will not mention them again, so the loop
     /// remembers them itself.
     still_readable: Vec<usize>,
+    /// Sessions that closed this pass, collected as they are noticed rather than
+    /// found by sweeping every slot afterwards.
+    closing: Vec<usize>,
     /// Unsent bytes one session may owe. Derived from the retention window
     /// rather than chosen: a session further behind than the window cannot be
     /// caught up whatever the venue does.
@@ -314,6 +327,7 @@ impl<S: LogStorage> Server<S> {
             free: Vec::new(),
             live: 0,
             still_readable: Vec::new(),
+            closing: Vec::new(),
             inbound: Vec::new(),
             outbound: Vec::new(),
             max_records_per_session,
@@ -433,7 +447,12 @@ impl<S: LogStorage> Server<S> {
                 match session_index(event.token()) {
                     None => accept = true,
                     Some(index) => {
-                        if !ready.contains(&index) {
+                        // Sessions carried over from the previous pass are
+                        // already flagged, so this both dedupes and skips them.
+                        if let Some(session) = self.sessions.get_mut(index).and_then(Option::as_mut)
+                            && !session.queued
+                        {
+                            session.queued = true;
                             ready.push(index);
                         }
                     }
@@ -451,7 +470,14 @@ impl<S: LogStorage> Server<S> {
                 continue;
             };
             if session.read_into(&mut self.inbound) {
+                // Stays flagged: it is going straight back into the ready set.
                 self.still_readable.push(index);
+            } else {
+                session.queued = false;
+            }
+            if !session.open {
+                self.closing.push(index);
+                continue;
             }
 
             // Attribute each session's account from its *own* first command.
@@ -505,15 +531,16 @@ impl<S: LogStorage> Server<S> {
     }
 
     /// Deregisters and forgets whatever closed this pass.
+    ///
+    /// Works from the list built while sessions were being visited, so a pass
+    /// with no disconnections does no work here at all.
     fn drop_closed(&mut self) {
-        for index in 0..self.sessions.len() {
-            let closed = self.sessions[index]
-                .as_ref()
-                .is_some_and(|session| !session.open);
-            if closed {
-                if let Some(mut session) = self.sessions[index].take() {
-                    let _ = self.poll.registry().deregister(&mut session.stream);
-                }
+        if self.closing.is_empty() {
+            return;
+        }
+        for index in std::mem::take(&mut self.closing) {
+            if let Some(mut session) = self.sessions[index].take() {
+                let _ = self.poll.registry().deregister(&mut session.stream);
                 self.free.push(index);
                 self.live -= 1;
             }
@@ -583,7 +610,13 @@ impl<S: LogStorage> Server<S> {
 
     /// Sends each session everything on its channels it has not seen.
     fn push_updates(&mut self) {
-        for session in self.sessions.iter_mut().filter_map(Option::as_mut) {
+        let mut closed = Vec::new();
+        for (index, session) in self
+            .sessions
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_mut().map(|session| (index, session)))
+        {
             for (channel, cursor) in &mut session.cursors {
                 self.outbound.clear();
                 match self.venue.resume(*channel, *cursor, &mut self.outbound) {
@@ -602,7 +635,11 @@ impl<S: LogStorage> Server<S> {
             if session.over_budget() {
                 session.open = false;
             }
+            if !session.open {
+                closed.push(index);
+            }
         }
+        self.closing.append(&mut closed);
     }
 }
 
