@@ -12,15 +12,15 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**285 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**298 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
 | `bx-engine` | 44 | The engine's own suite. |
 | `bx-protocol` | 12 | Record layout, discriminants, order type, subscription channels. |
-| `bx-journal` | 28 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
+| `bx-journal` | 30 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
 | `bx-pipeline` | 56 | Prices, balances, engine adapter, deltas, hashing, snapshots, and the crossable walk's complexity. |
-| `bx-gateway` | 47 | Framing, the group-commit loop, the HMAC challenge, token buckets, config parsing and validation. |
+| `bx-gateway` | 56 | Framing, the group-commit loop, the HMAC challenge, token buckets, histogram buckets, config parsing and validation. |
 | end-to-end | 22 | Full path with simulated traders and a subscriber, and the open-order index under scrambled cancellation. |
 | subscription | 7 | Channels, resume after disconnect, lagging out of the window. |
 | snapshot | 6 | Snapshot/restore equality with a full replay, queue priority. |
@@ -31,7 +31,7 @@ timing is not evidence of anything.
 | failover | 2 | Real processes: promotion recovers acked records, no majority means no service. |
 | idle cost | 2 | An idle connection stays under 120 ns a pass. |
 | many clients | 1 | A million accounts, and the memory that costs. |
-| admission | 15 | Real sockets: an unproven order never reaches the book, a captured proof does not open the next connection, a flood is cut to its allowance. |
+| admission | 17 | Real sockets: an unproven order never reaches the book, a captured proof does not open the next connection, a flood is cut to its allowance, a refusal is counted against its reason. |
 
 ### The end-to-end tests matter most
 

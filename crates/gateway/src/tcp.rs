@@ -48,6 +48,7 @@
 use crate::auth::{self, Credentials, Mode};
 use crate::codec::{Decoder, FRAME_LEN, encode};
 use crate::limit::{Bucket, RateLimit};
+use crate::metrics::Metrics;
 use crate::venue::Venue;
 use bx_journal::LogStorage;
 use bx_pipeline::fastmap::FastMap;
@@ -377,6 +378,9 @@ pub struct Server<S: LogStorage> {
     /// so the table tracks connected accounts rather than every account ever
     /// seen.
     allowances: FastMap<AccountId, Allowance>,
+    /// What the venue is doing, counted as it does it. Timings are sampled every
+    /// sixty-fourth pass so the clock reading does not land on the order path.
+    metrics: Metrics,
     /// Reused across passes so a steady-state loop allocates nothing.
     inbound: Vec<Command>,
     outbound: Vec<Event>,
@@ -445,6 +449,7 @@ impl<S: LogStorage> Server<S> {
             throttled: 0,
             rate: None,
             allowances: FastMap::default(),
+            metrics: Metrics::default(),
         };
         Ok(server)
     }
@@ -567,6 +572,10 @@ impl<S: LogStorage> Server<S> {
     /// # Errors
     /// Fails only if the journal cannot be written or flushed.
     pub fn poll(&mut self) -> bx_journal::Result<usize> {
+        // Sampled, so the clock is read on one pass in sixty-four rather than in
+        // front of every order.
+        let timing = self.metrics.sampling().then(Instant::now);
+
         // Which sessions to look at: the ones readiness named, plus the ones the
         // previous pass left with data still in the socket.
         let mut ready = std::mem::take(&mut self.still_readable);
@@ -674,15 +683,29 @@ impl<S: LogStorage> Server<S> {
 
         let applied = self.inbound.len();
         if applied > 0 {
+            let started = timing.map(|_| Instant::now());
             let mut group = std::mem::take(&mut self.inbound);
             let result = self.venue.accept(&mut group);
             self.inbound = group;
+            if let Some(started) = started {
+                self.metrics.commit_took(started.elapsed());
+            }
             result?;
         }
 
         self.push_updates();
         self.drop_closed();
+        self.metrics.pass(applied);
+        if let Some(started) = timing {
+            self.metrics.pass_took(started.elapsed());
+        }
         Ok(applied)
+    }
+
+    /// What the venue has been doing. Counts are exact; timings are sampled.
+    #[must_use]
+    pub const fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     fn session_at(&mut self, index: usize) -> &mut Session {
@@ -986,6 +1009,7 @@ impl<S: LogStorage> Server<S> {
                     // rather than waiting on a venue that will not read it.
                     if self.live >= self.max_sessions {
                         self.refused += 1;
+                        self.metrics.refused();
                         drop(stream);
                         continue;
                     }
@@ -1021,6 +1045,7 @@ impl<S: LogStorage> Server<S> {
                         self.sessions[index] = Some(session);
                     }
                     self.live += 1;
+                    self.metrics.accepted();
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
@@ -1031,6 +1056,7 @@ impl<S: LogStorage> Server<S> {
     /// Sends each session everything on its channels it has not seen.
     fn push_updates(&mut self) {
         let mut closed = Vec::new();
+        let mut shed = 0_u32;
         // Channels that fell outside the window, handled after the borrow ends.
         let mut lagged: Vec<(usize, Channel)> = Vec::new();
         for (index, session) in self
@@ -1053,12 +1079,16 @@ impl<S: LogStorage> Server<S> {
             session.flush();
             if session.over_budget() {
                 session.open = false;
+                shed += 1;
             }
             if !session.open {
                 closed.push(index);
             }
         }
         self.closing.append(&mut closed);
+        for _ in 0..shed {
+            self.metrics.shed();
+        }
         self.resynchronise(&lagged);
     }
 

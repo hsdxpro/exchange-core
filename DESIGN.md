@@ -255,7 +255,7 @@ reality.
 | Consensus | none: safe promotion, but no election | `openraft`, on a leadership log |
 | Journal I/O | buffered `std`, one write and one sync per group | `io_uring`, SQPOLL |
 | Timestamps | none published | `ingress_ns` from the NIC, `match_ns` from the shard |
-| Metrics | none | histograms sampled off the hot path |
+| Metrics | log-linear histograms, sampled every 64th pass | export to a scrape endpoint |
 
 Dependencies sit at the edge deliberately. The engine has none, `protocol`/`journal`/
 `pipeline` use only `zerocopy`, and everything the transport needs lives in `gateway` — so

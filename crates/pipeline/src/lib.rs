@@ -26,6 +26,33 @@ use snapshot::{Snapshot, balance_of};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Every reason an order can be refused, so a count can be reported against a
+/// name rather than a number. Listing them costs a compile-time check that
+/// nothing was forgotten, which a `0..N` loop over discriminants would not give.
+const REASONS: [RejectReason; 18] = [
+    RejectReason::None,
+    RejectReason::UnknownAccount,
+    RejectReason::UnknownSymbol,
+    RejectReason::QuantityZero,
+    RejectReason::QuantityTooLarge,
+    RejectReason::DuplicateOrderId,
+    RejectReason::UnknownOrderId,
+    RejectReason::OutsidePriceBand,
+    RejectReason::InsufficientBalance,
+    RejectReason::OrderLimitReached,
+    RejectReason::WouldCross,
+    RejectReason::InsufficientLiquidity,
+    RejectReason::AmendWouldIncrease,
+    RejectReason::SelfMatchPrevented,
+    RejectReason::UnsupportedTimeInForce,
+    RejectReason::EngineCapacity,
+    RejectReason::NotAuthenticated,
+    RejectReason::RateLimited,
+];
+
+/// Slots in the reject table, one per reason.
+pub const REJECT_REASONS: usize = REASONS.len();
+
 /// Accounting operations that failed when they should have been impossible.
 /// Any non-zero value means value was created or destroyed; tests assert it
 /// stays at zero.
@@ -67,6 +94,9 @@ pub struct Exchange<S: LogStorage> {
     /// several times per command and nothing iterates it, so ordering is not
     /// needed and O(log n) tree descents are pure cost.
     reservations: FastMap<OrderId, Reservation>,
+    /// Orders refused, by reason. A fixed array indexed by the discriminant, so
+    /// counting one costs an increment and nothing on the path that accepts.
+    rejects: [u64; REJECT_REASONS],
     /// Which orders each account has resting on each symbol.
     ///
     /// Serves two callers that would otherwise each want their own index.
@@ -105,6 +135,7 @@ impl<S: LogStorage> Exchange<S> {
             instruments,
             books,
             reservations: FastMap::default(),
+            rejects: [0; REJECT_REASONS],
             resting_per_account: FastMap::default(),
             events: Vec::new(),
             released: true,
@@ -941,6 +972,11 @@ impl<S: LogStorage> Exchange<S> {
     }
 
     fn reject(&mut self, command: &Command, reason: RejectReason) {
+        // Counted here rather than by scanning the event stream: this is the
+        // only path a rejection takes, so one increment covers it and the
+        // accepting path pays nothing at all. "Why is this client's fill rate
+        // down" is answered by which of these is climbing.
+        self.rejects[reason as usize] += 1;
         self.push(
             command,
             EventKind::Rejected,
@@ -949,6 +985,25 @@ impl<S: LogStorage> Exchange<S> {
             0,
             reason as u8,
         );
+    }
+
+    /// How many orders each reason has refused, indexed by
+    /// [`RejectReason`] as `usize`.
+    #[must_use]
+    pub const fn rejects(&self) -> &[u64; REJECT_REASONS] {
+        &self.rejects
+    }
+
+    /// The reasons that have actually refused something, worst first.
+    #[must_use]
+    pub fn rejects_by_reason(&self) -> Vec<(RejectReason, u64)> {
+        let mut seen: Vec<(RejectReason, u64)> = REASONS
+            .iter()
+            .filter(|reason| self.rejects[**reason as usize] > 0)
+            .map(|reason| (*reason, self.rejects[*reason as usize]))
+            .collect();
+        seen.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        seen
     }
 
     fn take_sequence(&mut self) -> Sequence {

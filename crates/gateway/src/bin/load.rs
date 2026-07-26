@@ -258,12 +258,26 @@ fn main() -> std::io::Result<()> {
         clients * each
     );
     println!("{}", "-".repeat(72));
-    if acknowledged < clients * each {
-        eprintln!("warning: not every concurrent order was acknowledged");
-    }
 
+    // A run where orders were refused is not the run it claims to be: a refused
+    // order skips matching, so a saturated venue reports a throughput it cannot
+    // sustain. This project has measured the reject path by accident three
+    // times, every time because nothing said so out loud.
+    if acknowledged < clients * each {
+        eprintln!(
+            "WARNING: {} of {} concurrent orders were not acknowledged. If the venue \
+             reports \"open order limit reached\", its pool filled and this figure \
+             is measuring refusals, not matching.",
+            clients * each - acknowledged,
+            clients * each
+        );
+    }
     if received < orders {
-        eprintln!("warning: the venue returned fewer events than orders sent");
+        eprintln!(
+            "WARNING: {} of {orders} pipelined orders were not acknowledged, so this \
+             figure is not measuring what it says.",
+            orders - received
+        );
     }
     Ok(())
 }

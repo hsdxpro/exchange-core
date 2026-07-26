@@ -35,6 +35,10 @@ const STARTING_BALANCE: u64 = u64::MAX / 4;
 /// that just died.
 const PROMOTION_WINDOW: Duration = Duration::from_secs(15);
 
+/// Commands between metric reports. Counted rather than timed so an idle venue
+/// says nothing and the loop never reads a clock on its account.
+const REPORT_EVERY: u64 = 1_000_000;
+
 /// What the venue runs as when no configuration file is given: one instrument,
 /// journal in memory. Enough to point the load harness at, and not a deployment.
 fn measurement_config() -> Config {
@@ -148,10 +152,28 @@ fn run<S: LogStorage>(config: &Config, storage: S, fresh: bool) -> std::io::Resu
     // Printed only once the port is bound and state is restored, so a parent
     // process can wait for this line instead of sleeping and hoping.
     println!("listening {}", server.address()?);
+    let mut reported_at = 0_u64;
     loop {
         if let Err(e) = server.poll() {
             eprintln!("venue stopped: {e}");
             return Err(std::io::Error::other(e.to_string()));
+        }
+        // Reported against commands rather than a clock, so an idle venue stays
+        // silent and a busy one reports often enough to be useful — and so the
+        // loop never reads a clock it would not otherwise read.
+        let commands = server.metrics().commands();
+        if commands >= reported_at + REPORT_EVERY {
+            reported_at = commands;
+            println!("{}", server.metrics().report());
+            let refused = server.venue().exchange().rejects_by_reason();
+            if !refused.is_empty() {
+                let named: Vec<String> = refused
+                    .iter()
+                    .take(5)
+                    .map(|(reason, count)| format!("{reason}: {count}"))
+                    .collect();
+                println!("  rejects       {}", named.join(", "));
+            }
         }
         // A failed snapshot is not fatal. The journal is still authoritative, so
         // it costs recovery time and nothing else; stopping the venue over it

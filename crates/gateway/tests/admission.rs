@@ -37,6 +37,10 @@ struct Running {
     stop: Arc<AtomicBool>,
     throttled: Arc<AtomicU64>,
     rejected_proofs: Arc<AtomicU64>,
+    commands: Arc<AtomicU64>,
+    sessions_accepted: Arc<AtomicU64>,
+    band_rejects: Arc<AtomicU64>,
+    duplicate_rejects: Arc<AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -72,12 +76,31 @@ impl Running {
         let throttle_count = Arc::clone(&throttled);
         let rejected_proofs = Arc::new(AtomicU64::new(0));
         let proof_count = Arc::clone(&rejected_proofs);
+        let commands = Arc::new(AtomicU64::new(0));
+        let command_count = Arc::clone(&commands);
+        let sessions_accepted = Arc::new(AtomicU64::new(0));
+        let accept_count = Arc::clone(&sessions_accepted);
+        let band_rejects = Arc::new(AtomicU64::new(0));
+        let band_count = Arc::clone(&band_rejects);
+        let duplicate_rejects = Arc::new(AtomicU64::new(0));
+        let duplicate_count = Arc::clone(&duplicate_rejects);
 
         let thread = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 server.poll().expect("the venue failed to commit");
                 throttle_count.store(server.throttled(), Ordering::Relaxed);
                 proof_count.store(server.rejected_proofs(), Ordering::Relaxed);
+                command_count.store(server.metrics().commands(), Ordering::Relaxed);
+                accept_count.store(server.metrics().sessions_accepted(), Ordering::Relaxed);
+                let refused = server.venue().exchange().rejects();
+                band_count.store(
+                    refused[RejectReason::OutsidePriceBand as usize],
+                    Ordering::Relaxed,
+                );
+                duplicate_count.store(
+                    refused[RejectReason::DuplicateOrderId as usize],
+                    Ordering::Relaxed,
+                );
                 std::thread::sleep(Duration::from_micros(200));
             }
         });
@@ -87,6 +110,10 @@ impl Running {
             stop,
             throttled,
             rejected_proofs,
+            commands,
+            sessions_accepted,
+            band_rejects,
+            duplicate_rejects,
             thread: Some(thread),
         }
     }
@@ -660,4 +687,57 @@ fn the_proof_bytes_are_exactly_a_full_hmac() {
     assert_eq!(CHALLENGE_LEN, 16);
     let proof = prove(&ALICE_SECRET, &[0; CHALLENGE_LEN]);
     assert_eq!(Command::authenticating(ALICE, proof).proof(), proof);
+}
+
+// ----------------------------------------------------------------- metrics
+
+#[test]
+fn the_venue_reports_what_it_actually_did() {
+    // Counts are exact, so they can be checked against traffic sent. Timings
+    // are sampled and cannot be, which is the trade the sampling buys.
+    let venue = Running::start(false, None);
+    let mut client = venue.connect();
+    let batch: Vec<Command> = (1..=40).map(|id| order(ALICE, id, 10_500)).collect();
+    send(&mut client, &batch);
+    let events = collect_until(&mut client, Duration::from_secs(3), |seen| {
+        answered(seen) >= 40
+    });
+    assert_eq!(kinds(&events, EventKind::Received), 40, "{events:?}");
+
+    let report = reaches(&venue.commands, 40);
+    assert!(
+        report >= 40,
+        "the venue applied 40 commands and counted {report}"
+    );
+    assert!(
+        venue.sessions_accepted.load(Ordering::Relaxed) >= 1,
+        "a connection was accepted and not counted"
+    );
+}
+
+#[test]
+fn a_refusal_is_counted_against_the_reason_it_was_refused() {
+    // "Why is this client's fill rate down" is answered by which of these
+    // climbs, so a refusal that is counted generically is no answer at all.
+    let venue = Running::start(false, None);
+    let mut client = venue.connect();
+
+    // Outside the ladder, which is the price band.
+    send(&mut client, &[order(ALICE, 1, 1)]);
+    // Duplicate ID, after a good one.
+    send(&mut client, &[order(ALICE, 2, 10_500)]);
+    send(&mut client, &[order(ALICE, 2, 10_500)]);
+    let _ = collect_until(&mut client, Duration::from_secs(3), |seen| {
+        answered(seen) >= 3
+    });
+
+    let named = reaches(&venue.band_rejects, 1);
+    assert!(
+        named >= 1,
+        "an order outside the band was refused but not counted as such"
+    );
+    assert!(
+        reaches(&venue.duplicate_rejects, 1) >= 1,
+        "a duplicate order ID was refused but not counted as such"
+    );
 }
