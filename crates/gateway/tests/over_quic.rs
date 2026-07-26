@@ -10,7 +10,7 @@ use bx_gateway::codec::encode;
 use bx_gateway::quic::{ALPN, QuicVenue, read_events, self_signed};
 use bx_journal::MemoryLog;
 use bx_pipeline::instrument::{Instrument, Instruments};
-use bx_pipeline::{limit_order, query_open_orders, subscribe};
+use bx_pipeline::{cancel_on_disconnect, limit_order, query_open_orders, subscribe};
 use bx_protocol::{ChannelKind, Command, Event, EventKind, Side, Ticks};
 use quinn::{ClientConfig, Endpoint};
 use std::net::SocketAddr;
@@ -36,6 +36,9 @@ struct Running {
     address: SocketAddr,
     certificate: Vec<u8>,
     stop: Arc<AtomicBool>,
+    /// Sessions the venue held at its last pass. A hint: the test thread reads it
+    /// while the venue thread writes it.
+    sessions: Arc<std::sync::atomic::AtomicUsize>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -62,19 +65,27 @@ impl Running {
         let address = venue.address().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
+        let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&sessions);
         let thread = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 venue
                     .poll(Duration::from_millis(2))
                     .expect("the venue failed to commit");
+                counter.store(venue.sessions(), Ordering::Relaxed);
             }
         });
         Self {
             address,
             certificate,
             stop,
+            sessions,
             thread: Some(thread),
         }
+    }
+
+    fn sessions_hint(&self) -> usize {
+        self.sessions.load(Ordering::Relaxed)
     }
 
     /// A client that trusts exactly this venue's certificate, rather than
@@ -162,6 +173,16 @@ async fn collect_until(
         }
     }
     seen
+}
+
+/// Collects everything that arrives within `window`, with no early exit.
+///
+/// For answers whose *length* is what is being measured. `collect_until` stops
+/// at the first event satisfying its predicate, which silently truncates a reply
+/// of several events to one -- a mistake made three times in these tests before
+/// this existed.
+async fn drain_for(stream: &mut quinn::RecvStream, window: Duration) -> Vec<Event> {
+    collect_until(stream, window, |_| false).await
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -430,6 +451,149 @@ fn a_reconnecting_client_can_recover_the_orders_it_still_has_working() {
                 .filter(|e| e.kind == EventKind::OrderState as u8)
                 .all(|e| e.account == 1),
             "another account's orders were reported"
+        );
+    });
+}
+
+/// Asks the venue what `account` still has working, on a fresh connection.
+///
+/// The query alone, with no order alongside it: the account is attributed from
+/// the query itself, and anything else in the batch would land after the answer.
+async fn working_orders(venue: &Running, account: u64) -> Vec<u64> {
+    let mut client = connect(venue).await;
+    send(&mut client, &[query_open_orders(account, SYMBOL)]).await;
+    // Drained rather than stopped at the first: the count is the answer.
+    let events = drain_for(&mut client.acks, Duration::from_millis(600)).await;
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::OrderState as u8)
+        .map(|e| e.order_id)
+        .collect()
+}
+
+#[test]
+fn a_departed_session_is_forgotten_rather_than_held_forever() {
+    // A session is freed only when the venue is told the peer has gone, and the
+    // stream writer used to be parked waiting for the venue to free it -- each
+    // waiting on the other, so a disconnected client stayed in the map for good.
+    // Nothing else noticed, because nothing else counted.
+    let venue = Running::start();
+    runtime().block_on(async {
+        for _ in 0..4 {
+            let mut client = connect(&venue).await;
+            send(
+                &mut client,
+                &[limit_order(5, SYMBOL, 1, Side::Bid, 10_010, 1)],
+            )
+            .await;
+            collect_until(&mut client.acks, Duration::from_secs(5), |seen| {
+                !seen.is_empty()
+            })
+            .await;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while venue.sessions_hint() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            venue.sessions_hint(),
+            0,
+            "connections that closed are still being held"
+        );
+    });
+}
+
+#[test]
+fn cancel_on_disconnect_withdraws_a_market_makers_quotes() {
+    // A market maker cannot manage risk it can no longer see, so its quotes must
+    // not outlive its connection. Opt-in, because a client holding a limit order
+    // for a week wants the opposite.
+    let venue = Running::start();
+    runtime().block_on(async {
+        {
+            let mut maker = connect(&venue).await;
+            send(
+                &mut maker,
+                &[
+                    cancel_on_disconnect(1, true),
+                    limit_order(1, SYMBOL, 501, Side::Bid, 10_100, 5),
+                    limit_order(1, SYMBOL, 502, Side::Ask, 10_300, 5),
+                ],
+            )
+            .await;
+            collect_until(&mut maker.acks, Duration::from_secs(5), |seen| {
+                seen.iter()
+                    .filter(|e| e.kind == EventKind::Resting as u8)
+                    .count()
+                    >= 2
+            })
+            .await;
+        } // connection dies
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let working = working_orders(&venue, 1).await;
+        assert!(
+            !working.contains(&501) && !working.contains(&502),
+            "quotes outlived the connection that was managing them: {working:?}"
+        );
+    });
+}
+
+#[test]
+fn without_it_orders_survive_the_connection_that_placed_them() {
+    // The default. A retail client that loses its connection expects to come back
+    // to the order it left.
+    let venue = Running::start();
+    runtime().block_on(async {
+        {
+            let mut client = connect(&venue).await;
+            send(
+                &mut client,
+                &[limit_order(3, SYMBOL, 601, Side::Bid, 10_120, 4)],
+            )
+            .await;
+            collect_until(&mut client.acks, Duration::from_secs(5), |seen| {
+                seen.iter().any(|e| e.kind == EventKind::Resting as u8)
+            })
+            .await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let working = working_orders(&venue, 3).await;
+        assert!(
+            working.contains(&601),
+            "an order was cancelled without being asked for: {working:?}"
+        );
+    });
+}
+
+#[test]
+fn turning_cancel_on_disconnect_back_off_takes_effect() {
+    let venue = Running::start();
+    runtime().block_on(async {
+        {
+            let mut client = connect(&venue).await;
+            send(
+                &mut client,
+                &[
+                    cancel_on_disconnect(4, true),
+                    limit_order(4, SYMBOL, 701, Side::Bid, 10_140, 3),
+                    cancel_on_disconnect(4, false),
+                ],
+            )
+            .await;
+            collect_until(&mut client.acks, Duration::from_secs(5), |seen| {
+                seen.iter().any(|e| e.kind == EventKind::Resting as u8)
+            })
+            .await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let working = working_orders(&venue, 4).await;
+        assert!(
+            working.contains(&701),
+            "the order was cancelled after the setting was turned off: {working:?}"
         );
     });
 }

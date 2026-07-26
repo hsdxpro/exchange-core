@@ -254,6 +254,18 @@ Each of these was settled against a specific alternative, noted below.
 
 ### Bugs that changed the design
 
+- **QUIC sessions were never reaped.** The venue frees a session when told the
+  peer has gone; the stream writer was parked waiting for the venue to free it.
+  Each waited on the other, so a disconnected client stayed in the map for good
+  and cancel-on-disconnect could never fire. Nothing noticed because nothing
+  counted sessions -- the tests all checked what arrived, never what was left
+  behind. Whoever observes the connection ending now says so, and the writer also
+  wakes on the connection closing.
+- **A test helper hid it three times.** The collector stopped at the first event
+  satisfying its predicate, so a reply of several events was silently truncated to
+  one. Twice that looked like a product bug and once it masked one. Answers whose
+  *length* is the measurement now use a drain with no early exit.
+
 - **Replication had no notion of leadership.** A follower accepted whatever any
   leader sent, so a partitioned leader that had been replaced would keep
   appending and two leaders would acknowledge orders into divergent logs.

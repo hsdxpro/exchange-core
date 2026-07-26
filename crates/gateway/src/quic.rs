@@ -73,6 +73,9 @@ struct Session {
     outbound: UnboundedSender<ToClient>,
     cursors: Vec<(Channel, Sequence)>,
     account: Option<AccountId>,
+    /// Cancel this account's resting orders when the connection goes. Per
+    /// session, and scoped to the account.
+    cancel_on_disconnect: bool,
 }
 
 /// A self-signed certificate, for local runs and tests.
@@ -219,6 +222,7 @@ impl<S: LogStorage> QuicVenue<S> {
                     outbound,
                     cursors: Vec::new(),
                     account: None,
+                    cancel_on_disconnect: false,
                 },
             );
             let to_venue = self.sender.clone();
@@ -258,8 +262,22 @@ impl<S: LogStorage> QuicVenue<S> {
         }
 
         self.publish();
+        let mut withdraw = Vec::new();
         for id in gone {
-            self.sessions.remove(&id);
+            if let Some(session) = self.sessions.remove(&id)
+                && session.cancel_on_disconnect
+                && let Some(account) = session.account
+            {
+                withdraw.push(account);
+            }
+        }
+        // Ordinary commands, applied after the session is gone, so they are
+        // journalled and published like any other cancel.
+        for account in withdraw {
+            let mut cancels = self.venue.cancels_for(account);
+            if !cancels.is_empty() {
+                self.venue.accept(&mut cancels)?;
+            }
         }
         Ok(applied)
     }
@@ -303,6 +321,12 @@ impl<S: LogStorage> QuicVenue<S> {
             .unwrap_or_default();
         if command.kind() == Some(CommandKind::QueryOpenOrders) {
             self.answer_open_orders(id, command.symbol, account);
+            return;
+        }
+        if command.kind() == Some(CommandKind::CancelOnDisconnect) {
+            if let Some(session) = self.sessions.get_mut(&id) {
+                session.cancel_on_disconnect = command.quantity != 0;
+            }
             return;
         }
         let Some(kind) = command.channel_kind() else {
@@ -496,9 +520,14 @@ async fn serve(
                             }
                         }
                     }
-                    Ok(None) | Err(_) => return,
+                    Ok(None) | Err(_) => break,
                 }
             }
+            // Whoever notices the connection has gone must say so. The venue
+            // frees the session only on this message, and the writer below is
+            // parked waiting for the venue to do exactly that -- so leaving it to
+            // the writer deadlocks the pair and the session is never reaped.
+            let _ = to_venue.send((id, FromClient::Gone));
         })
     };
 
@@ -514,7 +543,17 @@ async fn serve(
     tokio::spawn(write_stream(acks, ack_receiver));
 
     let mut bytes = Vec::new();
-    while let Some((channel, events)) = from_venue.recv().await {
+    loop {
+        // Ends when the venue drops the session *or* when the peer goes, rather
+        // than only the former: waiting solely on the venue is half of a circular
+        // wait, since the venue is waiting to be told the peer has gone.
+        let next = tokio::select! {
+            queued = from_venue.recv() => queued,
+            _ = connection.closed() => None,
+        };
+        let Some((channel, events)) = next else {
+            break;
+        };
         bytes.clear();
         for event in &events {
             encode(event, &mut bytes);

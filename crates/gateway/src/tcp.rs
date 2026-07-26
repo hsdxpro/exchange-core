@@ -71,6 +71,12 @@ struct Session {
     cursors: Vec<(Channel, Sequence)>,
     /// Set by the first command, which is how a session declares who it is.
     account: Option<AccountId>,
+    /// Cancel this account's resting orders when the connection goes.
+    ///
+    /// Per session, and scoped to the account: two sessions on one account should
+    /// agree about it, because the venue cannot tell which of them placed a given
+    /// order without an index it does not keep.
+    cancel_on_disconnect: bool,
     /// Already in the set of sessions this pass will read.
     ///
     /// A flag rather than a search. Readiness can name a session the previous
@@ -103,6 +109,7 @@ impl Session {
             max_outbox,
             cursors: Vec::new(),
             account: None,
+            cancel_on_disconnect: false,
             queued: false,
             open: true,
         }
@@ -556,11 +563,25 @@ impl<S: LogStorage> Server<S> {
         if self.closing.is_empty() {
             return;
         }
+        let mut withdraw = Vec::new();
         for index in std::mem::take(&mut self.closing) {
             if let Some(mut session) = self.sessions[index].take() {
                 let _ = self.poll.registry().deregister(&mut session.stream);
+                if session.cancel_on_disconnect
+                    && let Some(account) = session.account
+                {
+                    withdraw.push(account);
+                }
                 self.free.push(index);
                 self.live -= 1;
+            }
+        }
+        // Applied as ordinary commands after the session is gone, so they are
+        // journalled, published, and visible to everyone still watching.
+        for account in withdraw {
+            let mut cancels = self.venue.cancels_for(account);
+            if !cancels.is_empty() {
+                let _ = self.venue.accept(&mut cancels);
             }
         }
         self.still_readable
@@ -572,6 +593,10 @@ impl<S: LogStorage> Server<S> {
     fn apply_control(&mut self, index: usize, command: &Command, account: AccountId) {
         if command.kind() == Some(CommandKind::QueryOpenOrders) {
             self.answer_open_orders(index, command.symbol, account);
+            return;
+        }
+        if command.kind() == Some(CommandKind::CancelOnDisconnect) {
+            self.session_at(index).cancel_on_disconnect = command.quantity != 0;
             return;
         }
         let Some(kind) = command.channel_kind() else {

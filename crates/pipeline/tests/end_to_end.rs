@@ -469,6 +469,42 @@ fn a_crash_before_sync_loses_nothing_that_was_acknowledged() {
 }
 
 #[test]
+fn an_accounts_open_orders_are_all_reported_and_all_cancellable() {
+    let mut exchange = funded();
+    for (id, side, price) in [
+        (501_u64, Side::Bid, 10_100),
+        (502, Side::Ask, 10_300),
+        (503, Side::Bid, 10_050),
+    ] {
+        let mut order = limit_order(1, SYMBOL, id, side, price, 5);
+        exchange.submit(&mut order).unwrap();
+    }
+
+    let working = exchange.open_orders_for(1, SYMBOL);
+    let mut ids: Vec<u64> = working.iter().map(|o| o.order).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![501, 502, 503],
+        "not every resting order was reported"
+    );
+
+    // Cancelling them all, as a departing session would.
+    let mut cancels: Vec<Command> = ids
+        .iter()
+        .map(|id| bx_pipeline::cancel_order(1, SYMBOL, *id))
+        .collect();
+    exchange.submit_batch(&mut cancels).unwrap();
+
+    assert!(
+        exchange.open_orders_for(1, SYMBOL).is_empty(),
+        "orders survived being cancelled: {:?}",
+        exchange.open_orders_for(1, SYMBOL)
+    );
+    assert_eq!(exchange.open_orders(), 0);
+}
+
+#[test]
 fn an_enqueued_command_is_not_durable_until_it_is_committed() {
     let mut exchange = funded();
     let committed = exchange.next_sequence();

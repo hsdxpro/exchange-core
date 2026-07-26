@@ -22,15 +22,20 @@ use bx_protocol::{Command, Event, Sequence, SymbolId};
 pub struct Venue<S: LogStorage> {
     exchange: Exchange<S>,
     hub: Hub,
+    /// Listed symbols, so a departing session's orders can be found without
+    /// scanning every order in the venue.
+    symbols: Vec<SymbolId>,
 }
 
 impl<S: LogStorage> Venue<S> {
     /// # Errors
     /// Fails if the journal cannot be opened.
     pub fn new(storage: S, instruments: Instruments, retained_per_channel: usize) -> Result<Self> {
+        let symbols = instruments.iter().map(|i| i.symbol).collect();
         Ok(Self {
             exchange: Exchange::new(storage, instruments)?,
             hub: Hub::new(retained_per_channel),
+            symbols,
         })
     }
 
@@ -94,6 +99,25 @@ impl<S: LogStorage> Venue<S> {
     /// Fails if the journal is unreadable, corrupt, or has a gap.
     pub fn recover(&mut self) -> Result<u64> {
         self.exchange.recover()
+    }
+
+    /// Cancels everything an account has resting, across every listed symbol.
+    ///
+    /// Built as ordinary `Cancel` commands rather than reaching into the books,
+    /// so they are journalled, replayed and published like any other cancel. A
+    /// departing session must not be able to change state by a private route.
+    ///
+    /// Walks the instrument list, which is a configuration-bounded loop on a path
+    /// taken once per disconnection.
+    #[must_use]
+    pub fn cancels_for(&self, account: bx_protocol::AccountId) -> Vec<Command> {
+        let mut commands = Vec::new();
+        for symbol in self.symbols.iter().copied() {
+            for resting in self.exchange.open_orders_for(account, symbol) {
+                commands.push(bx_pipeline::cancel_order(account, symbol, resting.order));
+            }
+        }
+        commands
     }
 
     #[must_use]

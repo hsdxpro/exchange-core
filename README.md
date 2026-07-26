@@ -86,7 +86,7 @@ Requires `rustup` and nothing else. There is no CI; `xtask` is the task runner.
 cargo x
 ```
 
-That is format, `clippy -D warnings`, and all 227 tests. Also:
+That is format, `clippy -D warnings`, and all 233 tests. Also:
 
 ```bash
 cargo x latency
@@ -155,6 +155,13 @@ recovery mechanism rather than an approximation, and it constrains every feature
 only after the commit succeeds. An acknowledgement that has to be retracted is
 worse than one that took longer.
 
+**Cancel-on-disconnect is opt-in.** A market maker cannot manage risk it can no
+longer see, so leaving its quotes in the book after its connection dies is
+dangerous; a client holding a limit order for a week wants exactly the opposite.
+A venue that picks one for everybody is wrong for half its clients. The cancels
+it causes are ordinary journalled commands, so a departing session cannot change
+state by a private route.
+
 **A client can ask what it still has working.** A book can be rebuilt from a
 snapshot; a client's own orders cannot, and a trader that has just reconnected
 must know what is in the market before it acts. The answer costs that account's
@@ -188,14 +195,14 @@ Scope boundaries, with reasons rather than apologies:
   and untested platform-specific I/O is worse than none — the measurement also
   said the cost was one syscall *per record*, and batching the writes recovered
   8.6× without leaving `std`.
-- **Withdrawals, cancel-on-disconnect, trading halts.** Venue features rather
-  than exchange-core ones.
+- **Withdrawals and trading halts.** Venue features rather than exchange-core
+  ones.
 - **Fees.** The design puts them at settlement so they never touch matching;
   nothing applies them yet.
 
 ## Correctness
 
-227 tests. The ones worth looking at:
+233 tests. The ones worth looking at:
 
 - `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
   seed, asserting after every crash that recovery reproduces the last committed

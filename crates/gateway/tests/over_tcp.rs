@@ -11,7 +11,9 @@ use bx_gateway::codec::encode;
 use bx_gateway::tcp::{Server, read_events};
 use bx_journal::MemoryLog;
 use bx_pipeline::instrument::{Instrument, Instruments};
-use bx_pipeline::{limit_order, market_order, subscribe, unsubscribe};
+use bx_pipeline::{
+    cancel_on_disconnect, limit_order, market_order, query_open_orders, subscribe, unsubscribe,
+};
 use bx_protocol::{ChannelKind, Command, Event, EventKind, Side, Ticks};
 use std::io::Write;
 use std::net::TcpStream;
@@ -582,6 +584,45 @@ fn a_client_shed_for_being_slow_can_reconnect_and_rebuild_the_book() {
             .filter(|e| e.kind == EventKind::BookSnapshot as u8)
             .all(|e| e.quantity > 0),
         "an empty level was sent as state"
+    );
+}
+
+#[test]
+fn cancel_on_disconnect_withdraws_every_quote_not_just_one() {
+    let venue = Running::start();
+    {
+        let mut maker = venue.connect();
+        send(
+            &mut maker,
+            &[
+                cancel_on_disconnect(1, true),
+                limit_order(1, SYMBOL, 501, Side::Bid, 10_100, 5),
+                limit_order(1, SYMBOL, 502, Side::Ask, 10_300, 5),
+                limit_order(1, SYMBOL, 503, Side::Bid, 10_050, 5),
+            ],
+        );
+        collect_until(&mut maker, Duration::from_secs(5), |seen| {
+            seen.iter()
+                .filter(|e| e.kind == EventKind::Resting as u8)
+                .count()
+                >= 3
+        });
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut asking = venue.connect();
+    send(&mut asking, &[query_open_orders(1, SYMBOL)]);
+    // Drained rather than stopped at the first event: the count is the answer,
+    // and a predicate that stops early would truncate a reply of several to one.
+    let events = collect_until(&mut asking, Duration::from_millis(600), |_| false);
+    let working: Vec<u64> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::OrderState as u8)
+        .map(|e| e.order_id)
+        .collect();
+    assert!(
+        working.is_empty(),
+        "quotes outlived the connection managing them: {working:?}"
     );
 }
 

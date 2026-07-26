@@ -346,7 +346,10 @@ impl<S: LogStorage> Exchange<S> {
             // Session control never reaches here: the gateway handles it and
             // does not journal it. One in the journal means a bug upstream, so
             // it is refused rather than quietly ignored.
-            CommandKind::Subscribe | CommandKind::Unsubscribe | CommandKind::QueryOpenOrders => {
+            CommandKind::Subscribe
+            | CommandKind::Unsubscribe
+            | CommandKind::QueryOpenOrders
+            | CommandKind::CancelOnDisconnect => {
                 self.reject(&command, RejectReason::UnsupportedTimeInForce);
             }
             CommandKind::Deposit => self.accounts.deposit(
@@ -904,6 +907,36 @@ pub fn deposit(account: AccountId, asset: instrument::AssetId, amount: Quantity)
         Side::Bid,
         0,
         amount,
+        TimeInForce::GoodTillCancel,
+    )
+}
+
+/// Cancels one resting order.
+#[must_use]
+pub fn cancel_order(account: AccountId, symbol: SymbolId, order_id: OrderId) -> Command {
+    Command::new(
+        CommandKind::Cancel,
+        account,
+        symbol,
+        order_id,
+        Side::Bid,
+        0,
+        0,
+        TimeInForce::GoodTillCancel,
+    )
+}
+
+/// Turns cancel-on-disconnect on or off for the session that sends it.
+#[must_use]
+pub fn cancel_on_disconnect(account: AccountId, on: bool) -> Command {
+    Command::new(
+        CommandKind::CancelOnDisconnect,
+        account,
+        0,
+        0,
+        Side::Bid,
+        0,
+        u64::from(on),
         TimeInForce::GoodTillCancel,
     )
 }

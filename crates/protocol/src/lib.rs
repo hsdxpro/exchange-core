@@ -121,6 +121,18 @@ pub enum CommandKind {
     /// Layout: `symbol` names the instrument. Answered with
     /// [`EventKind::OrderState`], one per resting order.
     QueryOpenOrders = 7,
+    /// Asks the venue to cancel this account's resting orders if the connection
+    /// drops. `quantity` of 1 turns it on, 0 off.
+    ///
+    /// Opt-in because the right answer differs by client. A market maker cannot
+    /// manage risk it can no longer see, so leaving its quotes in the book after
+    /// its connection dies is dangerous. Someone holding a limit order for a week
+    /// wants exactly the opposite. A venue that picks one for everybody is wrong
+    /// for half its clients.
+    ///
+    /// Session control: it changes nothing itself and is never journalled. The
+    /// cancels it later causes are ordinary commands and are.
+    CancelOnDisconnect = 8,
 }
 
 /// Which feed a [`CommandKind::Subscribe`] names.
@@ -329,6 +341,7 @@ impl Command {
         self.kind == CommandKind::Subscribe as u8
             || self.kind == CommandKind::Unsubscribe as u8
             || self.kind == CommandKind::QueryOpenOrders as u8
+            || self.kind == CommandKind::CancelOnDisconnect as u8
     }
 
     /// Asset credited by a [`CommandKind::Deposit`]. Meaningless for any other
@@ -388,6 +401,7 @@ impl Command {
             5 => Some(CommandKind::Subscribe),
             6 => Some(CommandKind::Unsubscribe),
             7 => Some(CommandKind::QueryOpenOrders),
+            8 => Some(CommandKind::CancelOnDisconnect),
             _ => None,
         }
     }
@@ -530,6 +544,7 @@ mod tests {
             (5, CommandKind::Subscribe),
             (6, CommandKind::Unsubscribe),
             (7, CommandKind::QueryOpenOrders),
+            (8, CommandKind::CancelOnDisconnect),
         ] {
             let mut command = sample();
             command.kind = byte;
