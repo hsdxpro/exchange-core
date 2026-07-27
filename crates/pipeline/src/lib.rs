@@ -318,8 +318,7 @@ impl<S: LogStorage> Exchange<S> {
     /// # Errors
     /// Fails if the journal is unreadable, corrupt, or has a gap.
     pub fn recover(&mut self) -> bx_journal::Result<u64> {
-        let commands = self.journal.replay().collect_all()?;
-        Ok(self.apply_all(commands))
+        self.replay_from(0)
     }
 
     /// Restores a snapshot, then replays only the journal after it.
@@ -332,24 +331,54 @@ impl<S: LogStorage> Exchange<S> {
     /// Fails if the journal is unreadable, corrupt, or has a gap.
     pub fn recover_from(&mut self, snapshot: &Snapshot) -> bx_journal::Result<u64> {
         self.restore(snapshot);
-        let commands = self
-            .journal
-            .replay()
-            .from_sequence(snapshot.sequence)?
-            .collect_all()?;
-        Ok(self.apply_all(commands))
+        self.replay_from(snapshot.sequence)
     }
 
-    fn apply_all(&mut self, commands: Vec<Command>) -> u64 {
-        let count = commands.len() as u64;
-        for command in commands {
-            self.events.clear();
-            self.apply(command);
+    /// Replays from `start` in fixed-size chunks.
+    ///
+    /// Bounded memory on purpose. Collecting the journal into one `Vec` first
+    /// made peak recovery memory scale with the length of the log -- 64 bytes a
+    /// command, so a venue that had taken a hundred million orders needed
+    /// gigabytes to come back. Recovery is precisely when a node is least able
+    /// to find them, since it is usually recovering because something already
+    /// went wrong.
+    ///
+    /// Re-seeking each chunk is free: [`Replay::from_sequence`] is arithmetic on
+    /// a fixed record width, not a scan.
+    fn replay_from(&mut self, start: Sequence) -> bx_journal::Result<u64> {
+        /// 256 KiB of commands. Large enough that the per-chunk seek disappears
+        /// against the work, small enough to stay a rounding error in RSS.
+        const CHUNK: usize = 4_096;
+
+        let mut buffer: Vec<Command> = Vec::with_capacity(CHUNK);
+        let mut next = start;
+        let mut count = 0_u64;
+
+        loop {
+            buffer.clear();
+            {
+                let mut replay = self.journal.replay().from_sequence(next)?;
+                while buffer.len() < CHUNK {
+                    let Some(command) = replay.next_record()? else {
+                        break;
+                    };
+                    buffer.push(command);
+                }
+            }
+            if buffer.is_empty() {
+                break;
+            }
+            next += buffer.len() as Sequence;
+            count += buffer.len() as u64;
+            for command in buffer.drain(..) {
+                self.events.clear();
+                self.apply(command);
+            }
         }
         self.events.clear();
         self.released = true;
         self.event_sequence = 0;
-        count
+        Ok(count)
     }
 
     /// Captures the state as of the current journal position.

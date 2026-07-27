@@ -425,18 +425,31 @@ impl<'a, S: LogStorage> Replay<'a, S> {
         }
     }
 
-    /// Skips forward to `sequence`, so recovery can start from a snapshot.
+    /// Seeks to `sequence`, so recovery can start from a snapshot.
+    ///
+    /// Arithmetic rather than a search. Records are a fixed width, the log
+    /// begins at sequence zero, and [`Self::next_record`] refuses a sequence
+    /// that jumps -- so a sequence's offset is `HEADER_LEN + sequence *
+    /// RECORD_LEN` and nothing has to be read to find it. This used to scan
+    /// from the start, which made recovering from a snapshot still cost a walk
+    /// of the whole journal and left the snapshot saving only the *applying*.
+    ///
+    /// The trade is that records before `sequence` are no longer read, so
+    /// corruption among them is not reported here. Those records are already
+    /// folded into the snapshot being restored and will not be applied again;
+    /// [`Journal::open`] is what validates the log as a whole.
+    ///
+    /// A `sequence` past the end leaves the cursor past the end, and the first
+    /// read returns `None` -- the same as scanning off the end did.
     ///
     /// # Errors
-    /// Propagates any error encountered while scanning.
+    /// Fails if the offset for `sequence` does not fit in a `u64`.
     pub fn from_sequence(mut self, sequence: Sequence) -> Result<Self> {
-        while let Some(command) = self.next_record()? {
-            if command.sequence >= sequence {
-                self.offset -= RECORD_LEN as u64;
-                self.expected_sequence = Some(command.sequence);
-                break;
-            }
-        }
+        self.offset = sequence
+            .checked_mul(RECORD_LEN as u64)
+            .and_then(|scaled| scaled.checked_add(HEADER_LEN))
+            .ok_or(JournalError::CorruptRecord { offset: u64::MAX })?;
+        self.expected_sequence = Some(sequence);
         Ok(self)
     }
 
@@ -579,6 +592,61 @@ mod tests {
         assert_eq!(tail.len(), 40);
         assert_eq!(tail[0].sequence, 60);
         assert_eq!(tail.last().unwrap().sequence, 99);
+    }
+
+    /// Every seek target, not just one.
+    ///
+    /// `from_sequence` computes an offset instead of scanning for it, so the
+    /// failure it can have is landing on the wrong record -- and landing one
+    /// record out is invisible to a test that only checks how many records come
+    /// back. `order_id` carries the sequence independently of the sequence
+    /// field, so this catches a cursor that is off by any amount, at any target,
+    /// rather than only in the middle of the log.
+    #[test]
+    fn seeking_to_any_sequence_lands_on_exactly_that_record() {
+        const RECORDS: u64 = 64;
+        let journal = journal_with(RECORDS);
+
+        for target in 0..RECORDS {
+            let tail = journal
+                .replay()
+                .from_sequence(target)
+                .unwrap()
+                .collect_all()
+                .unwrap();
+            assert_eq!(
+                tail.len() as u64,
+                RECORDS - target,
+                "wrong number of records after seeking to {target}"
+            );
+            assert_eq!(tail[0].sequence, target, "seek to {target} landed wrong");
+            assert_eq!(
+                tail[0].order_id, target,
+                "seek to {target} landed on another record's payload"
+            );
+        }
+    }
+
+    #[test]
+    fn seeking_past_the_end_reads_nothing() {
+        let journal = journal_with(8);
+        for target in [8, 9, 1_000, u32::MAX as u64] {
+            let tail = journal
+                .replay()
+                .from_sequence(target)
+                .unwrap()
+                .collect_all()
+                .unwrap();
+            assert!(tail.is_empty(), "seeking to {target} should read nothing");
+        }
+    }
+
+    /// A sequence whose byte offset would not fit in a `u64` is refused rather
+    /// than wrapping into the middle of the log.
+    #[test]
+    fn a_sequence_that_cannot_be_addressed_is_refused() {
+        let journal = journal_with(1);
+        assert!(journal.replay().from_sequence(u64::MAX).is_err());
     }
 
     #[test]

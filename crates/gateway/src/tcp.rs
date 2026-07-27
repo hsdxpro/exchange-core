@@ -1261,16 +1261,20 @@ impl<S: LogStorage> Server<S> {
 
         // Written to only the sessions that have something waiting. A session
         // whose socket is full stays here until it drains.
+        // Compacted in place. Draining into two fresh vectors and assigning the
+        // survivors back cost a pair of allocations on every pass that wrote
+        // anything, which is every pass under load. The list only ever shrinks
+        // here, so the survivors fit in front of the entries already read.
         let mut shed = 0_u32;
-        let mut closed = Vec::new();
-        let mut still_owing = Vec::new();
-        for index in std::mem::take(&mut self.owing) {
+        let mut kept = 0_usize;
+        for cursor in 0..self.owing.len() {
+            let index = self.owing[cursor];
             let Some(session) = self.sessions[index].as_mut() else {
                 continue;
             };
             // The flag, not the list, is the truth. A slot freed on one pass can
             // be taken by a new connection on the next while this list still
-            // names it, and that entry now points at somebody else — who has
+            // names it, and that entry now points at somebody else, who has
             // their own flag saying whether they owe anything. Trusting the list
             // would flush a stranger and, worse, let the same index be carried
             // forward twice and accumulate.
@@ -1282,17 +1286,19 @@ impl<S: LogStorage> Server<S> {
                 session.open = false;
                 shed += 1;
             }
-            if !session.open {
+            let still_owes = session.open && !session.outbox.is_empty();
+            let closed = !session.open;
+            if !still_owes {
                 session.owes = false;
-                closed.push(index);
-            } else if session.outbox.is_empty() {
-                session.owes = false;
-            } else {
-                still_owing.push(index);
+            }
+            if still_owes {
+                self.owing[kept] = index;
+                kept += 1;
+            } else if closed {
+                self.closing.push(index);
             }
         }
-        self.owing = still_owing;
-        self.closing.append(&mut closed);
+        self.owing.truncate(kept);
         for _ in 0..shed {
             self.metrics.shed();
         }

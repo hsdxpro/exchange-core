@@ -188,6 +188,14 @@ impl<L: LogStorage> ReplicatedLog<L> {
             let stream = TcpStream::connect(address)?;
             stream.set_nodelay(true)?;
             stream.set_read_timeout(Some(ack_timeout))?;
+            // A write deadline as well as a read one. Without it a follower that
+            // stops reading -- hung, paused, or behind a black-holed link --
+            // closes its receive window and `write_all` blocks in the kernel
+            // with no deadline at all. The leader is one thread and that thread
+            // is the venue, so a single stuck follower stopped every client from
+            // trading. A read timeout alone does not help: the write never
+            // returns to reach the read.
+            stream.set_write_timeout(Some(ack_timeout))?;
             followers.push(Follower {
                 address: address.clone(),
                 stream,
@@ -345,6 +353,7 @@ impl<L: LogStorage> ReplicatedLog<L> {
         let stream = TcpStream::connect(&self.followers[index].address)?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(self.ack_timeout))?;
+        stream.set_write_timeout(Some(self.ack_timeout))?;
         self.followers[index].stream = stream;
         Ok(())
     }
@@ -649,6 +658,11 @@ impl<L: LogStorage> Replica<L> {
     pub fn serve(&mut self, stream: &mut TcpStream, idle_timeout: Duration) -> io::Result<()> {
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(idle_timeout))?;
+        // The same reasoning as the leader's side: a leader that stops reading
+        // its acknowledgements would otherwise pin this follower in a blocking
+        // write forever, and a pinned follower serves nobody -- including the
+        // replacement leader that needs it to complete a promotion.
+        stream.set_write_timeout(Some(idle_timeout))?;
         let mut header = [0_u8; HEADER_LEN];
         let mut group = Vec::new();
 
@@ -965,6 +979,25 @@ mod tests {
         );
         hung.join().unwrap();
     }
+
+    // There is deliberately no test here for the write-side half of the
+    // hung-follower problem, and that is worth recording rather than leaving as
+    // an apparent gap.
+    //
+    // The test above covers a follower that takes the group and never answers,
+    // which the read deadline handles. The other failure is a follower that
+    // stops *reading*: its receive window closes, the leader's send buffer
+    // fills, and `write_all` blocks in the kernel with no deadline -- so the
+    // read deadline behind it is never reached. That is why the sockets set a
+    // write timeout as well as a read one.
+    //
+    // It cannot be provoked here. On Windows loopback the stack absorbs the
+    // send regardless of whether the peer ever reads: measured, 128 MB written
+    // to a socket nobody was reading returned success in 9.5 ms. A test written
+    // against it therefore passes whether or not the write timeout is set, which
+    // is worse than no test -- it reports the guard as covered when removing the
+    // guard changes nothing it can see. Reproducing this needs a real network,
+    // or a socket whose buffers can be shrunk, which `std::net` cannot do.
 
     #[test]
     fn a_replaced_leader_is_refused_and_learns_that_it_was() {
