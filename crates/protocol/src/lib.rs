@@ -346,6 +346,35 @@ const _: () = assert!(size_of::<Event>() == 64);
 
 impl Event {
     /// Returns `None` if the discriminant is not a value this version defines.
+    ///
+    /// Typed, so a client reporting why it was refused can print the reason's
+    /// message rather than a number an operator has to look up in this file.
+    #[must_use]
+    pub fn reject_reason(&self) -> Option<RejectReason> {
+        match self.reject_reason {
+            0 => Some(RejectReason::None),
+            1 => Some(RejectReason::UnknownAccount),
+            2 => Some(RejectReason::UnknownSymbol),
+            3 => Some(RejectReason::QuantityZero),
+            4 => Some(RejectReason::QuantityTooLarge),
+            5 => Some(RejectReason::DuplicateOrderId),
+            6 => Some(RejectReason::UnknownOrderId),
+            7 => Some(RejectReason::OutsidePriceBand),
+            8 => Some(RejectReason::InsufficientBalance),
+            9 => Some(RejectReason::OrderLimitReached),
+            10 => Some(RejectReason::WouldCross),
+            11 => Some(RejectReason::InsufficientLiquidity),
+            12 => Some(RejectReason::AmendWouldIncrease),
+            13 => Some(RejectReason::SelfMatchPrevented),
+            14 => Some(RejectReason::UnsupportedTimeInForce),
+            15 => Some(RejectReason::EngineCapacity),
+            16 => Some(RejectReason::NotAuthenticated),
+            17 => Some(RejectReason::RateLimited),
+            _ => None,
+        }
+    }
+
+    /// Returns `None` if the discriminant is not a value this version defines.
     #[must_use]
     pub fn kind(&self) -> Option<EventKind> {
         match self.kind {

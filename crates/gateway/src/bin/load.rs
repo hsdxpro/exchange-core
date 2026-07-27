@@ -23,7 +23,7 @@
 
 use bx_gateway::codec::{FRAME_LEN, encode};
 use bx_pipeline::limit_order;
-use bx_protocol::{Command, Event, EventKind, Side, Ticks};
+use bx_protocol::{Command, Event, EventKind, RejectReason, Side, Ticks};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
@@ -51,11 +51,18 @@ const ACCOUNTS: u64 = 256;
 struct Responses {
     acknowledged: u64,
     rejected: u64,
+    /// Rejections tallied by reason discriminant, so the warning at the end
+    /// says *why* instead of guessing. A run refused for duplicate order IDs --
+    /// which is what running this tool twice against one venue produces, since
+    /// the first run's orders are still resting under the same IDs -- needs
+    /// different advice than a run refused by the rate limit, and only the
+    /// venue knows which happened.
+    reasons: [u64; 32],
 }
 
 impl Responses {
     /// Commands the venue has answered, one way or the other.
-    const fn answered(self) -> u64 {
+    const fn answered(&self) -> u64 {
         self.acknowledged + self.rejected
     }
 
@@ -64,7 +71,34 @@ impl Responses {
             self.acknowledged += 1;
         } else if event.kind == EventKind::Rejected as u8 {
             self.rejected += 1;
+            let slot = (event.reject_reason as usize).min(self.reasons.len() - 1);
+            self.reasons[slot] += 1;
         }
+    }
+
+    fn absorb(&mut self, other: &Self) {
+        self.acknowledged += other.acknowledged;
+        self.rejected += other.rejected;
+        for (mine, theirs) in self.reasons.iter_mut().zip(other.reasons.iter()) {
+            *mine += theirs;
+        }
+    }
+
+    /// The reason that refused the most commands, with its count.
+    fn dominant_reason(&self) -> Option<(RejectReason, u64)> {
+        let (index, count) = self
+            .reasons
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, count)| **count)?;
+        if *count == 0 {
+            return None;
+        }
+        let probe = Event {
+            reject_reason: index as u8,
+            ..Event::default()
+        };
+        probe.reject_reason().map(|reason| (reason, *count))
     }
 }
 
@@ -306,8 +340,7 @@ fn concurrent_throughput(
     let mut total = Responses::default();
     for worker in workers {
         let tally = worker.join().expect("client thread panicked")?;
-        total.acknowledged += tally.acknowledged;
-        total.rejected += tally.rejected;
+        total.absorb(&tally);
     }
     let elapsed = started.elapsed().as_secs_f64();
     Ok(((clients * orders_each) as f64 / elapsed, total))
@@ -379,12 +412,23 @@ fn main() -> std::io::Result<()> {
 
 /// Says what happened to the commands that were not acknowledged.
 fn report(phase: &str, tally: Responses, sent: u64) {
-    if tally.rejected > 0 {
+    if let Some((reason, count)) = tally.dominant_reason() {
+        let advice = match reason {
+            RejectReason::RateLimited => {
+                " Raise `max_commands_per_second` in the venue's configuration, or \
+                 lower --orders."
+            }
+            RejectReason::DuplicateOrderId => {
+                " The usual cause is running this tool twice against one venue: the \
+                 first run's orders are still resting under the same IDs. Restart \
+                 the venue between runs."
+            }
+            _ => "",
+        };
         eprintln!(
-            "WARNING: the venue refused {} of {sent} {phase} orders, so this figure \
-             is measuring the reject path rather than matching. The usual cause is \
-             `max_commands_per_second` in the venue's configuration being below the \
-             rate this tool sends at; raise it, or lower --orders.",
+            "WARNING: the venue refused {} of {sent} {phase} orders ({count} of \
+             them: {reason}), so this figure is measuring the reject path rather \
+             than matching.{advice}",
             tally.rejected
         );
     }
