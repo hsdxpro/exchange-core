@@ -25,9 +25,9 @@
 ---
 
 - **188 ns** for a passive limit order across the full path: sequence, journal, balance reservation, match, emit
-- **4.6M commands/sec** durable, acknowledged by a quorum of replicas
+- **7.5M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
-- **2.0 ms** to restart from a snapshot instead of 12.8 ms replaying from zero
+- **0.7 ms** to restart from a snapshot instead of 8.7 ms replaying from zero
 - **325 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
 
 Every number measured on the machine this was built on. `cargo x latency` reproduces the
@@ -79,10 +79,10 @@ cargo run --release -p bx-gateway --bin replica -- 127.0.0.1:7201
 | Operation | Cost |
 |---|---:|
 | Passive limit order, full path | **188 ns** |
-| Crossing order, one fill | **224 ns** |
-| Cancel by order ID | **106 ns** |
-| Mixed stream | **171 ns** |
-| Three market-data subscribers attached | +11 ns |
+| Crossing order, one fill | **242 ns** |
+| Cancel by order ID | **110 ns** |
+| Mixed stream | **178 ns** |
+| Three market-data subscribers attached | +28 ns |
 | Top-of-book feed, on every command | +8 ns |
 
 "Full path" = sequence, journal, balance reservation, match, event emission. Not the book
@@ -94,12 +94,12 @@ The largest decision in the design is which of these two rows to acknowledge on.
 
 | Commands/sec, durable | Local `fsync` | Quorum of replicas | Gain |
 |---|---:|---:|---:|
-| Group of 1 | 321 | 15,596 | **49×** |
-| Group of 256 | 77,989 | 1,477,527 | 19× |
-| Group of 16,384 | 2,344,665 | **4,646,905** | 2× |
+| Group of 1 | 325 | 24,492 | **75×** |
+| Group of 256 | 82,490 | 2,482,474 | 30× |
+| Group of 16,384 | 3,079,368 | **7,546,629** | 2.5× |
 
 - The gap is widest with nothing to amortise a sync over — a client waiting on one order.
-- At 16,384 the quorum path costs 215 ns/command, roughly the compute cost above.
+- At 16,384 the quorum path costs 133 ns/command, below the compute cost above.
   Durability is nearly free and the venue is matching-bound again.
 - **Nothing picks a group size.** A group is whatever arrived since the last pass: it
   grows under load, and falls to one when idle and latency matters more.
@@ -124,11 +124,11 @@ three converge — once the group is large the sync is shared across thousands o
 
 | Accounts | Per command | Memory |
 |---|---:|---:|
-| 16 | 177 ns | ~0 |
-| 100,000 | 390 ns | 9 MiB |
-| **1,000,000** | **463 ns** | **91 MiB** |
+| 16 | 248 ns | ~0 |
+| 100,000 | 423 ns | 9 MiB |
+| **1,000,000** | **453 ns** | **91 MiB** |
 
-2.16M commands/sec at a million accounts. The 2.6× degradation is cache misses on the
+2.21M commands/sec at a million accounts. The 1.8× degradation is cache misses on the
 balance map — lookups are still O(1), the working set stopped fitting. Memory is charged
 per *holding*, so an account that never traded costs nothing.
 
@@ -152,8 +152,8 @@ say and nothing to be told is never visited, so cost stops growing with connecti
 
 | | |
 |---|---:|
-| Replay all 100,000 commands | 12.8 ms |
-| Snapshot + replay the last 5,000 | **2.0 ms** |
+| Replay all 100,000 commands | 8.7 ms |
+| Snapshot + replay the last 5,000 | **0.7 ms** |
 
 ## Architecture
 
