@@ -168,6 +168,15 @@ an order, because an order never enters it.
 [`DESIGN.md`](DESIGN.md) is the architecture. [`ENGINEERING.md`](ENGINEERING.md)
 is the decisions, what was rejected and why, and the bugs worth remembering.
 
+The matching core here grew out of a smaller, standalone project that implements
+the same bitmap ladder in both Rust and C++ and verifies it differentially
+against independent reference models. That one is the auditable engine on its
+own; this one is the venue built around an engine of that shape.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Things worth knowing about the design
 
 **One transport, unencrypted, as fast as the machine allows.** Fixed 64-byte
