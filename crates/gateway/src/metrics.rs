@@ -147,6 +147,14 @@ pub struct Metrics {
     sessions_refused: u64,
     /// Sessions dropped for owing more than they are allowed to queue.
     sessions_shed: u64,
+    /// Whole records that arrived but did not decode, and were discarded.
+    ///
+    /// Counted because dropping them is the right call and saying nothing about
+    /// it is not. A client on a newer protocol version, or one with a framing
+    /// bug, otherwise sends orders into silence: nothing rests, nothing is
+    /// rejected, and neither the client nor the operator has anything to look
+    /// at. A rising count here names the problem.
+    records_undecodable: u64,
 }
 
 impl Metrics {
@@ -184,6 +192,16 @@ impl Metrics {
 
     pub const fn shed(&mut self) {
         self.sessions_shed += 1;
+    }
+
+    pub const fn undecodable(&mut self, records: u64) {
+        self.records_undecodable += records;
+    }
+
+    /// Whole records discarded because they did not decode.
+    #[must_use]
+    pub const fn records_undecodable(&self) -> u64 {
+        self.records_undecodable
     }
 
     #[must_use]

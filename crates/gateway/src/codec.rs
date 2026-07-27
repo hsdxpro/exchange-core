@@ -54,13 +54,16 @@ impl Decoder {
         debug_assert!(self.filled <= self.buffer.len());
     }
 
-    /// Decodes every whole record held, and keeps any partial tail for the next
-    /// read. Returns how many were appended to `out`.
+    /// Decodes every whole record held and keeps any partial tail for the next
+    /// read. Returns how many were appended to `out`, and adds the number
+    /// discarded to `undecodable`.
     ///
-    /// A record whose discriminants do not decode is dropped rather than
-    /// guessed at: it is either corruption or a newer protocol version, and in
-    /// both cases acting on it is worse than ignoring it.
-    pub fn drain(&mut self, out: &mut Vec<Command>) -> usize {
+    /// A record whose discriminants do not decode is dropped rather than guessed
+    /// at: it is either corruption or a newer protocol version, and acting on
+    /// either is worse than ignoring it. The discards are counted because doing
+    /// that silently leaves a client sending orders into nothing, with nothing
+    /// resting, nothing rejected, and no way for it or the operator to find out.
+    pub fn drain(&mut self, out: &mut Vec<Command>, undecodable: &mut u64) -> usize {
         let whole = self.filled / FRAME_LEN;
         let mut decoded = 0;
         for index in 0..whole {
@@ -77,6 +80,7 @@ impl Decoder {
         let consumed = whole * FRAME_LEN;
         self.buffer.copy_within(consumed..self.filled, 0);
         self.filled -= consumed;
+        *undecodable += (whole - decoded) as u64;
         decoded
     }
 
@@ -128,7 +132,7 @@ mod tests {
             let take = piece.len().min(room.len());
             room[..take].copy_from_slice(&piece[..take]);
             decoder.advance(take);
-            decoder.drain(&mut out);
+            decoder.drain(&mut out, &mut 0);
         }
         out
     }
@@ -169,12 +173,16 @@ mod tests {
         let mut out = Vec::new();
         decoder.writable()[..40].copy_from_slice(&bytes[..40]);
         decoder.advance(40);
-        assert_eq!(decoder.drain(&mut out), 0, "decoded an incomplete record");
+        assert_eq!(
+            decoder.drain(&mut out, &mut 0),
+            0,
+            "decoded an incomplete record"
+        );
         assert_eq!(decoder.partial(), 40);
 
         decoder.writable()[..24].copy_from_slice(&bytes[40..]);
         decoder.advance(24);
-        assert_eq!(decoder.drain(&mut out), 1);
+        assert_eq!(decoder.drain(&mut out, &mut 0), 1);
         assert_eq!(out[0], command(9));
     }
 
@@ -195,6 +203,56 @@ mod tests {
         );
     }
 
+    /// Dropping the record is right; dropping it without a trace is not.
+    ///
+    /// A client on a protocol version this build does not know sends orders that
+    /// never rest and are never rejected. Without this count, that failure is
+    /// invisible from both ends -- the client sees silence and the operator sees
+    /// a healthy venue.
+    #[test]
+    fn discarded_records_are_counted_rather_than_vanishing() {
+        let mut bytes = Vec::new();
+        let mut broken = command(1);
+        broken.kind = 200;
+        encode(&broken, &mut bytes);
+        encode(&command(2), &mut bytes);
+        let mut also_broken = command(3);
+        also_broken.side = 77;
+        encode(&also_broken, &mut bytes);
+
+        let mut decoder = Decoder::new(8);
+        let mut out = Vec::new();
+        let mut undecodable = 0_u64;
+
+        let room = decoder.writable();
+        room[..bytes.len()].copy_from_slice(&bytes);
+        decoder.advance(bytes.len());
+
+        assert_eq!(decoder.drain(&mut out, &mut undecodable), 1);
+        assert_eq!(undecodable, 2, "discarded records were not counted");
+        assert_eq!(out.len(), 1, "a malformed record reached the venue");
+    }
+
+    /// The counter accumulates rather than being overwritten, because one pass
+    /// reads many sessions into the same total.
+    #[test]
+    fn the_undecodable_count_accumulates_across_reads() {
+        let mut broken = command(1);
+        broken.kind = 200;
+        let mut bytes = Vec::new();
+        encode(&broken, &mut bytes);
+
+        let mut undecodable = 7;
+        let mut out = Vec::new();
+        let mut decoder = Decoder::new(4);
+        let room = decoder.writable();
+        room[..bytes.len()].copy_from_slice(&bytes);
+        decoder.advance(bytes.len());
+        decoder.drain(&mut out, &mut undecodable);
+
+        assert_eq!(undecodable, 8, "the count was replaced instead of added to");
+    }
+
     #[test]
     fn the_buffer_never_grows_however_much_is_pushed_at_it() {
         let mut decoder = Decoder::new(4);
@@ -203,12 +261,12 @@ mod tests {
             let room = decoder.writable().len();
             if room == 0 {
                 let mut out = Vec::new();
-                decoder.drain(&mut out);
+                decoder.drain(&mut out, &mut 0);
                 continue;
             }
             decoder.advance(room);
             let mut out = Vec::new();
-            decoder.drain(&mut out);
+            decoder.drain(&mut out, &mut 0);
         }
         assert!(decoder.is_full() || decoder.partial() == 0);
         assert_eq!(

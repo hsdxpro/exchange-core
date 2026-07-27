@@ -228,7 +228,7 @@ impl Session {
     /// cost is one extra read after a session's last data, which is far cheaper
     /// than scanning every connection, and the alternative is a session that
     /// goes silent forever because nothing will wake it again.
-    fn read_into(&mut self, out: &mut Vec<Command>) -> bool {
+    fn read_into(&mut self, out: &mut Vec<Command>, undecodable: &mut u64) -> bool {
         if self.decoder.writable().is_empty() {
             return true;
         }
@@ -240,7 +240,7 @@ impl Session {
             }
             Ok(bytes) => {
                 self.decoder.advance(bytes);
-                self.decoder.drain(out);
+                self.decoder.drain(out, undecodable);
                 // Not "bytes == room". A short read does not prove the socket is
                 // empty, and only `WouldBlock` re-arms the notification.
                 true
@@ -664,11 +664,16 @@ impl<S: LogStorage> Server<S> {
             let Some(session) = self.sessions.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
-            if session.read_into(&mut self.inbound) {
+            let mut undecodable = 0_u64;
+            let again = session.read_into(&mut self.inbound, &mut undecodable);
+            if again {
                 // Stays flagged: it is going straight back into the ready set.
                 self.still_readable.push(index);
             } else {
                 session.queued = false;
+            }
+            if undecodable > 0 {
+                self.metrics.undecodable(undecodable);
             }
             if !session.open {
                 self.closing.push(index);
