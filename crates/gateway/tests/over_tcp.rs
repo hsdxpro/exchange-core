@@ -947,6 +947,67 @@ fn a_client_that_disconnects_does_not_disturb_the_venue() {
     );
 }
 
+/// A connection cut in the middle of a record: the whole order before the cut
+/// is real, the half order after it never happened.
+///
+/// This is what a killed client process actually leaves on the wire -- the
+/// kernel sends FIN at whatever byte the last `write` ended on, which is
+/// rarely a frame boundary. The two failure modes this guards are opposites:
+/// dropping the complete order that preceded the cut (losing something a
+/// client was told about, if the ack raced out), and acting on the fragment
+/// (inventing an order nobody finished sending).
+#[test]
+fn a_connection_cut_mid_record_keeps_the_whole_order_and_discards_the_fragment() {
+    let venue = Running::start();
+    {
+        let mut dying = venue.connect();
+        let mut bytes = Vec::new();
+        // Two resting asks at distinct prices...
+        encode(
+            &limit_order(1, SYMBOL, 101, Side::Ask, 10_200, 5),
+            &mut bytes,
+        );
+        encode(
+            &limit_order(1, SYMBOL, 102, Side::Ask, 10_300, 5),
+            &mut bytes,
+        );
+        // ...but only one and a half of them ever reach the wire.
+        dying.write_all(&bytes[..96]).unwrap();
+        dying.flush().unwrap();
+    } // dropped: FIN lands 32 bytes into the second record
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Cross both prices. Exactly one can trade: the whole order rested, the
+    // fragment must not have become anything.
+    let mut taker = venue.connect();
+    watch_public(&mut taker, 2);
+    send(&mut taker, &[market_order(2, SYMBOL, 201, Side::Bid, 10)]);
+
+    let events = collect_until(&mut taker, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::Trade)
+    });
+    let trades: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Trade as u8)
+        .collect();
+    assert_eq!(
+        trades.len(),
+        1,
+        "expected exactly the one whole order to trade; the fragment {} ",
+        if trades.is_empty() {
+            "took the whole order with it"
+        } else {
+            "became an order nobody finished sending"
+        }
+    );
+    assert_eq!(
+        (trades[0].price, trades[0].quantity),
+        (10_200, 5),
+        "the wrong order traded"
+    );
+}
+
 #[test]
 fn unsubscribing_stops_the_feed_and_leaves_nothing_behind() {
     // The venue writes to the sessions following the channels a group touched,

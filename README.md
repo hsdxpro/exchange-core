@@ -7,7 +7,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-000000?logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/tests-312%20passing-success" alt="312 tests">
+  <img src="https://img.shields.io/badge/tests-325%20passing-success" alt="325 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -28,7 +28,7 @@
 - **4.6M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **2.0 ms** to restart from a snapshot instead of 12.8 ms replaying from zero
-- **312 tests**, including multi-process failover and seeded crash simulation
+- **325 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
 
 Every number here was measured on the machine this was built on. `cargo x latency`
 reproduces the table in about seven seconds.
@@ -41,7 +41,7 @@ Needs `rustup` and nothing else. `xtask` is the task runner; there is no CI.
 cargo x
 ```
 
-Format, `clippy -D warnings`, and all 312 tests.
+Format, `clippy -D warnings`, and all 325 tests.
 
 ```bash
 cargo x latency
@@ -49,15 +49,21 @@ cargo x latency
 
 Reproduces the performance tables below.
 
-#### Run it as a real venue
+#### Run it as a real venue and measure it
 
 ```bash
-cargo run --release -p bx-gateway --bin venue -- --config venue.conf
+cargo run --release -p bx-gateway --bin venue -- --config bench.conf
 ```
 
 ```bash
 cargo run --release -p bx-gateway --bin load -- 127.0.0.1:7070 --clients 32
 ```
+
+`bench.conf` exists because a benchmark and a deployment want opposite things.
+`venue.conf` is the deployment shape — authentication required, a rate limit a real
+account should live under, the journal on disk — and pointing `load` at it measures
+those three things instead of the venue. Each difference is stated in the file, and
+`load` says so out loud if the venue refuses or rejects instead of inventing a number.
 
 #### Run it replicated
 
@@ -197,7 +203,7 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 ## Testing
 
-312 tests. The ones worth reading:
+325 tests. The ones worth reading:
 
 | Test | What it proves |
 |---|---|
@@ -205,6 +211,8 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 | [`pipeline/tests/snapshot.rs`](crates/pipeline/tests/snapshot.rs) | A snapshot restart lands in exactly the state a full replay does — including queue position, not merely depth. |
 | [`gateway/tests/over_tcp.rs`](crates/gateway/tests/over_tcp.rs) | Real sockets: a record torn across two writes, a slow client shed and rebuilding, cancel-on-disconnect withdrawing every quote. |
 | [`gateway/tests/failover.rs`](crates/gateway/tests/failover.rs) | The binaries a deployment actually runs. The leader is killed mid-session and a node with an empty log is promoted at a higher term, then checked against everything the dead leader acknowledged. |
+| [`gateway/tests/machine_down.rs`](crates/gateway/tests/machine_down.rs) | A standalone venue killed mid-trading recovers every acknowledged order on restart, refuses duplicates of them, and serves. A follower killed mid-trading stops nothing, and is backfilled to the leader's exact log when it returns. |
+| [`gateway/tests/shipped_binaries.rs`](crates/gateway/tests/shipped_binaries.rs) | `venue` and `load` run as a pair against the shipped configuration files — the only tests that can catch the binaries and their config drifting apart. |
 | [`gateway/tests/idle_cost.rs`](crates/gateway/tests/idle_cost.rs) | Fails if a pass over 256 idle connections ever costs meaningfully more than a pass over one. |
 | [`journal/src/replication.rs`](crates/journal/src/replication.rs) | A replaced leader is refused and its write never reaches the follower's log. |
 
