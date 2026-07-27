@@ -154,6 +154,25 @@ and closed return RSS to baseline.
 </td></tr>
 </table>
 
+### Under a crowd
+
+One venue process, generators and audience on the same machine, journal in
+memory. Every subscriber follows the book channel, so every top-of-book change
+fans out to all of them.
+
+| Load | Delivered to audience | Venue RSS peak | Round trip p50 |
+|---|---:|---:|---:|
+| 1,024 senders | — | 1.03 GiB | 17.1 µs |
+| 128 senders + 256 subscribers | 105.7M events | 0.57 GiB | 4.9 ms |
+| 128 senders + 1,024 subscribers | 214.8M events (13.7 GB) | 1.02 GiB | 21.9 ms |
+| 512 senders + 512 subscribers | 518.0M events (33 GB) | 1.10 GiB | 11.0 ms |
+
+Saturating the fan-out degrades **latency**, never memory: outboxes are
+bounded, sessions cost 263 KB, the journal is 64 bytes a command, so the
+worst step peaked at 1.10 GiB and ended lower. Filling the 1M resting-order
+pool turns the surplus into clean rejections at 2.1M/sec rather than growth.
+`load --subscribers N` reproduces the table.
+
 ### Restart
 
 | | |

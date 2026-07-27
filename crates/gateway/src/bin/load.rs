@@ -17,13 +17,19 @@
 //!   group is whatever arrived since the last pass, so more clients means larger
 //!   groups and a sync amortised further. One pipelined client understates it.
 //!
+//! - **An audience** is `--subscribers N`: sessions that follow the book
+//!   channel for the whole run and count what they receive. Every top-of-book
+//!   change fans out to all of them, so this is what prices the venue's
+//!   outbound side -- and what proves a slow or huge audience degrades into
+//!   shed sessions rather than unbounded memory.
+//!
 //! ```text
-//! load [address] [--orders N] [--clients N]
+//! load [address] [--orders N] [--clients N] [--subscribers N]
 //! ```
 
 use bx_gateway::codec::{FRAME_LEN, encode};
-use bx_pipeline::limit_order;
-use bx_protocol::{Command, Event, EventKind, RejectReason, Side, Ticks};
+use bx_pipeline::{limit_order, subscribe};
+use bx_protocol::{ChannelKind, Command, Event, EventKind, RejectReason, Side, Ticks};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
@@ -362,6 +368,9 @@ fn main() -> std::io::Result<()> {
     };
     let orders = number("--orders", 200_000);
     let clients = number("--clients", 32);
+    let audience = number("--subscribers", 0);
+
+    let (watchers, feeds) = subscribers(&address, audience)?;
 
     println!("\nClient-observed latency against {address}");
     println!("{}", "-".repeat(72));
@@ -407,7 +416,71 @@ fn main() -> std::io::Result<()> {
     // silence means the run ended before the venue finished answering.
     report("pipelined", received, orders);
     report("concurrent", answered, clients * each);
+
+    if audience > 0 {
+        // Let the venue drain its outboxes before the audience hangs up.
+        std::thread::sleep(Duration::from_millis(500));
+        for feed in &feeds {
+            let _ = feed.shutdown(std::net::Shutdown::Both);
+        }
+        let mut counts: Vec<u64> = watchers
+            .into_iter()
+            .map(|w| w.join().expect("subscriber thread panicked"))
+            .collect();
+        counts.sort_unstable();
+        let total: u64 = counts.iter().sum();
+        println!(
+            "{:<40}{:>10} total   min {}   max {}",
+            format!("{audience} subscribers, book channel"),
+            total,
+            counts.first().copied().unwrap_or(0),
+            counts.last().copied().unwrap_or(0)
+        );
+        if counts.first().is_some_and(|&least| least == 0) {
+            eprintln!(
+                "WARNING: at least one subscriber received nothing. Either the                  run produced no top-of-book changes, or the venue shed it --                  the venue's own counters say which."
+            );
+        }
+    }
     Ok(())
+}
+
+/// Connects `count` sessions that subscribe to the book channel and read
+/// until the socket closes, each returning how many frames it received.
+///
+/// Counting is bytes divided by the frame length, because an audience member
+/// does not need to decode a feed to weigh it -- and decoding here would put
+/// the measuring instrument's cost into the venue's number.
+fn subscribers(
+    address: &str,
+    count: u64,
+) -> std::io::Result<(Vec<std::thread::JoinHandle<u64>>, Vec<TcpStream>)> {
+    let mut watchers = Vec::with_capacity(count as usize);
+    let mut feeds = Vec::with_capacity(count as usize);
+    for member in 0..count {
+        let stream = connect(address)?;
+        let mut reader = stream.try_clone()?;
+        let mut frame = Vec::with_capacity(FRAME_LEN);
+        encode(
+            &subscribe(1 + member % ACCOUNTS, SYMBOL, ChannelKind::Book),
+            &mut frame,
+        );
+        (&stream).write_all(&frame)?;
+        feeds.push(stream);
+        watchers.push(std::thread::spawn(move || -> u64 {
+            let mut scratch = vec![0_u8; 16 * 1024];
+            let mut received = 0_u64;
+            loop {
+                match reader.read(&mut scratch) {
+                    Ok(0) => break,
+                    Ok(bytes) => received += bytes as u64,
+                    Err(_) => break,
+                }
+            }
+            received / FRAME_LEN as u64
+        }));
+    }
+    Ok((watchers, feeds))
 }
 
 /// Says what happened to the commands that were not acknowledged.
