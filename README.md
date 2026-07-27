@@ -1,132 +1,55 @@
-# A crypto exchange core, in Rust
+<h1 align="center">exchange-core</h1>
 
-A matching engine and the venue around it: a binary protocol over TCP, order
-books on a bitmap price ladder, balance reservation, an append-only journal that
-is the single source of truth, a resumable market-data feed, snapshots, and
-replication with quorum acknowledgement.
+<p align="center">
+  A crypto exchange core in Rust — matching, journaling, market data, replication and failover.<br>
+  Single-writer, deterministic, and durable by quorum rather than by disk.
+</p>
 
-Everything below is measured on the machine it was developed on, not estimated.
-`cargo x latency` reproduces it in about seven seconds.
+<p align="center">
+  <img src="https://img.shields.io/badge/rust-stable-000000?logo=rust" alt="Rust">
+  <img src="https://img.shields.io/badge/tests-312%20passing-success" alt="312 tests">
+  <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
+  <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
+</p>
 
-## What it costs
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#performance">Performance</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#design-decisions">Design decisions</a> ·
+  <a href="DESIGN.md">Design</a> ·
+  <a href="ENGINEERING.md">Engineering log</a>
+</p>
 
-| | |
-|---|---:|
-| passive limit order, full path | **188 ns** |
-| crossing order, one fill | **224 ns** |
-| cancel by order ID | **106 ns** |
-| mixed stream | **171 ns** |
-| three market-data subscribers attached | +11 ns |
-| top-of-book feed, on every command | +8 ns |
+---
 
-"Full path" means sequence, journal, balance reservation, match, and event
-emission — not the book in isolation.
+- **188 ns** for a passive limit order across the *full* path — sequence, journal, balance reservation, match, emit
+- **4.6M commands/sec** durable, acknowledged by a quorum of replicas
+- **66.7 µs** round trip replicated, against 357 µs for a local `fsync` — **5.4× faster to reach two machines than the platter**
+- **2.0 ms** to restart from a snapshot instead of 12.8 ms replaying from zero
+- **312 tests**, including multi-process failover and seeded crash simulation
 
-A large order eating through a thin book is its own shape, and nothing measured
-it until it was looked for: a market order sweeping 2,000 distinct price levels
-cost **562 ns per level** and now costs **176 ns** — interleaved against a
-checksummed binary, three runs. The per-level bookkeeping deduplicated touched
-prices by searching the list, which is quadratic in the levels crossed.
+Every number here was measured on the machine this was built on. `cargo x latency`
+reproduces the table in about seven seconds.
 
-The crossing and cancel figures were **3,036 ns and 447 ns** until the index that
-answers "what does this account have working" stopped being searched linearly.
-It is the same index that makes self-match prevention one lookup, and taking an
-order out of it now costs a swap rather than a scan of the account's open
-orders — which is worst for exactly the client a venue exists to serve, since a
-market maker is defined by having thousands resting at once.
+## Quick start
 
-Durability is a different order of magnitude, and choosing between these two rows
-is the largest decision in the design:
-
-| commands/sec, durable | local fsync | quorum of replicas |
-|---|---:|---:|
-| group of 1 | 321 | 15,596 |
-| group of 256 | 77,989 | 1,477,527 |
-| group of 16,384 | 2,344,665 | **4,646,905** |
-
-At a group of 16,384 the quorum path costs 215 ns per command — which is roughly
-the compute cost above. Durability has become nearly free and the venue is bound
-by matching again. Reaching another machine beats reaching the platter by **49×**
-at a group of one, which is why the design acknowledges after a quorum rather
-than after a flush.
-
-Nothing in the code picks a group size. A group is whatever arrived since the
-last pass, so it grows under load — exactly when a sync needs amortising — and
-falls to one when the venue is idle and latency matters more.
-
-Separate processes over loopback, which is what a client actually experiences.
-The third row is a real cluster: one `venue` and two `replica` processes, a group
-acknowledged once a majority holds it.
-
-| durability | round trip, one order in flight | pipelined |
-|---|---:|---:|
-| none (journal in memory) | 11.4 µs | 1,796,009/sec |
-| local disk, one `fsync` per group | 357 µs | 1,560,998/sec |
-| **quorum of two followers** | **66.7 µs** | **1,785,257/sec** |
-
-All three measured in one sitting, 200,000 orders each, so the rows are
-comparable with each other rather than with some earlier machine.
-
-Reaching two other processes is **5.4× faster than reaching the platter** on a
-single order in flight, which is the whole argument for acknowledging after a
-quorum — and the gap is far wider when there is nothing to amortise the sync
-over, which is exactly when a client is waiting. Pipelined, the three converge:
-once the group is large the sync is shared by thousands of orders and the venue
-is bound by matching instead.
-
-### Does it hold at scale
-
-Same traffic spread over more accounts, every order resting:
-
-| accounts | per command | holdings | balance memory |
-|---|---:|---:|---:|
-| 16 | 177 ns | 32 | ~0 |
-| 100,000 | 390 ns | 200,000 | 9 MiB |
-| **1,000,000** | **463 ns** | 2,000,000 | **91 MiB** |
-
-About 2.16M commands a second at a million accounts. The 2.6× degradation is
-cache misses on the balance map, not anything algorithmic — lookups are still
-O(1), the working set simply stopped fitting. Memory is per *holding* rather than
-per registered user, so an account that has never traded costs nothing.
-
-Connections are the other axis, and that ceiling is gone. A pass over 256 idle
-connections costs the same as a pass over one:
-
-| idle connections | ns per pass | marginal, each |
-|---|---:|---:|
-| every socket read every pass | — | 422 |
-| found by readiness | 5,400 | 16 |
-| **written to only when touched** | **1,300** | **0** |
-
-Sessions are found by readiness on the way in, and on the way out the venue
-writes to the subscribers of the channels a group actually touched. A connection
-with nothing to say and nothing to be told is not visited at all, so it costs
-nothing and the cost stops growing with the connection count. `max_sessions` is
-still a stated ceiling and still counts refusals, but it is now about file
-descriptors and memory rather than about time in front of every order.
-
-### Restart
-
-| | |
-|---|---:|
-| replay all 100,000 commands | 12.8 ms |
-| snapshot + replay the last 5,000 | **2.0 ms** |
-
-## Running it
-
-Requires `rustup` and nothing else. There is no CI; `xtask` is the task runner.
+Needs `rustup` and nothing else. `xtask` is the task runner; there is no CI.
 
 ```bash
 cargo x
 ```
 
-That is format, `clippy -D warnings`, and the whole test suite. Also:
+Format, `clippy -D warnings`, and all 312 tests.
 
 ```bash
 cargo x latency
 ```
 
-To run the venue as a process and point a load client at it:
+Reproduces the performance tables below.
+
+#### Run it as a real venue
 
 ```bash
 cargo run --release -p bx-gateway --bin venue -- --config venue.conf
@@ -136,167 +59,184 @@ cargo run --release -p bx-gateway --bin venue -- --config venue.conf
 cargo run --release -p bx-gateway --bin load -- 127.0.0.1:7070 --clients 32
 ```
 
-To run it replicated, start followers first and list them in the config:
+#### Run it replicated
+
+Start followers first, then list them in `venue.conf`:
 
 ```bash
 cargo run --release -p bx-gateway --bin replica -- 127.0.0.1:7201
 ```
 
-## Layout
+## Performance
 
+### Command path
+
+| Operation | Cost |
+|---|---:|
+| Passive limit order, full path | **188 ns** |
+| Crossing order, one fill | **224 ns** |
+| Cancel by order ID | **106 ns** |
+| Mixed stream | **171 ns** |
+| Three market-data subscribers attached | +11 ns |
+| Top-of-book feed, on every command | +8 ns |
+
+"Full path" means sequence, journal, balance reservation, match and event emission — not
+the book in isolation.
+
+### Durability
+
+The largest decision in the design is which of these two rows to acknowledge on.
+
+| Commands/sec, durable | Local `fsync` | Quorum of replicas | Gain |
+|---|---:|---:|---:|
+| Group of 1 | 321 | 15,596 | **49×** |
+| Group of 256 | 77,989 | 1,477,527 | 19× |
+| Group of 16,384 | 2,344,665 | **4,646,905** | 2× |
+
+Reaching another machine beats reaching the platter by 49× when there is nothing to
+amortise a sync over — which is exactly when a client is waiting. At a group of 16,384 the
+quorum path costs 215 ns per command, roughly the compute cost above: durability has become
+nearly free and the venue is bound by matching again.
+
+**Nothing in the code picks a group size.** A group is whatever arrived since the last pass,
+so it grows under load — precisely when a sync needs amortising — and falls to one when the
+venue is idle and latency matters more.
+
+### End to end, separate processes over loopback
+
+| Durability | Round trip, 1 in flight | Pipelined |
+|---|---:|---:|
+| None (journal in memory) | 11.4 µs | 1,796,009/sec |
+| Local disk, one `fsync` per group | 357 µs | 1,560,998/sec |
+| **Quorum of two followers** | **66.7 µs** | 1,785,257/sec |
+
+One `venue` and two `replica` processes, 200,000 orders each, all measured in one sitting.
+Pipelined, the three converge: once the group is large the sync is shared across thousands
+of orders.
+
+### Scaling
+
+<table>
+<tr valign="top"><td>
+
+**Accounts** — same traffic, spread wider
+
+| Accounts | Per command | Memory |
+|---|---:|---:|
+| 16 | 177 ns | ~0 |
+| 100,000 | 390 ns | 9 MiB |
+| **1,000,000** | **463 ns** | **91 MiB** |
+
+2.16M commands/sec at a million accounts. The 2.6× is cache misses on the balance map, not
+algorithmic — lookups are still O(1), the working set simply stopped fitting. Memory is per
+*holding*, so an account that never traded costs nothing.
+
+</td><td>
+
+**Connections** — the ceiling is gone
+
+| Strategy | Per pass | Marginal |
+|---|---:|---:|
+| Read every socket | — | 422 ns |
+| Found by readiness | 5,400 ns | 16 ns |
+| **Written only when touched** | **1,300 ns** | **0 ns** |
+
+A pass over 256 idle connections costs the same as a pass over one. A connection with
+nothing to say and nothing to be told is never visited, so cost stops growing with the
+connection count.
+
+</td></tr>
+</table>
+
+### Restart
+
+| | |
+|---|---:|
+| Replay all 100,000 commands | 12.8 ms |
+| Snapshot + replay the last 5,000 | **2.0 ms** |
+
+## Architecture
+
+```text
+crates/engine/     Matching engine. No dependencies, forbid(unsafe_code).
+crates/protocol/   Wire records: fixed 64-byte layouts, asserted at compile time.
+crates/journal/    Append-only log, replay, replication with term fencing.
+crates/pipeline/   Sequencer, accounts, books, events, snapshots.
+crates/gateway/    Framing, sessions, admission, group commit, TCP server, config.
+crates/election/   Leader election, on a log the orders never touch.
+xtask/             Task runner.
 ```
-crates/engine/     the matching engine. No dependencies, forbid(unsafe_code).
-crates/protocol/   wire records: fixed 64-byte layouts, asserted at compile time.
-crates/journal/    append-only log, replay, replication with term fencing.
-crates/pipeline/   sequencer, accounts, books, events, snapshots.
-crates/gateway/    framing, sessions, admission, group commit, the TCP server, config.
-crates/election/   leader election, on a leadership log the orders never touch.
-xtask/             the task runner.
-```
 
-The engine has no dependencies at all: it forbids `unsafe` and stands alone.
-`protocol`, `journal` and `pipeline` use only `zerocopy` for fixed-layout casts.
-`mio` for readiness and `hmac`/`sha2`/`getrandom` for the challenge are in
-`gateway` alone, so nothing on the matching path can reach a dependency.
+**Nothing on the matching path can reach a dependency.** The engine stands alone;
+`protocol`, `journal` and `pipeline` use only `zerocopy` for fixed-layout casts; `mio`,
+`hmac`, `sha2` and `getrandom` live in `gateway` alone.
 
-The lockfile holds 156 crates and 123 of them arrived with one decision:
-`openraft` and `tokio`, in `crates/election`, which the `venue` binary uses and
-the gateway library does not. That is a real cost and it was paid on purpose —
-consensus is worth a hundred crates, and writing it is not. None of it can reach
-an order, because an order never enters it.
+The lockfile holds 156 crates and 123 arrived with one decision — `openraft` and `tokio`,
+in `crates/election`, used by the `venue` binary and not by the gateway library. A real
+cost, paid deliberately: consensus is worth a hundred crates, writing it is not. None of it
+can reach an order, because an order never enters it.
 
-[`DESIGN.md`](DESIGN.md) is the architecture. [`ENGINEERING.md`](ENGINEERING.md)
-is the decisions, what was rejected and why, and the bugs worth remembering.
+## Design decisions
 
-The matching core here grew out of
-[bitmap-matching-engine](https://github.com/hsdxpro/bitmap-matching-engine), a
-smaller standalone project that implements the same bitmap ladder in both Rust
-and C++ and verifies it differentially against independent reference models.
-That one is the auditable engine on its own; this one is the venue built around
-an engine of that shape.
+The reasoning for each is in [`DESIGN.md`](DESIGN.md); what was rejected and why, plus the
+bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
-## License
+| Decision | Why |
+|---|---|
+| **One unencrypted TCP transport** | Fixed 64-byte records, nothing between a market maker and the book. QUIC was built and removed: 38.6 µs round trip against TCP's 8.6 µs, 1.48M orders/sec against 3.76M. |
+| **One thread, no async runtime** | Matching is a sequential dependency — each order changes what the next one sees — so there is no parallelism in it to take. |
+| **The price ladder is the price band** | A book covers 65,536 ticks from its floor. A price the ladder cannot address is one the venue refuses, so the memory bound and the fat-finger control are one mechanism. |
+| **The journal is the only source of truth** | Everything else is derived. Fixed 64-byte records make replay zero-copy and let recovery seek to a sequence instead of scanning for it. |
+| **Determinism after the sequencer** | No clock reads, no randomness, no `HashMap` order reaching output. That is what makes replay a recovery mechanism rather than an approximation. |
+| **Nothing acknowledged before it is durable** | An acknowledgement that has to be retracted is worse than one that took longer. |
+| **The secret never crosses the wire** | With no TLS, anything a client *sends* can be replayed — so a token would be worth exactly as much as reading the wire. The venue issues a 16-byte nonce on accept; the client returns `HMAC-SHA256` of it and may pipeline orders behind the proof. |
+| **Cancel-on-disconnect is opt-in** | A market maker cannot manage risk it cannot see; a week-long limit order wants the opposite. A venue that picks one for everybody is wrong for half its clients. |
+| **Replication is fenced by term** | A follower refuses a group from a stale term, so a replaced leader cannot keep writing and two leaders cannot acknowledge into diverging logs. |
+| **Failover needs no person** | `openraft` runs a *separate* leadership log holding one fact. Routing orders through it would cost the fixed 64-byte record and with it zero-copy replay. What crosses the boundary is the term — which Raft already guarantees is unique per leader, and therefore *is* a fencing token. |
 
-MIT. See [LICENSE](LICENSE).
+## Testing
 
-## Things worth knowing about the design
+312 tests. The ones worth reading:
 
-**One transport, unencrypted, as fast as the machine allows.** Fixed 64-byte
-records over TCP with no TLS, so a market maker can be given a direct connection
-with nothing between it and the book. QUIC was built and then removed: measured
-against the same venue it cost 38.6 µs of round trip against TCP's 8.6 µs, and
-1.48M orders a second against 3.76M. It buys NAT traversal, mobile resilience and
-per-stream flow control, none of which is worth 4.5x the latency here.
+| Test | What it proves |
+|---|---|
+| [`pipeline/tests/simulation.rs`](crates/pipeline/tests/simulation.rs) | The venue crashed repeatedly from a seed; recovery reproduces the last committed state order for order, and nothing uncommitted survives. |
+| [`pipeline/tests/snapshot.rs`](crates/pipeline/tests/snapshot.rs) | A snapshot restart lands in exactly the state a full replay does — including queue position, not merely depth. |
+| [`gateway/tests/over_tcp.rs`](crates/gateway/tests/over_tcp.rs) | Real sockets: a record torn across two writes, a slow client shed and rebuilding, cancel-on-disconnect withdrawing every quote. |
+| [`gateway/tests/failover.rs`](crates/gateway/tests/failover.rs) | The binaries a deployment actually runs. The leader is killed mid-session and a node with an empty log is promoted at a higher term, then checked against everything the dead leader acknowledged. |
+| [`gateway/tests/idle_cost.rs`](crates/gateway/tests/idle_cost.rs) | Fails if a pass over 256 idle connections ever costs meaningfully more than a pass over one. |
+| [`journal/src/replication.rs`](crates/journal/src/replication.rs) | A replaced leader is refused and its write never reaches the follower's log. |
 
-**One thread, no async runtime.** Matching a book is a sequential dependency —
-each order changes what the next one sees — so there is no parallelism in it to
-take. Sessions are found by readiness on the way in and by the channels a group
-touched on the way out, so an idle connection is not visited at all and a pass
-costs the same whether the venue holds one connection or hundreds.
+`failover.rs` is the one property that cannot be tested in a single process. It found a
+leader whose journal held nothing but its magic bytes after ten thousand acknowledged
+orders.
 
-**The price ladder is the price band.** An instrument's book covers 65,536 ticks
-from its floor. A price the ladder cannot address is a price the venue refuses, so
-the memory bound and the fat-finger control are one mechanism rather than two.
-
-**The journal is the only source of truth.** Every other piece of state is
-derived, so recovery is: load a snapshot, replay from there. Records are a fixed
-64 bytes, which is what makes replay zero-copy and lets recovery seek straight to
-a sequence instead of scanning to it.
-
-**Everything after the sequencer is deterministic.** No clock reads, no
-randomness, no `HashMap` iteration reaching output. That is what makes replay a
-recovery mechanism rather than an approximation, and it constrains every feature.
-
-**Nothing is acknowledged before it is durable.** A group's events are released
-only after the commit succeeds. An acknowledgement that has to be retracted is
-worse than one that took longer.
-
-**The secret never crosses the wire.** Taking no TLS is what decides the shape of
-authentication: anything a client *sends* can be captured and replayed, so a
-bearer token or an API key would be worth exactly as much as reading the wire.
-The venue puts a fresh 16-byte nonce on the connection the moment it is accepted
-and the client returns `HMAC-SHA256` of it. What an eavesdropper gets is a nonce
-that will never be issued again and a tag that answers it. A client may pipeline
-its opening orders directly behind the proof, so admission costs one round trip
-rather than two.
-
-**Cancel-on-disconnect is opt-in.** A market maker cannot manage risk it can no
-longer see, so leaving its quotes in the book after its connection dies is
-dangerous; a client holding a limit order for a week wants exactly the opposite.
-A venue that picks one for everybody is wrong for half its clients. The cancels
-it causes are ordinary journalled commands, so a departing session cannot change
-state by a private route.
-
-**A client can ask what it still has working.** A book can be rebuilt from a
-snapshot; a client's own orders cannot, and a trader that has just reconnected
-must know what is in the market before it acts. The answer costs that account's
-own order count rather than a scan of the venue, because the index that lets
-self-match prevention skip in one lookup is the same index that lists the orders.
-
-**A subscriber is told the book before the changes to it.** Increments alone
-cannot build a book — a client has no idea what was resting before it arrived — so
-subscribing sends the current levels stamped with the sequence the increments
-resume from.
-
-**Replication is fenced by term.** A follower refuses a group from a term older
-than the highest it has seen, so a leader that has been replaced cannot keep
-writing and two leaders cannot acknowledge into logs that diverge.
-
-**Failover needs no person.** A node serves only while the cluster has elected
-it, and stops the moment it has not. Consensus is `openraft` rather than
-anything written here, because the failure mode is two nodes each believing they
-lead — but it runs a *separate* leadership log holding one fact, and the command
-log never goes near it. An openraft entry is variable-length and heterogeneous;
-routing orders through it would cost the fixed 64-byte record and with it the
-zero-copy replay and O(1) seek. What crosses the boundary is the term, which
-Raft already guarantees is unique per leader and therefore *is* a fencing token.
-
-## What is deliberately not here
+## Not included
 
 Scope boundaries, with reasons rather than apologies:
 
-- **Cross-partition balances.** Symbols already partition across processes —
-  a venue owns exactly the instruments its config lists, so four of them over
-  disjoint symbol sets is four cores, each keeping single-writer determinism and
-  its own failure domain. What that does not solve is an account whose money is
-  in one partition trading a symbol served by another. That is a position
-  service or a buying-power allocation, not a thread pool, and it is the real
-  remaining question. `ENGINEERING.md` has the reasoning for why threading the
-  matching stage was measured and rejected.
-- **`io_uring`.** `LogStorage` is the seam it belongs behind. It is Linux-only,
-  and untested platform-specific I/O is worse than none — the measurement also
-  said the cost was one syscall *per record*, and batching the writes recovered
-  8.6× without leaving `std`.
-- **Encryption.** Authentication proves who a session is at connect; it does not
-  protect the orders after it. On a link an attacker can *write* to, orders can
-  still be injected into an admitted session. That is the accepted cost of
-  taking no TLS, and the answer is a private link — which is the deployment this
-  transport exists for.
-- **Withdrawals and trading halts.** Venue features rather than exchange-core
-  ones.
-- **Fees.** The design puts them at settlement so they never touch matching;
-  nothing applies them yet.
+- **Cross-partition balances.** Symbols already partition across processes — four venues
+  over disjoint symbol sets is four cores, each keeping single-writer determinism and its
+  own failure domain. What that does not solve is an account whose money sits in one
+  partition trading a symbol served by another. That is a position service, not a thread
+  pool, and it is the real remaining question.
+- **`io_uring`.** Linux-only, and untested platform-specific I/O is worse than none. The
+  measurement said the cost was one syscall *per record*; batching recovered 8.6× without
+  leaving `std`. `LogStorage` is the seam it belongs behind.
+- **Encryption.** Authentication proves who a session is at connect; it does not protect
+  the orders after it. On a link an attacker can *write* to, orders can be injected into an
+  admitted session. That is the accepted cost of taking no TLS, and the answer is a private
+  link — the deployment this transport exists for.
+- **Withdrawals, halts, fees.** Venue features rather than exchange-core ones. Fees belong
+  at settlement so they never touch matching.
 
-## Correctness
+## Related
 
-312 tests. The ones worth looking at:
+The matching core grew out of [**matching-engine**](https://github.com/hsdxpro/matching-engine),
+a standalone project implementing the same bitmap ladder in both Rust and C++, verified
+differentially against independent reference models. That is the auditable engine; this is
+the venue around one.
 
-- `crates/pipeline/tests/simulation.rs` — the venue crashed repeatedly from a
-  seed, asserting after every crash that recovery reproduces the last committed
-  state order for order, and that nothing uncommitted survived.
-- `crates/pipeline/tests/snapshot.rs` — a restart from a snapshot lands in
-  exactly the state a full replay of the same journal does, including queue
-  position, not merely the same depth.
-- `crates/gateway/tests/over_tcp.rs` — real sockets, including a record torn
-  across two writes, a client shed for being slow that reconnects and rebuilds,
-  and cancel-on-disconnect withdrawing every quote.
-- `crates/journal/src/replication.rs` — a replaced leader is refused and its
-  write never reaches the follower's log.
-- `crates/gateway/tests/idle_cost.rs` — a benchmark that fails if a pass over
-  256 idle connections ever costs meaningfully more than a pass over one again.
-- `crates/gateway/tests/failover.rs` — the same binaries a deployment runs: the
-  leader is killed mid-session and a node with an empty log is promoted at a
-  higher term, then checked against everything the dead leader acknowledged.
-  This is the one property that cannot be tested in a single process, and it
-  found a leader whose journal held nothing but its magic bytes after ten
-  thousand acknowledged orders.
+## License
+
+[MIT](LICENSE)
