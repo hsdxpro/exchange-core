@@ -24,9 +24,9 @@
 
 ---
 
-- **188 ns** for a passive limit order across the *full* path — sequence, journal, balance reservation, match, emit
+- **188 ns** for a passive limit order across the full path: sequence, journal, balance reservation, match, emit
 - **4.6M commands/sec** durable, acknowledged by a quorum of replicas
-- **66.7 µs** round trip replicated, against 357 µs for a local `fsync` — **5.4× faster to reach two machines than the platter**
+- **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **2.0 ms** to restart from a snapshot instead of 12.8 ms replaying from zero
 - **312 tests**, including multi-process failover and seeded crash simulation
 
@@ -80,7 +80,7 @@ cargo run --release -p bx-gateway --bin replica -- 127.0.0.1:7201
 | Three market-data subscribers attached | +11 ns |
 | Top-of-book feed, on every command | +8 ns |
 
-"Full path" means sequence, journal, balance reservation, match and event emission — not
+"Full path" means sequence, journal, balance reservation, match and event emission, not
 the book in isolation.
 
 ### Durability
@@ -93,14 +93,14 @@ The largest decision in the design is which of these two rows to acknowledge on.
 | Group of 256 | 77,989 | 1,477,527 | 19× |
 | Group of 16,384 | 2,344,665 | **4,646,905** | 2× |
 
-Reaching another machine beats reaching the platter by 49× when there is nothing to
-amortise a sync over — which is exactly when a client is waiting. At a group of 16,384 the
-quorum path costs 215 ns per command, roughly the compute cost above: durability has become
-nearly free and the venue is bound by matching again.
+The gap is widest when there is nothing to amortise a sync over, which is the case when a
+client is waiting on a single order. At a group of 16,384 the quorum path costs 215 ns per
+command, roughly the compute cost above. Durability has become nearly free and the venue is
+bound by matching again.
 
-**Nothing in the code picks a group size.** A group is whatever arrived since the last pass,
-so it grows under load — precisely when a sync needs amortising — and falls to one when the
-venue is idle and latency matters more.
+**Nothing in the code picks a group size.** A group is whatever arrived since the last pass.
+It grows under load, when a sync most needs amortising, and falls to one when the venue is
+idle and latency matters more.
 
 ### End to end, separate processes over loopback
 
@@ -127,9 +127,9 @@ of orders.
 | 100,000 | 390 ns | 9 MiB |
 | **1,000,000** | **463 ns** | **91 MiB** |
 
-2.16M commands/sec at a million accounts. The 2.6× is cache misses on the balance map, not
-algorithmic — lookups are still O(1), the working set simply stopped fitting. Memory is per
-*holding*, so an account that never traded costs nothing.
+2.16M commands/sec at a million accounts. The 2.6× degradation is cache misses on the
+balance map. Lookups are still O(1); the working set simply stopped fitting. Memory is
+charged per *holding*, so an account that has never traded costs nothing.
 
 </td><td>
 
@@ -142,8 +142,8 @@ algorithmic — lookups are still O(1), the working set simply stopped fitting. 
 | **Written only when touched** | **1,300 ns** | **0 ns** |
 
 A pass over 256 idle connections costs the same as a pass over one. A connection with
-nothing to say and nothing to be told is never visited, so cost stops growing with the
-connection count.
+nothing to say and nothing to be told is never visited at all, so the cost stops growing
+with the connection count.
 
 </td></tr>
 </table>
@@ -167,14 +167,15 @@ crates/election/   Leader election, on a log the orders never touch.
 xtask/             Task runner.
 ```
 
-**Nothing on the matching path can reach a dependency.** The engine stands alone;
-`protocol`, `journal` and `pipeline` use only `zerocopy` for fixed-layout casts; `mio`,
-`hmac`, `sha2` and `getrandom` live in `gateway` alone.
+No crate on the matching path has a dependency it could reach. The engine stands alone.
+`protocol`, `journal` and `pipeline` use only `zerocopy` for fixed-layout casts, and `mio`,
+`hmac`, `sha2` and `getrandom` are confined to `gateway`.
 
-The lockfile holds 156 crates and 123 arrived with one decision — `openraft` and `tokio`,
-in `crates/election`, used by the `venue` binary and not by the gateway library. A real
-cost, paid deliberately: consensus is worth a hundred crates, writing it is not. None of it
-can reach an order, because an order never enters it.
+The lockfile holds 156 crates, 123 of which arrived with a single decision: `openraft` and
+`tokio` in `crates/election`, used by the `venue` binary and not by the gateway library.
+That is a large dependency for one feature, and it was accepted because writing consensus
+correctly is harder than depending on it. None of those crates can reach an order, since an
+order never enters that path.
 
 ## Design decisions
 
@@ -184,13 +185,13 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 | Decision | Why |
 |---|---|
 | **One unencrypted TCP transport** | Nothing between a market maker and the book. QUIC was built and removed — 38.6 µs round trip against TCP's 8.6 µs. |
-| **One thread, no async runtime** | Matching is a sequential dependency; there is no parallelism in it to take. |
-| **The price ladder is the price band** | The memory bound and the fat-finger control become one mechanism instead of two. |
-| **The journal is the only source of truth** | Everything else is derived, so recovery is: load a snapshot, replay from there. |
-| **Determinism after the sequencer** | Makes replay a recovery mechanism rather than an approximation. |
-| **Nothing acknowledged before it is durable** | An acknowledgement that has to be retracted is worse than one that took longer. |
+| **One thread, no async runtime** | Matching is a sequential dependency: each order changes what the next one sees. |
+| **The price ladder is the price band** | A book covers 65,536 ticks from its floor, so the memory bound and the fat-finger control are one mechanism. |
+| **The journal is the only source of truth** | Everything else is derived state, so recovery is a snapshot load followed by a replay. |
+| **Determinism after the sequencer** | No clock reads, no randomness, no `HashMap` order reaching output, so a replay reproduces the original exactly. |
+| **Nothing acknowledged before it is durable** | A group's events are released only after its commit succeeds. |
 | **The secret never crosses the wire** | With no TLS, anything a client *sends* is replayable — so the venue issues a nonce and the client returns `HMAC-SHA256` of it. |
-| **Cancel-on-disconnect is opt-in** | A venue that picks one policy for everybody is wrong for half its clients. |
+| **Cancel-on-disconnect is opt-in** | A market maker needs its quotes pulled on disconnect; a week-long limit order does not. |
 | **Replication is fenced by term** | A replaced leader cannot keep writing, and two leaders cannot acknowledge into diverging logs. |
 | **Failover needs no person** | `openraft` runs a *separate* leadership log. What crosses into the venue is the term — which Raft already guarantees is unique per leader, and therefore *is* a fencing token. |
 
@@ -207,29 +208,30 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 | [`gateway/tests/idle_cost.rs`](crates/gateway/tests/idle_cost.rs) | Fails if a pass over 256 idle connections ever costs meaningfully more than a pass over one. |
 | [`journal/src/replication.rs`](crates/journal/src/replication.rs) | A replaced leader is refused and its write never reaches the follower's log. |
 
-`failover.rs` is the one property that cannot be tested in a single process. It found a
-leader whose journal held nothing but its magic bytes after ten thousand acknowledged
-orders.
+`failover.rs` covers the one property that cannot be tested inside a single process. It
+found a leader whose journal held nothing but its magic bytes after ten thousand
+acknowledged orders.
 
 ## Not included
 
 Scope boundaries, with reasons rather than apologies:
 
-- **Cross-partition balances** — symbols already partition across processes, but an account
-  whose money sits in one partition trading a symbol served by another needs a position
-  service, not a thread pool. The real remaining question.
-- **`io_uring`** — Linux-only, and untested platform-specific I/O is worse than none.
+- **Cross-partition balances.** Symbols already partition across processes, but an account
+  whose money sits in one partition and trades a symbol served by another needs a position
+  service rather than a thread pool. This is the largest open question here.
+- **`io_uring`.** Linux-only, and untested platform-specific I/O is worse than none.
   Batching the writes recovered 8.6× without leaving `std`.
-- **Encryption** — authentication proves who a session is at connect; it does not protect
-  the orders after it. The accepted cost of taking no TLS, answered by a private link.
-- **Withdrawals, halts, fees** — venue features rather than exchange-core ones.
+- **Encryption.** Authentication proves who a session is at connect; it does not protect the
+  orders sent afterwards. This is the accepted cost of taking no TLS, and the answer is a
+  private link.
+- **Withdrawals, halts and fees.** Venue features rather than exchange-core ones.
 
 ## Related
 
 The matching core grew out of [**matching-engine**](https://github.com/hsdxpro/matching-engine),
-a standalone project implementing the same bitmap ladder in both Rust and C++, verified
-differentially against independent reference models. That is the auditable engine; this is
-the venue around one.
+a standalone project implementing the same bitmap ladder in both Rust and C++ and verifying
+both against independent reference models. That project is the auditable engine on its own;
+this one is the venue built around it.
 
 ## License
 
