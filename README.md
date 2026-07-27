@@ -145,6 +145,12 @@ per *holding*, so an account that never traded costs nothing.
 A pass over 256 idle connections costs the same as over one. A connection with nothing to
 say and nothing to be told is never visited, so cost stops growing with connection count.
 
+Memory is **263 KB per session**, measured across 4,000 idle sessions: a 256 KiB read
+buffer preallocated at admission so the trading path never allocates, plus bookkeeping.
+Past `max_sessions` a connect is accepted and immediately dropped, so the client learns
+now rather than timing out against a venue that will never read it. 8,000 sessions opened
+and closed return RSS to baseline.
+
 </td></tr>
 </table>
 
