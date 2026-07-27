@@ -30,8 +30,8 @@
 - **2.0 ms** to restart from a snapshot instead of 12.8 ms replaying from zero
 - **325 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
 
-Every number here was measured on the machine this was built on. `cargo x latency`
-reproduces the table in about seven seconds.
+Every number measured on the machine this was built on. `cargo x latency` reproduces the
+table in about seven seconds.
 
 ## Quick start
 
@@ -59,11 +59,10 @@ cargo run --release -p bx-gateway --bin venue -- --config bench.conf
 cargo run --release -p bx-gateway --bin load -- 127.0.0.1:7070 --clients 32
 ```
 
-`bench.conf` exists because a benchmark and a deployment want opposite things.
-`venue.conf` is the deployment shape — authentication required, a rate limit a real
-account should live under, the journal on disk — and pointing `load` at it measures
-those three things instead of the venue. Each difference is stated in the file, and
-`load` says so out loud if the venue refuses or rejects instead of inventing a number.
+Two configs, because a benchmark and a deployment want opposite things. `venue.conf` is
+the deployment shape — auth required, a real rate limit, journal on disk — so pointing
+`load` at it measures those three, not the venue. Differences are stated in the file, and
+`load` says so out loud rather than inventing a number if the venue refuses.
 
 #### Run it replicated
 
@@ -86,8 +85,8 @@ cargo run --release -p bx-gateway --bin replica -- 127.0.0.1:7201
 | Three market-data subscribers attached | +11 ns |
 | Top-of-book feed, on every command | +8 ns |
 
-"Full path" means sequence, journal, balance reservation, match and event emission, not
-the book in isolation.
+"Full path" = sequence, journal, balance reservation, match, event emission. Not the book
+in isolation.
 
 ### Durability
 
@@ -99,14 +98,11 @@ The largest decision in the design is which of these two rows to acknowledge on.
 | Group of 256 | 77,989 | 1,477,527 | 19× |
 | Group of 16,384 | 2,344,665 | **4,646,905** | 2× |
 
-The gap is widest when there is nothing to amortise a sync over, which is the case when a
-client is waiting on a single order. At a group of 16,384 the quorum path costs 215 ns per
-command, roughly the compute cost above. Durability has become nearly free and the venue is
-bound by matching again.
-
-**Nothing in the code picks a group size.** A group is whatever arrived since the last pass.
-It grows under load, when a sync most needs amortising, and falls to one when the venue is
-idle and latency matters more.
+- The gap is widest with nothing to amortise a sync over — a client waiting on one order.
+- At 16,384 the quorum path costs 215 ns/command, roughly the compute cost above.
+  Durability is nearly free and the venue is matching-bound again.
+- **Nothing picks a group size.** A group is whatever arrived since the last pass: it
+  grows under load, and falls to one when idle and latency matters more.
 
 ### End to end, separate processes over loopback
 
@@ -116,9 +112,8 @@ idle and latency matters more.
 | Local disk, one `fsync` per group | 357 µs | 1,560,998/sec |
 | **Quorum of two followers** | **66.7 µs** | 1,785,257/sec |
 
-One `venue` and two `replica` processes, 200,000 orders each, all measured in one sitting.
-Pipelined, the three converge: once the group is large the sync is shared across thousands
-of orders.
+One `venue`, two `replica` processes, 200,000 orders each, one sitting. Pipelined the
+three converge — once the group is large the sync is shared across thousands of orders.
 
 ### Scaling
 
@@ -134,8 +129,8 @@ of orders.
 | **1,000,000** | **463 ns** | **91 MiB** |
 
 2.16M commands/sec at a million accounts. The 2.6× degradation is cache misses on the
-balance map. Lookups are still O(1); the working set simply stopped fitting. Memory is
-charged per *holding*, so an account that has never traded costs nothing.
+balance map — lookups are still O(1), the working set stopped fitting. Memory is charged
+per *holding*, so an account that never traded costs nothing.
 
 </td><td>
 
@@ -147,9 +142,8 @@ charged per *holding*, so an account that has never traded costs nothing.
 | Found by readiness | 5,400 ns | 16 ns |
 | **Written only when touched** | **1,300 ns** | **0 ns** |
 
-A pass over 256 idle connections costs the same as a pass over one. A connection with
-nothing to say and nothing to be told is never visited at all, so the cost stops growing
-with the connection count.
+A pass over 256 idle connections costs the same as over one. A connection with nothing to
+say and nothing to be told is never visited, so cost stops growing with connection count.
 
 </td></tr>
 </table>
@@ -173,17 +167,16 @@ crates/election/   Leader election, on a log the orders never touch.
 xtask/             Task runner.
 ```
 
-No crate on the matching path has a dependency it could reach. The engine stands alone.
-`protocol`, `journal` and `pipeline` use `zerocopy` for fixed-layout casts; `journal` also
-uses `socket2`, at connection setup only, to bound the kernel buffers on replication
-sockets — the one buffer the venue does not otherwise own. `mio`, `hmac`, `sha2` and
-`getrandom` are confined to `gateway`.
+No crate on the matching path has a dependency it could reach; the engine stands alone.
 
-The lockfile holds 156 crates, 123 of which arrived with a single decision: `openraft` and
-`tokio` in `crates/election`, used by the `venue` binary and not by the gateway library.
-That is a large dependency for one feature, and it was accepted because writing consensus
-correctly is harder than depending on it. None of those crates can reach an order, since an
-order never enters that path.
+- `protocol`, `journal`, `pipeline`: `zerocopy` for fixed-layout casts.
+- `journal`: `socket2` at connection setup only, to bound kernel buffers on replication
+  sockets — the one buffer the venue does not otherwise own.
+- `gateway`: `mio`, `hmac`, `sha2`, `getrandom`, confined there.
+- 156 crates in the lockfile, 123 from one decision — `openraft` + `tokio` in
+  `crates/election`, used by the `venue` binary, not the gateway library. Large for one
+  feature, accepted because writing consensus correctly is harder than depending on it.
+  An order never enters that path.
 
 ## Design decisions
 
@@ -218,30 +211,32 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 | [`gateway/tests/idle_cost.rs`](crates/gateway/tests/idle_cost.rs) | Fails if a pass over 256 idle connections ever costs meaningfully more than a pass over one. |
 | [`journal/src/replication.rs`](crates/journal/src/replication.rs) | A replaced leader is refused and its write never reaches the follower's log. |
 
-`failover.rs` covers the one property that cannot be tested inside a single process. It
-found a leader whose journal held nothing but its magic bytes after ten thousand
-acknowledged orders.
+`failover.rs` covers the one property untestable inside a single process. It found a
+leader whose journal held nothing but its magic bytes after ten thousand acknowledged
+orders.
 
 ## Not included
 
 Scope boundaries, with reasons rather than apologies:
 
 - **Cross-partition balances.** Symbols already partition across processes, but an account
-  whose money sits in one partition and trades a symbol served by another needs a position
-  service rather than a thread pool. This is the largest open question here.
+  banking in one partition and trading a symbol in another needs a position service, not a
+  thread pool. The largest open question here.
 - **`io_uring`.** Linux-only, and untested platform-specific I/O is worse than none.
-  Batching the writes recovered 8.6× without leaving `std`.
-- **Encryption.** Authentication proves who a session is at connect; it does not protect the
-  orders sent afterwards. This is the accepted cost of taking no TLS, and the answer is a
-  private link.
-- **Withdrawals, halts and fees.** Venue features rather than exchange-core ones.
+  Batching writes recovered 8.6× without leaving `std`.
+- **Encryption.** Auth proves who a session is at connect; it does not protect the orders
+  after. The accepted cost of no TLS; the answer is a private link.
+- **Withdrawals, halts and fees.** Venue features, not exchange-core ones.
 
 ## Related
 
-The matching core grew out of [**matching-engine**](https://github.com/hsdxpro/matching-engine),
-a standalone project implementing the same bitmap ladder in both Rust and C++ and verifying
-both against independent reference models. That project is the auditable engine on its own;
-this one is the venue built around it.
+The matching core grew out of
+[**matching-engine**](https://github.com/hsdxpro/matching-engine) — the same bitmap ladder
+in Rust and C++, both verified against independent reference models. That project is the
+auditable engine on its own; this is the venue around it.
+
+[**tick-to-trade**](https://github.com/hsdxpro/tick-to-trade) is the other side of the
+wire: feed parsing, book maintenance and order entry, measured end to end.
 
 ## License
 
