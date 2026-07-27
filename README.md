@@ -183,16 +183,16 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 | Decision | Why |
 |---|---|
-| **One unencrypted TCP transport** | Fixed 64-byte records, nothing between a market maker and the book. QUIC was built and removed: 38.6 µs round trip against TCP's 8.6 µs, 1.48M orders/sec against 3.76M. |
-| **One thread, no async runtime** | Matching is a sequential dependency — each order changes what the next one sees — so there is no parallelism in it to take. |
-| **The price ladder is the price band** | A book covers 65,536 ticks from its floor. A price the ladder cannot address is one the venue refuses, so the memory bound and the fat-finger control are one mechanism. |
-| **The journal is the only source of truth** | Everything else is derived. Fixed 64-byte records make replay zero-copy and let recovery seek to a sequence instead of scanning for it. |
-| **Determinism after the sequencer** | No clock reads, no randomness, no `HashMap` order reaching output. That is what makes replay a recovery mechanism rather than an approximation. |
+| **One unencrypted TCP transport** | Nothing between a market maker and the book. QUIC was built and removed — 38.6 µs round trip against TCP's 8.6 µs. |
+| **One thread, no async runtime** | Matching is a sequential dependency; there is no parallelism in it to take. |
+| **The price ladder is the price band** | The memory bound and the fat-finger control become one mechanism instead of two. |
+| **The journal is the only source of truth** | Everything else is derived, so recovery is: load a snapshot, replay from there. |
+| **Determinism after the sequencer** | Makes replay a recovery mechanism rather than an approximation. |
 | **Nothing acknowledged before it is durable** | An acknowledgement that has to be retracted is worse than one that took longer. |
-| **The secret never crosses the wire** | With no TLS, anything a client *sends* can be replayed — so a token would be worth exactly as much as reading the wire. The venue issues a 16-byte nonce on accept; the client returns `HMAC-SHA256` of it and may pipeline orders behind the proof. |
-| **Cancel-on-disconnect is opt-in** | A market maker cannot manage risk it cannot see; a week-long limit order wants the opposite. A venue that picks one for everybody is wrong for half its clients. |
-| **Replication is fenced by term** | A follower refuses a group from a stale term, so a replaced leader cannot keep writing and two leaders cannot acknowledge into diverging logs. |
-| **Failover needs no person** | `openraft` runs a *separate* leadership log holding one fact. Routing orders through it would cost the fixed 64-byte record and with it zero-copy replay. What crosses the boundary is the term — which Raft already guarantees is unique per leader, and therefore *is* a fencing token. |
+| **The secret never crosses the wire** | With no TLS, anything a client *sends* is replayable — so the venue issues a nonce and the client returns `HMAC-SHA256` of it. |
+| **Cancel-on-disconnect is opt-in** | A venue that picks one policy for everybody is wrong for half its clients. |
+| **Replication is fenced by term** | A replaced leader cannot keep writing, and two leaders cannot acknowledge into diverging logs. |
+| **Failover needs no person** | `openraft` runs a *separate* leadership log. What crosses into the venue is the term — which Raft already guarantees is unique per leader, and therefore *is* a fencing token. |
 
 ## Testing
 
@@ -215,20 +215,14 @@ orders.
 
 Scope boundaries, with reasons rather than apologies:
 
-- **Cross-partition balances.** Symbols already partition across processes — four venues
-  over disjoint symbol sets is four cores, each keeping single-writer determinism and its
-  own failure domain. What that does not solve is an account whose money sits in one
-  partition trading a symbol served by another. That is a position service, not a thread
-  pool, and it is the real remaining question.
-- **`io_uring`.** Linux-only, and untested platform-specific I/O is worse than none. The
-  measurement said the cost was one syscall *per record*; batching recovered 8.6× without
-  leaving `std`. `LogStorage` is the seam it belongs behind.
-- **Encryption.** Authentication proves who a session is at connect; it does not protect
-  the orders after it. On a link an attacker can *write* to, orders can be injected into an
-  admitted session. That is the accepted cost of taking no TLS, and the answer is a private
-  link — the deployment this transport exists for.
-- **Withdrawals, halts, fees.** Venue features rather than exchange-core ones. Fees belong
-  at settlement so they never touch matching.
+- **Cross-partition balances** — symbols already partition across processes, but an account
+  whose money sits in one partition trading a symbol served by another needs a position
+  service, not a thread pool. The real remaining question.
+- **`io_uring`** — Linux-only, and untested platform-specific I/O is worse than none.
+  Batching the writes recovered 8.6× without leaving `std`.
+- **Encryption** — authentication proves who a session is at connect; it does not protect
+  the orders after it. The accepted cost of taking no TLS, answered by a private link.
+- **Withdrawals, halts, fees** — venue features rather than exchange-core ones.
 
 ## Related
 
