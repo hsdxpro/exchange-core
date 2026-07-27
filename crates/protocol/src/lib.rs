@@ -929,28 +929,61 @@ mod tests {
 
     #[test]
     fn every_reject_reason_has_a_distinct_message() {
-        let reasons = [
-            RejectReason::None,
-            RejectReason::UnknownAccount,
-            RejectReason::UnknownSymbol,
-            RejectReason::QuantityZero,
-            RejectReason::QuantityTooLarge,
-            RejectReason::DuplicateOrderId,
-            RejectReason::UnknownOrderId,
-            RejectReason::OutsidePriceBand,
-            RejectReason::InsufficientBalance,
-            RejectReason::OrderLimitReached,
-            RejectReason::WouldCross,
-            RejectReason::InsufficientLiquidity,
-            RejectReason::AmendWouldIncrease,
-            RejectReason::SelfMatchPrevented,
-            RejectReason::UnsupportedTimeInForce,
-            RejectReason::EngineCapacity,
-        ];
-        let mut messages: Vec<String> = reasons.iter().map(ToString::to_string).collect();
+        let mut messages: Vec<String> = ALL_REASONS.iter().map(ToString::to_string).collect();
         let total = messages.len();
         messages.sort_unstable();
         messages.dedup();
         assert_eq!(messages.len(), total, "two reject reasons share a message");
+    }
+
+    /// Every reason this version defines. The old inline list had quietly
+    /// fallen two variants behind the enum, so the distinct-message test was
+    /// not checking the reasons most likely to be new.
+    const ALL_REASONS: [RejectReason; 18] = [
+        RejectReason::None,
+        RejectReason::UnknownAccount,
+        RejectReason::UnknownSymbol,
+        RejectReason::QuantityZero,
+        RejectReason::QuantityTooLarge,
+        RejectReason::DuplicateOrderId,
+        RejectReason::UnknownOrderId,
+        RejectReason::OutsidePriceBand,
+        RejectReason::InsufficientBalance,
+        RejectReason::OrderLimitReached,
+        RejectReason::WouldCross,
+        RejectReason::InsufficientLiquidity,
+        RejectReason::AmendWouldIncrease,
+        RejectReason::SelfMatchPrevented,
+        RejectReason::UnsupportedTimeInForce,
+        RejectReason::EngineCapacity,
+        RejectReason::NotAuthenticated,
+        RejectReason::RateLimited,
+    ];
+
+    /// `Event::reject_reason` is a hand-written match, so a variant added to
+    /// the enum and forgotten there decodes to `None` -- and a client that
+    /// reports why it was refused goes silent for exactly the newest reason.
+    #[test]
+    fn every_reject_reason_survives_the_wire_and_back() {
+        for reason in ALL_REASONS {
+            let event = Event {
+                reject_reason: reason as u8,
+                ..Event::default()
+            };
+            assert_eq!(
+                event.reject_reason(),
+                Some(reason),
+                "discriminant {} does not decode back to {reason:?}; \
+                 Event::reject_reason has fallen behind the enum",
+                reason as u8
+            );
+        }
+        // One past the last known discriminant is not a reason. When adding a
+        // variant, extend ALL_REASONS and move this boundary up.
+        let unknown = Event {
+            reject_reason: ALL_REASONS.len() as u8,
+            ..Event::default()
+        };
+        assert_eq!(unknown.reject_reason(), None);
     }
 }
