@@ -156,21 +156,40 @@ and closed return RSS to baseline.
 
 ### Under a crowd
 
-One venue process, generators and audience on the same machine, journal in
-memory. Every subscriber follows the book channel, so every top-of-book change
-fans out to all of them.
+The same order load twice -- alone, then with 1,024 market-data subscribers
+watching. Every subscriber follows the book channel, so every top-of-book
+change fans out to all of them. One venue process; generators and audience
+share the machine.
 
-| Load | Delivered to audience | Venue RSS peak | Round trip p50 |
-|---|---:|---:|---:|
-| 1,024 senders | — | 1.03 GiB | 17.1 µs |
-| 128 senders + 256 subscribers | 105.7M events | 0.57 GiB | 4.9 ms |
-| 128 senders + 1,024 subscribers | 214.8M events (13.7 GB) | 1.02 GiB | 21.9 ms |
-| 512 senders + 512 subscribers | 518.0M events (33 GB) | 1.10 GiB | 11.0 ms |
+| 128 senders, 200,000 orders | alone | + 1,024 subscribers |
+|---|---:|---:|
+| Round trip, min / p50 | 9.3 µs / 17.5 µs | 369.7 µs / **14.3 ms** |
+| Pipelined throughput | 2.40M orders/sec | 35,910/sec |
+| Concurrent throughput | 1.33M orders/sec | 968,701/sec |
+| Orders acknowledged | **200,000 of 200,000** | **200,000 of 200,000** |
+| Delivered to the audience | — | 214.8M events (13.7 GB) |
+| Venue RSS peak | 237 MiB | 852 MiB |
 
-Saturating the fan-out degrades **latency**, never memory: outboxes are
-bounded, sessions cost 263 KB, the journal is 64 bytes a command, so the
-worst step peaked at 1.10 GiB and ended lower. Filling the 1M resting-order
-pool turns the surplus into clean rejections at 2.1M/sec rather than growth.
+Heavier crowds hold the same shape: 512 senders with 512 subscribers moved
+518M events (33 GB) at a 1.10 GiB peak; 1,024 senders alone peaked at
+1.03 GiB with a 17.1 µs p50.
+
+What the pair says:
+
+- **The audience taxes latency, never correctness or memory.** Every order is
+  still acknowledged, RSS stays bounded -- outboxes are capped, a session is
+  263 KB, the journal is 64 bytes a command -- and overfilling the 1M
+  resting-order pool produces clean rejections at 2.1M/sec instead of growth.
+- **The 14 ms is a seam, not slow code.** One gateway thread serves the order
+  path and the audience, so a top-of-book change becomes 1,024 unicast writes
+  and the next acknowledgement queues behind them. The venue-shaped fix is a
+  market-data publisher of its own -- a separate thread or process, or a
+  multicast feed that costs one packet regardless of audience size. That is
+  the next seam worth opening, and this table is its baseline.
+- **The fan-out is deterministic.** Two runs a day apart delivered the
+  identical 214,790,272 events to the audience: the workload is seeded and
+  nothing after the sequencer reads a clock.
+
 `load --subscribers N` reproduces the table.
 
 ### Restart
