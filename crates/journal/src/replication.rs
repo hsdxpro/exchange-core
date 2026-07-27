@@ -110,6 +110,87 @@ fn request(kind: u8, term: u64, length: u32) -> [u8; HEADER_LEN] {
     header
 }
 
+/// Kernel buffer for a replication socket, each direction.
+///
+/// Large enough to hold the biggest group the venue has ever produced under
+/// load with room to spare, so a healthy follower never stalls on it. Small
+/// enough that a follower which stops reading costs the leader a bounded and
+/// known amount of kernel memory rather than whatever the operating system
+/// feels like.
+///
+/// Set explicitly for a second reason that is easy to miss: **it is what makes
+/// the write deadline real.** Windows grows a TCP send buffer dynamically when
+/// the application never sets one -- measured on this project: 128 MB accepted
+/// in 9.5 ms by a socket whose peer never read a byte. Under that behaviour a
+/// stalled follower absorbs entire groups into kernel memory, `write_all`
+/// never blocks, and the write timeout guards a path that cannot be reached;
+/// the leak is only caught later, by the acknowledgement read timing out.
+/// Setting SO_SNDBUF disables the dynamic growth, so a stalled peer stops the
+/// write within one buffer's worth and the deadline actually fires.
+const SOCKET_BUFFER: usize = 4 << 20;
+
+/// Applies the bounded buffers to one replication socket.
+fn bound_buffers(stream: &TcpStream) -> io::Result<()> {
+    let socket = socket2::SockRef::from(stream);
+    socket.set_send_buffer_size(SOCKET_BUFFER)?;
+    socket.set_recv_buffer_size(SOCKET_BUFFER)?;
+    Ok(())
+}
+
+/// The most bytes handed to one `write` call on a replication socket.
+///
+/// Bounding the buffers is not enough on its own, and the reason was found
+/// empirically: hand Windows a single 32 MiB send and AFD pends the entire
+/// user buffer and completes it, sailing straight past both SO_SNDBUF and the
+/// peer's closed window -- the same experiment issued as 256 KiB writes
+/// stopped cold at three buffers' worth. A giant send also makes the write
+/// deadline all-or-nothing, where what a deadline should bound is the stall.
+///
+/// Writing in bounded slices closes both holes: each slice participates in
+/// flow control, and the timeout applies per slice, so a stalled follower
+/// costs one deadline rather than one deadline per 32 MiB. For a healthy
+/// follower the cost is a few more syscalls per large group, which is noise
+/// against the network round trip the group already pays.
+const WRITE_SLICE: usize = 256 << 10;
+
+/// Writes `bytes` in bounded slices, honouring the socket's write deadline on
+/// each one.
+fn write_bounded(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
+    for slice in bytes.chunks(WRITE_SLICE) {
+        stream.write_all(slice)?;
+    }
+    Ok(())
+}
+
+/// A listener whose accepted sockets inherit the bounded receive buffer.
+///
+/// The bound has to be on the listener, not retrofitted after `accept`: the
+/// window is negotiated at the handshake, and a socket accepted with the
+/// platform default has already told the peer it will take whatever the
+/// platform felt like offering. Measured on Windows loopback: a receive buffer
+/// shrunk *after* accept changed nothing and 32 MiB was absorbed anyway, while
+/// the same bound inherited from the listener stopped the sender inside 64 KiB.
+/// This is what every follower should listen on.
+///
+/// # Errors
+/// Fails if the address cannot be bound.
+pub fn bound_listener(address: &str) -> io::Result<TcpListener> {
+    use std::net::ToSocketAddrs;
+    let resolved = address
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::other(format!("`{address}` resolves to nothing")))?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(resolved),
+        socket2::Type::STREAM,
+        None,
+    )?;
+    socket.set_recv_buffer_size(SOCKET_BUFFER)?;
+    socket.bind(&resolved.into())?;
+    socket.listen(64)?;
+    Ok(socket.into())
+}
+
 /// One follower, as the leader sees it.
 #[derive(Debug)]
 struct Follower {
@@ -196,6 +277,7 @@ impl<L: LogStorage> ReplicatedLog<L> {
             // trading. A read timeout alone does not help: the write never
             // returns to reach the read.
             stream.set_write_timeout(Some(ack_timeout))?;
+            bound_buffers(&stream)?;
             followers.push(Follower {
                 address: address.clone(),
                 stream,
@@ -241,6 +323,25 @@ impl<L: LogStorage> ReplicatedLog<L> {
     #[must_use]
     pub fn live_followers(&self) -> usize {
         self.followers.iter().filter(|f| f.live).count()
+    }
+
+    /// Kernel buffer sizes of the first follower's socket: send, then receive.
+    ///
+    /// Introspection for the partition tests. The blocked-write test would
+    /// pass on a platform whose defaults happen to be small even if the
+    /// explicit bounds were silently dropped -- and on the platform where the
+    /// bounds matter, that silence is an unbounded kernel buffer per stalled
+    /// follower. Reading the values back is what catches it.
+    ///
+    /// # Errors
+    /// Fails if there are no followers or the socket query fails.
+    pub fn follower_buffer_sizes(&self) -> io::Result<(usize, usize)> {
+        let follower = self
+            .followers
+            .first()
+            .ok_or_else(|| io::Error::other("no followers configured"))?;
+        let socket = socket2::SockRef::from(&follower.stream);
+        Ok((socket.send_buffer_size()?, socket.recv_buffer_size()?))
     }
 
     #[must_use]
@@ -354,6 +455,7 @@ impl<L: LogStorage> ReplicatedLog<L> {
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(self.ack_timeout))?;
         stream.set_write_timeout(Some(self.ack_timeout))?;
+        bound_buffers(&stream)?;
         self.followers[index].stream = stream;
         Ok(())
     }
@@ -430,7 +532,7 @@ impl<L: LogStorage> ReplicatedLog<L> {
             follower
                 .stream
                 .write_all(&request(APPEND, self.term, length))?;
-            follower.stream.write_all(&buffer[..read])?;
+            write_bounded(&mut follower.stream, &buffer[..read])?;
             let mut ack = [0_u8; ACK_LEN];
             follower.stream.read_exact(&mut ack)?;
             cursor += read as u64;
@@ -510,7 +612,7 @@ impl<L: LogStorage> ReplicatedLog<L> {
 
         for follower in self.followers.iter_mut().filter(|f| f.live) {
             if follower.stream.write_all(&header).is_err()
-                || follower.stream.write_all(&self.pending).is_err()
+                || write_bounded(&mut follower.stream, &self.pending).is_err()
             {
                 follower.live = false;
             }
@@ -663,6 +765,7 @@ impl<L: LogStorage> Replica<L> {
         // write forever, and a pinned follower serves nobody -- including the
         // replacement leader that needs it to complete a promotion.
         stream.set_write_timeout(Some(idle_timeout))?;
+        bound_buffers(stream)?;
         let mut header = [0_u8; HEADER_LEN];
         let mut group = Vec::new();
 

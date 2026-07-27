@@ -67,7 +67,7 @@ impl From<io::Error> for JournalError {
 
 pub type Result<T> = std::result::Result<T, JournalError>;
 
-pub use replication::{Replica, ReplicatedLog};
+pub use replication::{Replica, ReplicatedLog, bound_listener};
 
 /// Somewhere bytes can be appended and read back.
 ///

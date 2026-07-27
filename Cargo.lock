@@ -178,6 +178,7 @@ name = "bx-journal"
 version = "0.1.0"
 dependencies = [
  "bx-protocol",
+ "socket2",
  "zerocopy",
 ]
 

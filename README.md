@@ -174,8 +174,10 @@ xtask/             Task runner.
 ```
 
 No crate on the matching path has a dependency it could reach. The engine stands alone.
-`protocol`, `journal` and `pipeline` use only `zerocopy` for fixed-layout casts, and `mio`,
-`hmac`, `sha2` and `getrandom` are confined to `gateway`.
+`protocol`, `journal` and `pipeline` use `zerocopy` for fixed-layout casts; `journal` also
+uses `socket2`, at connection setup only, to bound the kernel buffers on replication
+sockets — the one buffer the venue does not otherwise own. `mio`, `hmac`, `sha2` and
+`getrandom` are confined to `gateway`.
 
 The lockfile holds 156 crates, 123 of which arrived with a single decision: `openraft` and
 `tokio` in `crates/election`, used by the `venue` binary and not by the gateway library.

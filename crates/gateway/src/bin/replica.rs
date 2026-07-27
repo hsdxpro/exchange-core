@@ -70,7 +70,11 @@ fn main() -> std::io::Result<()> {
         .position(|a| a == "--file")
         .and_then(|i| args.get(i + 1));
 
-    let listener = TcpListener::bind(&address)?;
+    // Bound buffers, inherited by every leader connection at the handshake.
+    // Without this a leader pushing groups at a wedged follower has its bytes
+    // absorbed by the platform's dynamic buffering instead of hitting its
+    // write deadline -- and the kernel memory that absorbs them is unbounded.
+    let listener = bx_journal::bound_listener(&address)?;
     match file {
         Some(path) => {
             let log =

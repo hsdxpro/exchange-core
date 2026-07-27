@@ -8,6 +8,7 @@ description = "Append-only sequenced command log with replay"
 
 [dependencies]
 bx-protocol = { path = "../protocol" }
+socket2 = "0.6"
 zerocopy = { version = "0.8", features = ["derive"] }
 
 [lints]
