@@ -34,6 +34,50 @@ const FLOOR: Ticks = 10_000;
 const ACCOUNT: u64 = 1;
 /// Round-trip samples. Each is one order and one blocking read.
 const PROBES: usize = 2_000;
+/// Accounts the venue funds at startup. One per connection, so a client never
+/// shares a private feed and can count its own answers exactly.
+const ACCOUNTS: u64 = 256;
+
+/// What came back for the commands sent.
+///
+/// Split because "how many were acknowledged" and "how many got an answer" are
+/// different questions, and conflating them is what made this tool hang. Every
+/// command produces exactly one of these two events: an acknowledgement if it
+/// reached the sequencer, a rejection if the gateway refused it first -- which
+/// is what a rate limit does. Waiting only for acknowledgements therefore waits
+/// forever the moment a single order is refused, and the failure surfaces ten
+/// seconds later as a socket timeout that names nothing.
+#[derive(Clone, Copy, Debug, Default)]
+struct Responses {
+    acknowledged: u64,
+    rejected: u64,
+}
+
+impl Responses {
+    /// Commands the venue has answered, one way or the other.
+    const fn answered(self) -> u64 {
+        self.acknowledged + self.rejected
+    }
+
+    fn count(&mut self, event: &Event) {
+        if event.kind == EventKind::Received as u8 {
+            self.acknowledged += 1;
+        } else if event.kind == EventKind::Rejected as u8 {
+            self.rejected += 1;
+        }
+    }
+}
+
+/// Whether an error is the peer going away rather than a fault worth reporting.
+fn is_disconnect(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
 
 fn connect(address: &str) -> std::io::Result<TcpStream> {
     let stream = TcpStream::connect(address)?;
@@ -42,17 +86,60 @@ fn connect(address: &str) -> std::io::Result<TcpStream> {
     Ok(stream)
 }
 
-/// Reads until at least one whole event arrives, returning how many.
-fn read_some(stream: &mut TcpStream, scratch: &mut [u8]) -> std::io::Result<usize> {
-    let bytes = stream.read(scratch)?;
-    Ok(bytes / FRAME_LEN)
+/// Reads until the venue answers the order just sent, returning what it said.
+///
+/// Answered means acknowledged or rejected, not "some bytes arrived". Counting
+/// any frame as a reply is how this tool reported a healthy 10 microsecond round
+/// trip against a venue that required authentication and was in fact sending
+/// nothing but a challenge: the number was the client reading a refusal to talk
+/// to it, timed to the microsecond and completely meaningless.
+fn await_answer(
+    stream: &mut TcpStream,
+    scratch: &mut [u8],
+    held: &mut usize,
+) -> std::io::Result<EventKind> {
+    loop {
+        let bytes = stream.read(&mut scratch[*held..])?;
+        if bytes == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the venue closed the connection without answering",
+            ));
+        }
+        let filled = *held + bytes;
+        let whole = filled / FRAME_LEN;
+        let mut answer = None;
+        for index in 0..whole {
+            let start = index * FRAME_LEN;
+            if let Ok(event) = Event::read_from_bytes(&scratch[start..start + FRAME_LEN]) {
+                if event.kind == EventKind::Received as u8 {
+                    answer = Some(EventKind::Received);
+                } else if event.kind == EventKind::Rejected as u8 && answer.is_none() {
+                    answer = Some(EventKind::Rejected);
+                } else if event.kind == EventKind::Challenge as u8 {
+                    return Err(std::io::Error::other(
+                        "the venue requires authentication and this tool cannot \
+                         authenticate; set `authentication = open` in the venue's \
+                         configuration to measure it",
+                    ));
+                }
+            }
+        }
+        scratch.copy_within(whole * FRAME_LEN..filled, 0);
+        *held = filled - whole * FRAME_LEN;
+        if let Some(kind) = answer {
+            return Ok(kind);
+        }
+    }
 }
 
 fn round_trip(address: &str, first_order: u64) -> std::io::Result<(f64, f64)> {
     let mut stream = connect(address)?;
     let mut scratch = vec![0_u8; FRAME_LEN * 64];
+    let mut held = 0_usize;
     let mut bytes = Vec::with_capacity(FRAME_LEN);
     let mut samples = Vec::with_capacity(PROBES);
+    let mut rejected = 0_u64;
 
     for probe in 0..PROBES {
         let order_id = first_order + probe as u64;
@@ -65,18 +152,23 @@ fn round_trip(address: &str, first_order: u64) -> std::io::Result<(f64, f64)> {
 
         let started = Instant::now();
         stream.write_all(&bytes)?;
-        let mut seen = 0;
-        while seen == 0 {
-            seen = read_some(&mut stream, &mut scratch)?;
+        if await_answer(&mut stream, &mut scratch, &mut held)? == EventKind::Rejected {
+            rejected += 1;
         }
         samples.push(started.elapsed().as_secs_f64() * 1e6);
     }
 
+    if rejected > 0 {
+        eprintln!(
+            "WARNING: {rejected} of {PROBES} round-trip probes were rejected, so this \
+             latency is the cost of being refused rather than of being matched."
+        );
+    }
     samples.sort_by(f64::total_cmp);
     Ok((samples[0], samples[samples.len() / 2]))
 }
 
-fn throughput(address: &str, orders: u64, first_order: u64) -> std::io::Result<(f64, u64)> {
+fn throughput(address: &str, orders: u64, first_order: u64) -> std::io::Result<(f64, Responses)> {
     let mut stream = connect(address)?;
     let mut reader = stream.try_clone()?;
 
@@ -95,41 +187,43 @@ fn throughput(address: &str, orders: u64, first_order: u64) -> std::io::Result<(
     // replies filling the socket buffer -- which would measure the test, not
     // the venue.
     let wanted = orders;
-    let drain = std::thread::spawn(move || -> std::io::Result<u64> {
+    let drain = std::thread::spawn(move || -> std::io::Result<Responses> {
         let mut scratch = vec![0_u8; FRAME_LEN * 1_024];
-        let mut seen = 0_u64;
+        let mut tally = Responses::default();
         let mut partial = 0_usize;
-        while seen < wanted {
-            let bytes = reader.read(&mut scratch[partial..])?;
-            if bytes == 0 {
-                break;
-            }
+        while tally.answered() < wanted {
+            let bytes = match reader.read(&mut scratch[partial..]) {
+                Ok(0) => break,
+                Ok(bytes) => bytes,
+                // The venue sheds a session that owes more than it may queue,
+                // and a shed session is a closed socket. That is the venue
+                // working as designed under a client that will not read fast
+                // enough, so it is reported at the end rather than thrown as an
+                // I/O error that hides how far the run actually got.
+                Err(e) if is_disconnect(&e) => break,
+                Err(e) => return Err(e),
+            };
             let filled = partial + bytes;
             let whole = filled / FRAME_LEN;
             for index in 0..whole {
                 let start = index * FRAME_LEN;
-                // Count acknowledgements only. Every command produces exactly
-                // one, where the total event count also includes depth updates
-                // and prints and would finish the measurement early.
-                if let Ok(event) = Event::read_from_bytes(&scratch[start..start + FRAME_LEN])
-                    && event.kind == EventKind::Received as u8
-                {
-                    seen += 1;
+                if let Ok(event) = Event::read_from_bytes(&scratch[start..start + FRAME_LEN]) {
+                    tally.count(&event);
                 }
             }
             scratch.copy_within(whole * FRAME_LEN..filled, 0);
             partial = filled - whole * FRAME_LEN;
         }
-        Ok(seen)
+        Ok(tally)
     });
 
     let started = Instant::now();
     stream.write_all(&bytes)?;
     stream.flush()?;
-    let received = drain.join().expect("reader thread panicked")?;
+    let tally = drain.join().expect("reader thread panicked")?;
     let elapsed = started.elapsed().as_secs_f64();
 
-    Ok((orders as f64 / elapsed, received))
+    Ok((orders as f64 / elapsed, tally))
 }
 
 /// Many clients at once, each on its own account and its own slice of the
@@ -140,18 +234,21 @@ fn concurrent_throughput(
     clients: u64,
     orders_each: u64,
     first_order: u64,
-) -> std::io::Result<(f64, u64)> {
+) -> std::io::Result<(f64, Responses)> {
     let ready = std::sync::Arc::new(std::sync::Barrier::new(clients as usize + 1));
     let mut workers = Vec::with_capacity(clients as usize);
 
     for client in 0..clients {
         let address = address.to_string();
         let gate = std::sync::Arc::clone(&ready);
-        workers.push(std::thread::spawn(move || -> std::io::Result<u64> {
+        workers.push(std::thread::spawn(move || -> std::io::Result<Responses> {
             // Accounts the venue funds at startup. Clients sharing an account is
             // fine here: every order is a resting bid in its own price band, so
             // nothing crosses and nothing self-matches.
-            let account = 1 + client % 16;
+            // One account per connection. Sharing accounts put two clients on
+            // one private feed, so each counted the other's acknowledgements and
+            // a run could report more answers than it sent orders.
+            let account = 1 + client % ACCOUNTS;
             let base = FLOOR + 1_000 + (client as Ticks) * 37;
             let mut stream = connect(&address)?;
             let mut reader = stream.try_clone()?;
@@ -168,30 +265,31 @@ fn concurrent_throughput(
 
             // Read on another thread, or a client blocks against its own receive
             // buffer and measures itself rather than the venue.
-            let drain = std::thread::spawn(move || -> std::io::Result<u64> {
+            let drain = std::thread::spawn(move || -> std::io::Result<Responses> {
                 let mut scratch = vec![0_u8; FRAME_LEN * 256];
-                let mut seen = 0_u64;
+                let mut tally = Responses::default();
                 let mut partial = 0_usize;
-                while seen < orders_each {
-                    let bytes = reader.read(&mut scratch[partial..])?;
-                    if bytes == 0 {
-                        break;
-                    }
+                while tally.answered() < orders_each {
+                    let bytes = match reader.read(&mut scratch[partial..]) {
+                        Ok(0) => break,
+                        Ok(bytes) => bytes,
+                        Err(e) if is_disconnect(&e) => break,
+                        Err(e) => return Err(e),
+                    };
                     let filled = partial + bytes;
                     let whole = filled / FRAME_LEN;
                     for index in 0..whole {
                         let start = index * FRAME_LEN;
                         if let Ok(event) =
                             Event::read_from_bytes(&scratch[start..start + FRAME_LEN])
-                            && event.kind == EventKind::Received as u8
                         {
-                            seen += 1;
+                            tally.count(&event);
                         }
                     }
                     scratch.copy_within(whole * FRAME_LEN..filled, 0);
                     partial = filled - whole * FRAME_LEN;
                 }
-                Ok(seen)
+                Ok(tally)
             });
 
             // Every client starts writing at the same moment, so the venue sees
@@ -205,12 +303,14 @@ fn concurrent_throughput(
 
     ready.wait();
     let started = Instant::now();
-    let mut acknowledged = 0;
+    let mut total = Responses::default();
     for worker in workers {
-        acknowledged += worker.join().expect("client thread panicked")?;
+        let tally = worker.join().expect("client thread panicked")?;
+        total.acknowledged += tally.acknowledged;
+        total.rejected += tally.rejected;
     }
     let elapsed = started.elapsed().as_secs_f64();
-    Ok(((clients * orders_each) as f64 / elapsed, acknowledged))
+    Ok(((clients * orders_each) as f64 / elapsed, total))
 }
 
 fn main() -> std::io::Result<()> {
@@ -244,17 +344,21 @@ fn main() -> std::io::Result<()> {
         "{:<40}{:>10.0} orders/sec",
         "pipelined throughput", per_second
     );
-    println!("{:<40}{received:>10} of {orders}", "orders acknowledged");
+    println!(
+        "{:<40}{:>10} of {orders}",
+        "orders acknowledged", received.acknowledged
+    );
 
     let each = (orders / clients).max(1);
-    let (concurrent, acknowledged) = concurrent_throughput(&address, clients, each, 20_000_000)?;
+    let (concurrent, answered) = concurrent_throughput(&address, clients, each, 20_000_000)?;
     println!(
         "{:<40}{concurrent:>10.0} orders/sec",
         format!("{clients} clients at once, {each} each")
     );
     println!(
-        "{:<40}{acknowledged:>10} of {}",
+        "{:<40}{:>10} of {}",
         "orders acknowledged",
+        answered.acknowledged,
         clients * each
     );
     println!("{}", "-".repeat(72));
@@ -263,21 +367,33 @@ fn main() -> std::io::Result<()> {
     // order skips matching, so a saturated venue reports a throughput it cannot
     // sustain. This project has measured the reject path by accident three
     // times, every time because nothing said so out loud.
-    if acknowledged < clients * each {
-        eprintln!(
-            "WARNING: {} of {} concurrent orders were not acknowledged. If the venue \
-             reports \"open order limit reached\", its pool filled and this figure \
-             is measuring refusals, not matching.",
-            clients * each - acknowledged,
-            clients * each
-        );
-    }
-    if received < orders {
-        eprintln!(
-            "WARNING: {} of {orders} pipelined orders were not acknowledged, so this \
-             figure is not measuring what it says.",
-            orders - received
-        );
-    }
+    //
+    // Rejections are named separately from silence. They are different faults
+    // with different fixes: a rejection means the venue answered and said no,
+    // which at these rates is almost always the per-account rate limit, and
+    // silence means the run ended before the venue finished answering.
+    report("pipelined", received, orders);
+    report("concurrent", answered, clients * each);
     Ok(())
+}
+
+/// Says what happened to the commands that were not acknowledged.
+fn report(phase: &str, tally: Responses, sent: u64) {
+    if tally.rejected > 0 {
+        eprintln!(
+            "WARNING: the venue refused {} of {sent} {phase} orders, so this figure \
+             is measuring the reject path rather than matching. The usual cause is \
+             `max_commands_per_second` in the venue's configuration being below the \
+             rate this tool sends at; raise it, or lower --orders.",
+            tally.rejected
+        );
+    }
+    let unanswered = sent.saturating_sub(tally.answered());
+    if unanswered > 0 {
+        eprintln!(
+            "WARNING: {unanswered} of {sent} {phase} orders were never answered at \
+             all. The connection was closed before the venue finished, which is what \
+             shedding a session that queued more than it may look like."
+        );
+    }
 }

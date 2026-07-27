@@ -28,7 +28,11 @@ use std::time::Duration;
 
 /// Accounts credited at startup, so a client can trade without a funding API.
 /// A real venue funds through deposits from its own account service.
-const ACCOUNTS: std::ops::RangeInclusive<u64> = 1..=16;
+/// Wide enough that the load client can give every one of its connections an
+/// account to itself. Sharing one is not a saving: the private feed is
+/// per-account, so two sessions on one account each receive the other's
+/// acknowledgements and neither can tell which events answer its own orders.
+const ACCOUNTS: std::ops::RangeInclusive<u64> = 1..=256;
 const STARTING_BALANCE: u64 = u64::MAX / 4;
 
 /// How long a promoted node keeps trying to reach a majority before giving up and
