@@ -105,6 +105,18 @@ impl Process {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// Waits for the process to exit on its own, returning whether it failed.
+    fn exited_with_failure(&mut self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return !status.success();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
 }
 
 impl Drop for Process {
@@ -537,5 +549,71 @@ fn a_dead_follower_neither_stops_the_leader_nor_stays_gone() {
     assert!(
         records(&b_log) >= target,
         "the follower that never failed is missing records"
+    );
+}
+
+/// A journal that rotted on disk stops the venue before it serves anyone.
+///
+/// The journal is the only source of truth, so a venue that starts over a
+/// corrupt one is a venue whose books silently disagree with what clients were
+/// told before the corruption. Refusing to start is the only honest answer,
+/// and it must happen at startup -- an operator restarting after a disk scare
+/// finds out now, not when replay produces a wrong book under load.
+///
+/// A torn *trailing* write is different and must keep working: that is the
+/// ordinary residue of a crash, and `simulation.rs` proves it recovers. This
+/// is corruption in the middle, which no crash produces and only a bad disk
+/// or a bad restore can.
+#[test]
+fn a_corrupt_journal_stops_the_venue_before_it_serves() {
+    const ORDERS: u64 = 200;
+    let scratch = Scratch::new("corrupt");
+    let journal = scratch.file("venue.log");
+    let config = standalone_config(&scratch.file("venue.conf"), &journal);
+
+    let mut venue = Process::start(
+        env!("CARGO_BIN_EXE_venue"),
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:7505",
+        ],
+    );
+    assert!(
+        venue.wait_for("listening", Duration::from_secs(20)),
+        "the venue never came up"
+    );
+    let mut client = connect("127.0.0.1:7505");
+    assert_eq!(trade_from(&mut client, 1, ORDERS), ORDERS);
+    drop(client);
+    venue.kill();
+
+    // Rot a record in the middle: its discriminants become values no version
+    // defines. Not the tail -- a torn tail is legitimate.
+    let mut bytes = std::fs::read(&journal).unwrap();
+    let middle = (MAGIC_LEN + (ORDERS / 2) * RECORD_LEN) as usize;
+    for byte in &mut bytes[middle..middle + 8] {
+        *byte = 0xFF;
+    }
+    std::fs::write(&journal, &bytes).unwrap();
+
+    let mut restarted = Process::start(
+        env!("CARGO_BIN_EXE_venue"),
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:7505",
+        ],
+    );
+    assert!(
+        restarted.exited_with_failure(Duration::from_secs(20)),
+        "the venue started over a corrupt journal instead of refusing; whatever \
+         it is serving cannot match what clients were told before the corruption"
+    );
+    assert!(
+        !restarted.wait_for("listening", Duration::from_secs(1)),
+        "the venue listened before noticing its journal is corrupt"
     );
 }

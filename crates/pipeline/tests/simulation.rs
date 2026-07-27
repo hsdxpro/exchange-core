@@ -216,6 +216,80 @@ fn a_storage_failure_is_reported_and_never_silently_swallowed() {
     assert_eq!(accounting_violations(), 0);
 }
 
+/// The disk fills. The venue refuses to acknowledge, and recovery discards
+/// exactly the group that was applied in memory but never made durable.
+///
+/// This is the failure the shipped storage actually has. `FileLog` buffers
+/// appends and touches the device only at sync, so on a real file ENOSPC
+/// surfaces in the sync and never in the append -- and the test above, which
+/// fails appends, exercises a path the deployed venue cannot reach.
+///
+/// The dangerous moment is precise: `enqueue` has already applied the group to
+/// the books when `commit`'s sync fails, so the venue's memory is ahead of its
+/// journal. Everything rests on two behaviours -- the failed commit releases no
+/// events, and the process fail-stops so the divergent memory is discarded and
+/// replay rebuilds from the last durable group. A shadow venue fed only the
+/// commands that were actually committed defines, independently, what the
+/// recovered state must be.
+#[test]
+fn a_full_disk_refuses_acknowledgement_and_recovery_discards_the_divergence() {
+    // Funding costs 16 syncs (8 accounts, 2 deposits each); the disk fills 25
+    // trading commands later.
+    let deposits = 16;
+    let mut primary = Exchange::new(
+        MemoryLog::new().failing_sync_after(deposits + 25),
+        instruments(),
+    )
+    .unwrap();
+    let mut shadow = funded();
+    common::fund(&mut primary);
+
+    let mut traders = TraderPopulation::new(4242);
+    let mut resting = Vec::new();
+    let mut committed = 0;
+    let mut refused = false;
+    for _ in 0..100 {
+        let mut command = traders.act(&mut resting);
+        let mut twin = command;
+        if primary.submit(&mut command).is_ok() {
+            committed += 1;
+            shadow
+                .submit(&mut twin)
+                .expect("the shadow's clean storage refused a command");
+        } else {
+            // The venue fail-stops here: its memory holds a group the journal
+            // does not, and serving on would acknowledge against state that a
+            // restart cannot reproduce.
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "the disk never filled, so nothing was tested");
+    assert_eq!(committed, 25, "the failure did not land where it was aimed");
+
+    // The operator frees space and restarts. Everything committed survives;
+    // the group that was applied but never synced does not exist.
+    let mut storage = primary.into_storage();
+    storage.crash();
+    storage.repair();
+    let mut recovered = Exchange::new(storage, instruments()).unwrap();
+    recovered.recover().unwrap();
+
+    assert_eq!(
+        observe(&recovered),
+        observe(&shadow),
+        "recovery after a full disk does not match a venue that only ever \
+         saw the committed commands"
+    );
+    assert_eq!(accounting_violations(), 0);
+
+    // And it is a venue again, not a wreck: the repaired disk takes new orders.
+    let mut command = traders.act(&mut resting);
+    recovered
+        .submit(&mut command)
+        .expect("the recovered venue refuses orders after the disk was freed");
+}
+
 #[test]
 fn recovery_is_reproducible_from_the_same_journal() {
     // Determinism is what makes replay a recovery mechanism rather than an

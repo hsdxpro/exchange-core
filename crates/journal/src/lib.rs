@@ -254,6 +254,8 @@ pub struct MemoryLog {
     fail_after: Option<usize>,
     appends: usize,
     tear_at_append: Option<usize>,
+    fail_sync_after: Option<usize>,
+    syncs: usize,
 }
 
 impl MemoryLog {
@@ -279,6 +281,25 @@ impl MemoryLog {
     pub fn tearing_append(mut self, n: usize) -> Self {
         self.tear_at_append = Some(n);
         self
+    }
+
+    /// Every sync after `n` fails, which is where a full disk actually bites.
+    ///
+    /// `failing_after` breaks the append, but `FileLog` buffers appends in
+    /// memory and touches the device only at sync -- so on the real storage,
+    /// ENOSPC surfaces here and nowhere else. A suite that only failed appends
+    /// was testing a failure the shipped storage cannot have.
+    #[must_use]
+    pub fn failing_sync_after(mut self, n: usize) -> Self {
+        self.fail_sync_after = Some(n);
+        self
+    }
+
+    /// Clears injected failures: the operator freed disk space, or the device
+    /// came back. What was appended but never synced is still not durable.
+    pub fn repair(&mut self) {
+        self.fail_after = None;
+        self.fail_sync_after = None;
     }
 
     /// Discards everything not yet synced, simulating power loss.
@@ -308,6 +329,13 @@ impl LogStorage for MemoryLog {
     }
 
     fn sync(&mut self) -> io::Result<()> {
+        self.syncs += 1;
+        if self.fail_sync_after.is_some_and(|n| self.syncs > n) {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "simulated full disk",
+            ));
+        }
         self.synced_len = self.bytes.len() as u64;
         Ok(())
     }
