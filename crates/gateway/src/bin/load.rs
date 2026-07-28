@@ -421,6 +421,8 @@ fn main() -> std::io::Result<()> {
         // Let the venue drain its outboxes before the audience hangs up.
         std::thread::sleep(Duration::from_millis(500));
         for feed in &feeds {
+            // Best effort: the venue may have shed the session already, and
+            // either way the point is only to unblock the reader thread.
             let _ = feed.shutdown(std::net::Shutdown::Both);
         }
         let mut counts: Vec<u64> = watchers
@@ -458,14 +460,14 @@ fn subscribers(
     let mut watchers = Vec::with_capacity(count as usize);
     let mut feeds = Vec::with_capacity(count as usize);
     for member in 0..count {
-        let stream = connect(address)?;
+        let mut stream = connect(address)?;
         let mut reader = stream.try_clone()?;
         let mut frame = Vec::with_capacity(FRAME_LEN);
         encode(
             &subscribe(1 + member % ACCOUNTS, SYMBOL, ChannelKind::Book),
             &mut frame,
         );
-        (&stream).write_all(&frame)?;
+        stream.write_all(&frame)?;
         feeds.push(stream);
         watchers.push(std::thread::spawn(move || -> u64 {
             let mut scratch = vec![0_u8; 16 * 1024];
