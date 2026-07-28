@@ -1230,6 +1230,23 @@ impl<S: LogStorage> Server<S> {
         if published {
             self.touched.extend_from_slice(self.venue.hub().touched());
         }
+        // Every follower is served before this pass returns to the order
+        // socket, which is what puts the crowd table's p50 in milliseconds
+        // while the same order load alone answers in microseconds.
+        //
+        // Serving a bounded slice per pass and resuming where it left off is
+        // the obvious fix and does not work. It measured p50 down from 14.3 ms
+        // to 1.9 ms and then failed the crowd test twice: with a thousand
+        // followers resident, new connections stopped being accepted and the
+        // load client timed out connecting, every phase after that lost. The
+        // unit suite passed throughout, which is exactly why the load test
+        // exists. Whatever starves the accept path there is not understood
+        // yet, and a latency win that costs a venue its ability to take on a
+        // client is not a win.
+        //
+        // The fix a venue actually uses is a publisher that is not this
+        // thread -- or multicast, which costs one packet regardless of
+        // audience. Both are real work; neither is a smaller constant here.
         for channel in &self.touched {
             let Some(following) = self.subscribers.get(channel) else {
                 continue;
