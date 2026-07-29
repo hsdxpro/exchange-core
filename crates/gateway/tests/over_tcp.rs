@@ -15,6 +15,7 @@ use bx_pipeline::{
     cancel_on_disconnect, limit_order, market_order, query_open_orders, subscribe, unsubscribe,
 };
 use bx_protocol::{ChannelKind, Command, Event, EventKind, Side, Ticks};
+use socket2::SockRef;
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -593,7 +594,18 @@ fn a_client_shed_for_being_slow_can_reconnect_and_rebuild_the_book() {
     let venue = Running::start();
 
     // A silent client: subscribed, never reading.
+    //
+    // Its receive buffer is pinned small on purpose. A client that stops
+    // calling `read` is not yet a slow client -- its kernel goes on accepting
+    // the feed on its behalf, and Linux autotunes that buffer into the
+    // megabytes, so with the default the venue's writes never block and there
+    // is nothing to shed. Bounding it here makes "cannot absorb the feed" true
+    // from the first burst instead of true only on whichever platform happens
+    // to buffer least.
     let mut silent = venue.connect();
+    SockRef::from(&silent)
+        .set_recv_buffer_size(16 * 1024)
+        .unwrap();
     send(
         &mut silent,
         &[limit_order(3, SYMBOL, 7_001, Side::Bid, 10_050, 1)],
@@ -616,7 +628,13 @@ fn a_client_shed_for_being_slow_can_reconnect_and_rebuild_the_book() {
         }
     });
 
-    for round in 0..80_u64 {
+    // 200 rounds of 500 is 100,000 events, near 6.4 MB of feed against a
+    // 2 MB outbox budget and half a megabyte of kernel buffer either side.
+    // Sized to clear the budget several times over rather than to clear it
+    // narrowly: at 80 rounds the backlog landed just under the bound once the
+    // buffers had taken their share, which is a test that passes on the
+    // arithmetic of the day.
+    for round in 0..200_u64 {
         let commands: Vec<Command> = (0..500)
             .map(|i| {
                 limit_order(

@@ -150,6 +150,9 @@ say and nothing to be told is never visited, so cost stops growing with connecti
 
 Memory is **263 KB per session**, measured across 4,000 idle sessions: a 256 KiB read
 buffer preallocated at admission so the trading path never allocates, plus bookkeeping.
+The kernel holds up to **256 KB more** per session for feed in flight -- bounded at
+accept, because left to autotune it reaches the megabytes and a subscriber that stopped
+reading then sits that far stale while the venue's own outbox still looks empty.
 Past `max_sessions` a connect is accepted and immediately dropped, so the client learns
 now rather than timing out against a venue that will never read it. 8,000 sessions opened
 and closed return RSS to baseline.
