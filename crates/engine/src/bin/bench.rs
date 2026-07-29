@@ -333,7 +333,24 @@ const SCENARIO_WIDTH: usize = 40;
 const LATENCY_WIDTH: usize = 11;
 const PER_ITEM_WIDTH: usize = 19;
 
-fn print_header(cpu: Option<usize>, runs: usize) {
+/// What the scheduler will let this process run on, as reported by the kernel.
+///
+/// Only Linux reports it, so everywhere else the first two variants are never
+/// built. The type stays one shape rather than being split per platform: the
+/// header prints from a single match, and two cfg'd copies of that match are
+/// two things to keep in step.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+enum Affinity {
+    /// Exactly one CPU is allowed: the operator pinned the run.
+    Pinned(usize),
+    /// More than one, so the run can migrate between cores mid-measurement.
+    Shared(usize),
+    /// Not a platform that reports it, or a mask that did not parse.
+    Unreported,
+}
+
+fn print_header(affinity: Affinity, runs: usize) {
     println!("\nBitmap Exchange — Rust 1.97.1 / Edition 2024");
     println!(
         "Single-instrument L2/L3 order book and price-time FIFO matching engine over a\n\
@@ -342,9 +359,15 @@ fn print_header(cpu: Option<usize>, runs: usize) {
         size_of::<OrderSlot>(),
         size_of::<PriceLevel>()
     );
-    match cpu {
-        Some(core) => println!("Benchmark runs: {runs} | pinned to Linux CPU {core}"),
-        None => println!("Benchmark runs: {runs} | CPU pinning unavailable on this platform"),
+    match affinity {
+        Affinity::Pinned(cpu) => println!("Benchmark runs: {runs} | pinned to CPU {cpu}"),
+        Affinity::Shared(cpus) => println!(
+            "Benchmark runs: {runs} | not pinned, {cpus} CPUs allowed \
+             (run under `taskset -c <cpu>` for stable tails)"
+        ),
+        Affinity::Unreported => {
+            println!("Benchmark runs: {runs} | CPU affinity not reported on this platform")
+        }
     }
 }
 
@@ -431,8 +454,7 @@ fn main() -> ExitCode {
     let l2_update_count = if quick { 300_000 } else { 2_000_000 };
     let l3_count = if quick { 80_000 } else { 300_000 };
     let mut sink = 0_u64;
-    let pinned_cpu = pin_first_allowed_cpu();
-    print_header(pinned_cpu, runs);
+    print_header(affinity(), runs);
 
     if !skip_verification {
         let workload = if quick {
@@ -860,40 +882,52 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Reads the affinity mask the process was started with, rather than setting
+/// one. Setting it means `sched_setaffinity`, which means FFI, which this
+/// workspace forbids -- and self-pinning would pick the lowest allowed CPU
+/// anyway, typically the one carrying the timer and network interrupts. The
+/// operator picks a quiet core with `taskset`; this only reports what they
+/// chose, so the header describes the run that actually happened.
 #[cfg(target_os = "linux")]
-fn pin_first_allowed_cpu() -> Option<usize> {
-    #[repr(C)]
-    struct CpuSet {
-        bits: [u64; 16],
+fn affinity() -> Affinity {
+    // `Cpus_allowed_list` is the kernel's own rendering of the mask, in the
+    // same "0-3,8" form `taskset -c` accepts.
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return Affinity::Unreported;
+    };
+    let Some(list) = status.lines().find_map(|line| {
+        line.strip_prefix("Cpus_allowed_list:")
+            .map(|value| value.trim())
+    }) else {
+        return Affinity::Unreported;
+    };
+
+    let mut first = None;
+    let mut count = 0_usize;
+    for range in list.split(',') {
+        let (low, high) = match range.split_once('-') {
+            Some((low, high)) => (low, high),
+            None => (range, range),
+        };
+        let (Ok(low), Ok(high)) = (low.trim().parse::<usize>(), high.trim().parse::<usize>())
+        else {
+            return Affinity::Unreported;
+        };
+        if high < low {
+            return Affinity::Unreported;
+        }
+        first.get_or_insert(low);
+        count += high - low + 1;
     }
 
-    unsafe extern "C" {
-        fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut CpuSet) -> i32;
-        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const CpuSet) -> i32;
+    match (first, count) {
+        (Some(cpu), 1) => Affinity::Pinned(cpu),
+        (Some(_), n) if n > 1 => Affinity::Shared(n),
+        _ => Affinity::Unreported,
     }
-
-    let mut allowed = CpuSet { bits: [0; 16] };
-    // SAFETY: `allowed` is a valid writable `CpuSet`, and the size matches the object.
-    if unsafe { sched_getaffinity(0, size_of::<CpuSet>(), &mut allowed) } != 0 {
-        return None;
-    }
-    let cpu = allowed
-        .bits
-        .iter()
-        .enumerate()
-        .find_map(|(word_index, &word)| {
-            (word != 0).then_some(word_index * 64 + word.trailing_zeros() as usize)
-        })?;
-    let mut selected = CpuSet { bits: [0; 16] };
-    selected.bits[cpu / 64] = 1_u64 << (cpu % 64);
-    // SAFETY: `selected` is a valid readable `CpuSet`, and the size matches the object.
-    if unsafe { sched_setaffinity(0, size_of::<CpuSet>(), &selected) } != 0 {
-        return None;
-    }
-    Some(cpu)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_first_allowed_cpu() -> Option<usize> {
-    None
+fn affinity() -> Affinity {
+    Affinity::Unreported
 }
