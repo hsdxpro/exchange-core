@@ -147,6 +147,17 @@ pub struct Metrics {
     sessions_refused: u64,
     /// Sessions dropped for owing more than they are allowed to queue.
     sessions_shed: u64,
+    /// Subscriptions restated because the client fell behind the retention
+    /// window: its queue was dropped and the book sent afresh.
+    ///
+    /// The other half of the same story as `sessions_shed`, and the half an
+    /// operator cannot otherwise see. Both are the venue refusing to
+    /// accumulate for a client that is not keeping up; which one a given
+    /// client meets depends on how much its kernel absorbed before the venue's
+    /// own queue grew. A rising count here says subscribers are falling behind
+    /// -- the feed is outrunning them, or the retention window is too short --
+    /// while sessions stay connected and nothing looks wrong.
+    subscriptions_restated: u64,
     /// Whole records that arrived but did not decode, and were discarded.
     ///
     /// Counted because dropping them is the right call and saying nothing about
@@ -192,6 +203,10 @@ impl Metrics {
 
     pub const fn shed(&mut self) {
         self.sessions_shed += 1;
+    }
+
+    pub const fn restated(&mut self) {
+        self.subscriptions_restated += 1;
     }
 
     pub const fn undecodable(&mut self, records: u64) {
@@ -249,6 +264,11 @@ impl Metrics {
         self.sessions_shed
     }
 
+    #[must_use]
+    pub const fn subscriptions_restated(&self) -> u64 {
+        self.subscriptions_restated
+    }
+
     /// One block an operator can read, or a log can carry.
     #[must_use]
     pub fn report(&self) -> String {
@@ -278,8 +298,11 @@ impl Metrics {
         }
         let _ = write!(
             out,
-            "  sessions      accepted {}  refused {}  shed {}",
-            self.sessions_accepted, self.sessions_refused, self.sessions_shed
+            "  sessions      accepted {}  refused {}  shed {}  restated {}",
+            self.sessions_accepted,
+            self.sessions_refused,
+            self.sessions_shed,
+            self.subscriptions_restated
         );
         out
     }

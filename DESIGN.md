@@ -316,7 +316,7 @@ custom transport becomes the bottleneck.
 | A partition panics | deliberate abort with a state dump, restart from snapshot + replay. The other partitions are untouched, which is the point of them being processes |
 | Subscriber falls behind | ring overwrites, subscriber sees the gap and re-snapshots |
 | Client floods | A token bucket per account at the gateway, before sequencing, so a discarded command is never journalled. Separately, the per-session outbox budget sheds a client the venue cannot write *to*, which is the opposite failure |
-| Subscriber stops reading | Its socket fills, the outbox grows past its budget, and the session is shed. The send buffer is bounded at accept so that point is a number this venue chose: left autotuning, the kernel absorbs megabytes on the client's behalf and the outbox stays empty while the client goes stale |
+| Subscriber stops reading | Its socket fills, the outbox grows past its budget, and the session is shed. How long that takes depends on what the kernel will hold for it first. Pinning the send buffer to make that a fixed number was tried and reverted: the same bound caps how far a healthy reader may fall behind, and it disconnected subscribers over milliseconds of jitter |
 | Order outside price band | rejected at the risk stage |
 | Self-match | cancel-newest; the resting order survives |
 

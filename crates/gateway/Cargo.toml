@@ -20,12 +20,6 @@ zerocopy = { version = "0.8", features = ["derive"] }
 # idle connection and capped a gateway at a few hundred clients. Hand-rolling
 # per-platform readiness is not a thing to hand-roll.
 mio = { version = "1", features = ["os-poll", "net"] }
-# One socket option -- the send-buffer bound that keeps a stalled subscriber's
-# backlog from growing into whatever the kernel feels like autotuning. Already
-# in the tree underneath `mio`, so it adds nothing to the build, and the only
-# alternative is per-platform `setsockopt` through FFI, which this workspace
-# forbids.
-socket2 = "0.6"
 # Authentication. The venue takes no TLS by design, so a bearer token would be
 # replayable by anyone on the wire; the client signs a per-connection nonce
 # instead and the secret is never sent. HMAC-SHA256 is the standard construction
@@ -39,6 +33,14 @@ sha2 = "0.10"
 # thin syscall wrapper underneath every Rust RNG, and it is all that is wanted:
 # there is no distribution to sample, just sixteen bytes.
 getrandom = "0.3"
+
+[dev-dependencies]
+# Tests only. `over_tcp` pins a client's receive buffer small so that "a client
+# that cannot absorb the feed" is true on every platform rather than only on
+# whichever one buffers least. Already in the tree underneath `mio`, and the
+# alternative is per-platform `setsockopt` through FFI, which this workspace
+# forbids.
+socket2 = "0.6"
 
 [lints]
 workspace = true

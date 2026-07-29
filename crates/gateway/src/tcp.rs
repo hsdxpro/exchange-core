@@ -61,41 +61,11 @@ use bx_protocol::{
 };
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
-use socket2::SockRef;
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-/// How much feed the kernel may hold for one session before it starts refusing
-/// the venue's writes.
-///
-/// Left alone, Linux autotunes this into the megabytes, and a client that has
-/// stopped reading absorbs all of it before a single write returns `WouldBlock`
-/// -- so the venue's outbox stays empty, [`Session::over_budget`] never fires,
-/// and a client can sit several megabytes stale while looking healthy. Stale
-/// market data is worthless to whoever eventually reads it, and the memory is
-/// charged to the venue either way. Bounding it here makes the backlog a
-/// number this code chose rather than one the platform chose, so shedding
-/// happens at the same point on every operating system.
-///
-/// 4,096 events. Large enough that a reader keeping up never stalls the writer
-/// on a burst, small enough that one that has stopped is noticed within a few
-/// milliseconds of feed. Linux doubles the request for its own bookkeeping and
-/// enforces a floor; both are fine, since this is an upper bound on staleness,
-/// not an allocation anyone depends on.
-const SEND_BUFFER_BYTES: usize = 4_096 * FRAME_LEN;
-
-/// Applies [`SEND_BUFFER_BYTES`] to an accepted socket.
-///
-/// Best effort: a platform that refuses the option leaves the socket at its
-/// default, which is the behaviour this venue had before. The outbox budget is
-/// still enforced, so the failure mode is a looser staleness bound, not an
-/// unbounded one.
-fn bound_send_buffer(stream: &TcpStream) {
-    let _ = SockRef::from(stream).set_send_buffer_size(SEND_BUFFER_BYTES);
-}
 
 /// One connected client.
 #[derive(Debug)]
@@ -293,9 +263,12 @@ impl Session {
     /// out of the window, applied one step earlier and for the same reason --
     /// the venue neither slows down for a slow client nor accumulates for one.
     ///
-    /// This measures only what the venue is holding. What the kernel is holding
-    /// on the session's behalf is bounded separately, at accept, by
-    /// [`bound_send_buffer`] -- the two together are the whole backlog.
+    /// This measures what the venue is holding, not what the kernel is holding
+    /// on the session's behalf. Pinning the send buffer to bound that too was
+    /// tried and reverted: it also caps how far a *healthy* reader may fall
+    /// behind, and a subscriber with a few milliseconds of jitter was being
+    /// disconnected. Tolerance belongs in this budget, which an operator sets
+    /// and can see, plus whatever the kernel is willing to hold.
     fn over_budget(&self) -> bool {
         self.outbox.len() > self.max_outbox
     }
@@ -1223,7 +1196,6 @@ impl<S: LogStorage> Server<S> {
                         continue;
                     }
                     let _ = stream.set_nodelay(true);
-                    bound_send_buffer(&stream);
                     // A fresh nonce per connection, which is what makes a
                     // captured proof worthless against the next one.
                     let challenge = (self.mode == Mode::Required).then(auth::nonce);
@@ -1415,6 +1387,7 @@ impl<S: LogStorage> Server<S> {
     ///   properly, and there is not one yet.
     fn resynchronise(&mut self, lagged: &[(usize, Channel)]) {
         for (index, channel) in lagged.iter().copied() {
+            self.metrics.restated();
             match channel {
                 Channel::Book(symbol) => {
                     let at = self.venue.hub().next_sequence(channel).unwrap_or_default();

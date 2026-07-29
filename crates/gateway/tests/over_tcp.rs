@@ -12,7 +12,8 @@ use bx_gateway::tcp::{Server, read_events};
 use bx_journal::MemoryLog;
 use bx_pipeline::instrument::{Instrument, Instruments};
 use bx_pipeline::{
-    cancel_on_disconnect, limit_order, market_order, query_open_orders, subscribe, unsubscribe,
+    cancel_on_disconnect, cancel_order, limit_order, market_order, query_open_orders, subscribe,
+    unsubscribe,
 };
 use bx_protocol::{ChannelKind, Command, Event, EventKind, Side, Ticks};
 use socket2::SockRef;
@@ -43,6 +44,7 @@ fn instruments() -> Instruments {
 struct Running {
     address: String,
     stop: Arc<AtomicBool>,
+    disciplined: Arc<AtomicUsize>,
     /// Sessions the server held at its last pass. Only a hint: the test thread
     /// reads it while the server thread writes it.
     sessions: Arc<AtomicUsize>,
@@ -81,12 +83,19 @@ impl Running {
         let counter = Arc::clone(&sessions);
         let subscriptions = Arc::new(AtomicUsize::new(0));
         let tracked = Arc::clone(&subscriptions);
+        let disciplined = Arc::new(AtomicUsize::new(0));
+        let overloads = Arc::clone(&disciplined);
 
         let thread = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 server.poll().expect("the venue failed to commit");
                 counter.store(server.sessions(), Ordering::Relaxed);
                 tracked.store(server.tracked_subscriptions(), Ordering::Relaxed);
+                let metrics = server.metrics();
+                overloads.store(
+                    (metrics.sessions_shed() + metrics.subscriptions_restated()) as usize,
+                    Ordering::Relaxed,
+                );
                 // Nothing to do until a socket is readable. A deployed venue
                 // busy-polls a pinned core here; a test does not need to.
                 std::thread::sleep(Duration::from_micros(200));
@@ -98,12 +107,25 @@ impl Running {
             stop,
             sessions,
             subscriptions,
+            disciplined,
             thread: Some(thread),
         }
     }
 
     fn sessions_hint(&self) -> usize {
         self.sessions.load(Ordering::Relaxed)
+    }
+
+    /// Times the venue has refused to accumulate for a client that is not
+    /// keeping up: sessions shed plus subscriptions restated.
+    ///
+    /// The two are the same policy meeting a client at different points, and
+    /// which one it meets is not this venue's choice -- it depends on how much
+    /// the operating system buffered before the venue's own queue began to
+    /// grow. A test that demands one of them in particular is a test about the
+    /// kernel.
+    fn overload_responses(&self) -> usize {
+        self.disciplined.load(Ordering::Relaxed)
     }
 
     /// Entries in the venue's channel-to-session index. Same caveat as
@@ -628,39 +650,89 @@ fn a_client_shed_for_being_slow_can_reconnect_and_rebuild_the_book() {
         }
     });
 
-    // 200 rounds of 500 is 100,000 events, near 6.4 MB of feed against a
-    // 2 MB outbox budget and half a megabyte of kernel buffer either side.
-    // Sized to clear the budget several times over rather than to clear it
-    // narrowly: at 80 rounds the backlog landed just under the bound once the
-    // buffers had taken their share, which is a test that passes on the
-    // arithmetic of the day.
-    for round in 0..200_u64 {
-        let commands: Vec<Command> = (0..500)
+    // Each round rests 500 orders and cancels all 500 again, so the feed keeps
+    // coming without the resting pool ever filling.
+    //
+    // Resting alone cannot do it. The instrument holds 65,536 orders, and once
+    // that is reached every further order is rejected -- and a rejection goes
+    // to the client that sent it, not to the book channel. So the feed a
+    // subscriber sees stops at about 4 MB however long the loop runs, and
+    // adding rounds changes nothing.
+    //
+    // 4 MB is not enough to overload anyone here, because the kernel takes the
+    // feed on the silent client's behalf before the venue's own queue grows:
+    // up to a 4 MB send buffer, plus the 32 KB its receive buffer was pinned
+    // to above. The venue's 2 MB budget sits behind all of that, so the bar is
+    // nearer 6 MB. On Windows, where the default send buffer is 64 KB, almost
+    // all 4 MB queued where the venue could see it and the session was shed;
+    // on Linux it fit in the kernel and nothing happened. One test, two
+    // platforms, two answers, and neither of them about the venue.
+    //
+    // Cancelling as we go removes the ceiling: 800 rounds of 500 rests and 500
+    // cancels is 800,000 events, over 50 MB, against a pool that never holds
+    // more than 500.
+    for round in 0..800_u64 {
+        let first = round * 500 + 1;
+        let mut commands: Vec<Command> = (0..500)
             .map(|i| {
                 limit_order(
                     1,
                     SYMBOL,
-                    round * 500 + i + 1,
+                    first + i,
                     Side::Bid,
                     FLOOR + 1_000 + ((round * 500 + i) % 4_000) as Ticks,
                     1,
                 )
             })
             .collect();
+        commands.extend((0..500).map(|i| cancel_order(1, SYMBOL, first + i)));
         send(&mut maker, &commands);
         std::thread::sleep(Duration::from_millis(2));
     }
+
+    // The flood cancels everything it rests, so it leaves no book behind. The
+    // second half of this test is about what a returning client is told, and
+    // that needs there to be something to tell: 500 orders across 500 distinct
+    // levels, left resting, with ids past everything the loop used.
+    let resting: Vec<Command> = (0..500)
+        .map(|i| {
+            limit_order(
+                1,
+                SYMBOL,
+                400_001 + i,
+                Side::Bid,
+                FLOOR + 1_000 + i as Ticks,
+                1,
+            )
+        })
+        .collect();
+    send(&mut maker, &resting);
+    std::thread::sleep(Duration::from_millis(50));
     sending.store(false, Ordering::Relaxed);
     let _ = drain.join();
 
-    // The silent one is gone; the venue did not queue for it forever.
+    // The venue did not queue for the silent one forever. It has two ways of
+    // refusing to, and takes whichever the client reaches first: shed for
+    // owing more than its budget, or restated because it fell behind the
+    // retention window, which drops the queue and sends the book afresh.
+    //
+    // Asserting on shedding alone is what this used to do, and it made the
+    // test a measurement of the operating system. A client that stops reading
+    // is not yet a client the venue is queueing for -- the kernel accepts the
+    // feed on its behalf first, and how much it accepts before the venue's own
+    // queue grows differs by platform and by tuning. On Windows the budget was
+    // reached and the session was shed; on Linux the autotuned buffers
+    // absorbed enough that the client lagged out of the window and was
+    // restated instead. Both are the venue declining to accumulate. Only one
+    // of them was being accepted.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while venue.sessions_hint() > 1 && Instant::now() < deadline {
+    while venue.overload_responses() == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        venue.sessions_hint() <= 1,
-        "the slow client was never shed, so its queue was unbounded"
+        venue.overload_responses() > 0,
+        "the venue neither shed nor restated a client that never read, \
+         so it was queueing for it without limit"
     );
     drop(silent);
 
