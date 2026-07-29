@@ -45,6 +45,8 @@ struct Running {
     address: String,
     stop: Arc<AtomicBool>,
     disciplined: Arc<AtomicUsize>,
+    grouping: Arc<AtomicUsize>,
+    counted: Arc<AtomicUsize>,
     /// Sessions the server held at its last pass. Only a hint: the test thread
     /// reads it while the server thread writes it.
     sessions: Arc<AtomicUsize>,
@@ -85,6 +87,10 @@ impl Running {
         let tracked = Arc::clone(&subscriptions);
         let disciplined = Arc::new(AtomicUsize::new(0));
         let overloads = Arc::clone(&disciplined);
+        let grouping = Arc::new(AtomicUsize::new(0));
+        let groups = Arc::clone(&grouping);
+        let counted = Arc::new(AtomicUsize::new(0));
+        let commands = Arc::clone(&counted);
 
         let thread = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
@@ -96,6 +102,8 @@ impl Running {
                     (metrics.sessions_shed() + metrics.subscriptions_restated()) as usize,
                     Ordering::Relaxed,
                 );
+                groups.store(metrics.groups() as usize, Ordering::Relaxed);
+                commands.store(metrics.commands() as usize, Ordering::Relaxed);
                 // Nothing to do until a socket is readable. A deployed venue
                 // busy-polls a pinned core here; a test does not need to.
                 std::thread::sleep(Duration::from_micros(200));
@@ -108,8 +116,22 @@ impl Running {
             sessions,
             subscriptions,
             disciplined,
+            grouping,
+            counted,
             thread: Some(thread),
         }
+    }
+
+    /// Groups the venue has committed, and commands inside them.
+    ///
+    /// The ratio is the whole durability argument: one group is one journal
+    /// sync, so a client that hands the venue a hundred orders in one write pays
+    /// for one sync rather than a hundred.
+    fn grouping(&self) -> (usize, usize) {
+        (
+            self.grouping.load(Ordering::Relaxed),
+            self.counted.load(Ordering::Relaxed),
+        )
     }
 
     fn sessions_hint(&self) -> usize {
@@ -1269,4 +1291,126 @@ fn connection_churn_does_not_grow_the_subscriber_index() {
             );
         }
     }
+}
+
+/// Many orders in one write are committed as one group.
+///
+/// This is the property every durability number in the README rests on. One
+/// group is one journal sync, so a client handing the venue a hundred orders in
+/// a single write pays for one sync rather than a hundred — measured at 412 ns
+/// per command in a group of 16,384 against 3.06 ms alone. Nothing pinned it,
+/// which meant a change that quietly committed per command would have kept every
+/// test passing while making the venue thousands of times slower to acknowledge.
+///
+/// The API is batch-shaped already: a command is a fixed 64 bytes and the send
+/// path takes a slice, so batching is what a client does by default rather than
+/// a mode it opts into.
+#[test]
+fn a_batch_written_at_once_commits_as_one_group() {
+    const ORDERS: u64 = 200;
+    let venue = Running::start();
+    let mut client = venue.connect();
+
+    // One order first, on its own, so the session is attributed and the
+    // connection handshake is not counted in the batch below.
+    send(
+        &mut client,
+        &[limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1)],
+    );
+    let _ = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::Received)
+    });
+    let (groups_before, commands_before) = venue.grouping();
+
+    // The batch: one write, many orders.
+    let batch: Vec<Command> = (0..ORDERS)
+        .map(|i| limit_order(1, SYMBOL, 100 + i, Side::Bid, FLOOR + 1_000 + i as Ticks, 1))
+        .collect();
+    send(&mut client, &batch);
+    let events = collect_until(&mut client, Duration::from_secs(10), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Received as u8)
+            .count()
+            >= ORDERS as usize
+    });
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::Received as u8)
+            .count(),
+        ORDERS as usize,
+        "not every order in the batch was acknowledged"
+    );
+
+    let (groups_after, commands_after) = venue.grouping();
+    let groups = groups_after - groups_before;
+    let commands = commands_after - commands_before;
+    assert_eq!(
+        commands, ORDERS as usize,
+        "the venue saw {commands} commands for a batch of {ORDERS}"
+    );
+    // A pass is bounded, so a large batch may span a few of them -- the point is
+    // that it is nothing like one group per command.
+    assert!(
+        groups < 10,
+        "a batch of {ORDERS} took {groups} groups, so it is committing per \
+         command rather than per batch"
+    );
+    assert!(
+        commands / groups.max(1) > 20,
+        "only {} commands per group; batching is not reaching the journal",
+        commands / groups.max(1)
+    );
+}
+
+/// A batch is not atomic, and that is deliberate.
+///
+/// Each order in a batch stands or falls on its own: one refused for balance or
+/// a duplicate ID does not take the others down with it. All-or-nothing sounds
+/// safer and is worse here — a market maker requoting a book wants the quotes
+/// that are fine to rest, not to have the whole requote rejected because one
+/// price moved. Anyone wanting atomicity can send one order and wait.
+#[test]
+fn one_bad_order_in_a_batch_does_not_take_the_others_with_it() {
+    let venue = Running::start();
+    let mut client = venue.connect();
+
+    let batch = vec![
+        limit_order(1, SYMBOL, 500, Side::Bid, 10_050, 1),
+        // Quantity zero: refused on its own terms.
+        limit_order(1, SYMBOL, 501, Side::Bid, 10_050, 0),
+        limit_order(1, SYMBOL, 502, Side::Bid, 10_060, 1),
+    ];
+    send(&mut client, &batch);
+
+    // Waits for the outcomes, not the acknowledgements. Stopping once three
+    // commands have been answered catches the two acks plus the refusal and
+    // misses the second order coming to rest, which is the thing being checked.
+    let events = collect_until(&mut client, Duration::from_secs(10), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Resting as u8)
+            .count()
+            >= 2
+            && seen.iter().any(|e| e.kind == EventKind::Rejected as u8)
+    });
+
+    let rejected: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Rejected as u8)
+        .collect();
+    assert_eq!(rejected.len(), 1, "expected one refusal: {events:?}");
+    assert_eq!(rejected[0].order_id, 501);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::Resting as u8 && e.order_id == 500),
+        "the order before the bad one did not rest: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::Resting as u8 && e.order_id == 502),
+        "the order after the bad one did not rest: {events:?}"
+    );
 }
