@@ -396,7 +396,16 @@ fn a_client_that_never_reads_is_dropped_instead_of_growing_the_venue() {
     let venue = Running::start();
 
     // A silent client: connected, attributed an account, then never reading.
+    //
+    // Its receive buffer is pinned small for the same reason as in the
+    // shedding test below: a client that stops calling `read` is not yet a
+    // client the venue is queueing for, because its kernel goes on accepting
+    // the feed on its behalf, and how much it accepts before the venue's own
+    // queue grows is a property of the platform rather than of this venue.
     let mut silent = venue.connect();
+    SockRef::from(&silent)
+        .set_recv_buffer_size(16 * 1024)
+        .unwrap();
     send(
         &mut silent,
         &[limit_order(3, SYMBOL, 9_001, Side::Bid, 10_050, 1)],
@@ -404,60 +413,115 @@ fn a_client_that_never_reads_is_dropped_instead_of_growing_the_venue() {
     // Subscribed to the public feed, so a backlog builds for it.
     watch_public(&mut silent, 3);
 
-    // A well-behaved client generates far more feed than the window holds, and
-    // reads the whole time. It must not be shed.
-    let mut busy = venue.connect();
-    watch_public(&mut busy, 1);
-    let mut reader = busy.try_clone().unwrap();
+    // A well-behaved subscriber: follows the same feed and reads it, nothing
+    // else. It must not be shed.
+    //
+    // It generates none of the load. Having one client both send the orders
+    // and follow the feed they produce makes it its own worst subscriber --
+    // every order it sends is an event it then has to read, and past a certain
+    // rate it falls behind for reasons that have nothing to do with the
+    // policy under test. It was shed that way while this test was being
+    // written, which reads exactly like the failure the test exists to catch.
+    let mut watcher = venue.connect();
+    watch_public(&mut watcher, 1);
+    let mut reader = watcher.try_clone().unwrap();
     let writing = Arc::new(AtomicBool::new(true));
     let still_writing = Arc::clone(&writing);
     let drain = std::thread::spawn(move || {
         let mut seen = 0_usize;
+        // Whether the loop ended because the feed stopped rather than because
+        // it was asked to. That distinction is the assertion below: a reader
+        // that keeps up must not be cut off.
+        let mut cut_off = false;
+        // One buffer, reused. Allocating per read made this reader slow enough
+        // to fall behind the feed it is meant to be keeping up with.
+        let mut batch = Vec::new();
         while still_writing.load(Ordering::Relaxed) {
-            let mut batch = Vec::new();
+            batch.clear();
             if read_events(&mut reader, 1, &mut batch).is_err() || batch.is_empty() {
+                cut_off = true;
                 break;
             }
             seen += batch.len();
         }
-        seen
+        (seen, cut_off)
     });
 
-    // Enough backlog to pass the bound comfortably: the cap is one retention
-    // window in bytes, and each order produces about three events.
-    const ROUNDS: u64 = 60;
+    // The load, from a client of its own that follows no feed and drains its
+    // acknowledgements so it never becomes a slow client itself.
+    let mut busy = venue.connect();
+    let mut acks = busy.try_clone().unwrap();
+    let sending = Arc::new(AtomicBool::new(true));
+    let still_sending = Arc::clone(&sending);
+    let ack_drain = std::thread::spawn(move || {
+        let mut scratch = Vec::new();
+        while still_sending.load(Ordering::Relaxed) {
+            scratch.clear();
+            if read_events(&mut acks, 1, &mut scratch).is_err() || scratch.is_empty() {
+                break;
+            }
+        }
+    });
+
+    // Each round rests 1,000 orders and cancels them again. Resting alone
+    // cannot produce an unbounded feed: the instrument holds 65,536 orders and
+    // rejects the rest, and a rejection goes to the client that sent it rather
+    // than to the book channel, so the feed a subscriber sees stops however
+    // long the loop runs. Cancelling as we go takes that ceiling off.
+    //
+    // 100 rounds is 200,000 events. Sized between two bounds rather than as
+    // large as possible: enough that the silent client falls out of the
+    // 32,768-event window once its kernel has taken its fill, and not so much
+    // that the watcher above cannot stay with it. Overshooting sheds the
+    // watcher, which is the failure this test exists to catch, reported
+    // against a venue that did nothing wrong.
+    const ROUNDS: u64 = 100;
     for round in 0..ROUNDS {
-        let commands: Vec<Command> = (0..1_000)
+        let first = round * 1_000 + 1;
+        let mut commands: Vec<Command> = (0..1_000)
             .map(|i| {
                 limit_order(
                     1,
                     SYMBOL,
-                    round * 1_000 + i + 1,
+                    first + i,
                     Side::Bid,
                     FLOOR + 1_000 + ((round * 1_000 + i) % 4_000) as Ticks,
                     1,
                 )
             })
             .collect();
+        commands.extend((0..1_000).map(|i| cancel_order(1, SYMBOL, first + i)));
         send(&mut busy, &commands);
     }
+    sending.store(false, Ordering::Relaxed);
+    let _ = ack_drain.join();
     writing.store(false, Ordering::Relaxed);
-    let received = drain.join().unwrap();
-    assert!(
-        received > RETAINED,
-        "the reading client only got {received} events, so the venue never \
-         produced enough backlog to shed anyone"
-    );
+    let (received, cut_off) = drain.join().unwrap();
 
-    // The silent session is gone; the reading one is not.
+    // The venue refused to accumulate for the silent one -- by shedding it, or
+    // by restating a subscription that fell out of the retention window, which
+    // drops the queue and sends the book afresh. Both are the policy working,
+    // and which one a client meets depends on what its kernel absorbed first.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while venue.sessions_hint() > 1 && Instant::now() < deadline {
+    while venue.overload_responses() == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(
-        venue.sessions_hint(),
-        1,
-        "the silent client was not shed, so its queue was unbounded"
+    assert!(
+        venue.overload_responses() > 0,
+        "the venue neither shed nor restated a client that never read, so it \
+         was queueing for it without limit"
+    );
+
+    // And the one that kept reading is still here. This is the half that
+    // matters most: a bound on the silent client is only worth having if it
+    // does not also punish a client that is keeping up. Pinning the venue's
+    // send buffer to make shedding prompt was tried and reverted for failing
+    // exactly this, on a loaded machine, against a reader lagging by
+    // milliseconds.
+    assert!(
+        !cut_off && received > 0,
+        "the reading client was cut off after {received} events, so the venue \
+         punished a client that was keeping up"
     );
 
     // And the venue still trades.

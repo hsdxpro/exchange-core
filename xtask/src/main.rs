@@ -18,6 +18,23 @@ fn run(args: &[&str]) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// The whole suite, with the gateway's tests held to one at a time.
+///
+/// Everything in `bx-gateway`'s test directory binds a port, and most of it
+/// spawns a venue process or the load binary alongside. Run in parallel on a
+/// machine with cores to spare that is fine; run in parallel on a shared
+/// two-core runner it is a queue, and the symptoms are not obviously about
+/// contention -- a loopback connect that times out after twenty seconds, a
+/// venue that takes longer to print `listening` than the test waited. Both
+/// were seen in CI, on tests that were not broken.
+///
+/// The rest of the workspace is compute, not ports and processes, and keeps
+/// its parallelism.
+fn tests() -> bool {
+    run(&["test", "--workspace", "--exclude", "bx-gateway"])
+        && run(&["test", "-p", "bx-gateway", "--", "--test-threads=1"])
+}
+
 fn gate() -> bool {
     run(&["fmt", "--all", "--", "--check"])
         && run(&[
@@ -28,7 +45,7 @@ fn gate() -> bool {
             "-D",
             "warnings",
         ])
-        && run(&["test", "--workspace"])
+        && tests()
 }
 
 fn main() -> ExitCode {
@@ -36,7 +53,7 @@ fn main() -> ExitCode {
 
     let ok = match task.as_str() {
         "gate" => gate(),
-        "test" => run(&["test", "--workspace"]),
+        "test" => tests(),
         "e2e" => run(&[
             "test",
             "-p",
