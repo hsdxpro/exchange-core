@@ -361,7 +361,7 @@ fn a_standalone_venue_killed_mid_trading_recovers_everything_on_restart() {
         ],
     );
     assert!(
-        venue.wait_for("listening", Duration::from_secs(20)),
+        venue.wait_for("listening", Duration::from_secs(60)),
         "the venue never came up"
     );
 
@@ -397,7 +397,7 @@ fn a_standalone_venue_killed_mid_trading_recovers_everything_on_restart() {
         "the restarted venue never reported recovering its journal"
     );
     assert!(
-        restarted.wait_for("listening", Duration::from_secs(20)),
+        restarted.wait_for("listening", Duration::from_secs(60)),
         "the restarted venue never started serving"
     );
 
@@ -475,7 +475,7 @@ fn a_dead_follower_neither_stops_the_leader_nor_stays_gone() {
         ],
     );
     assert!(
-        leader.wait_for("listening", Duration::from_secs(20)),
+        leader.wait_for("listening", Duration::from_secs(60)),
         "the leader never came up"
     );
 
@@ -581,7 +581,7 @@ fn a_corrupt_journal_stops_the_venue_before_it_serves() {
         ],
     );
     assert!(
-        venue.wait_for("listening", Duration::from_secs(20)),
+        venue.wait_for("listening", Duration::from_secs(60)),
         "the venue never came up"
     );
     let mut client = connect("127.0.0.1:7505");

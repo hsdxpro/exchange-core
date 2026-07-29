@@ -266,7 +266,7 @@ fn a_promoted_node_recovers_what_the_dead_leader_acknowledged() {
         ],
     );
     assert!(
-        leader.wait_for("listening", Duration::from_secs(20)),
+        leader.wait_for("listening", Duration::from_secs(60)),
         "the first leader never came up"
     );
 
@@ -314,7 +314,7 @@ fn a_promoted_node_recovers_what_the_dead_leader_acknowledged() {
         ],
     );
     assert!(
-        promoted.wait_for("listening", Duration::from_secs(40)),
+        promoted.wait_for("listening", Duration::from_secs(90)),
         "the promoted node never started serving"
     );
 
@@ -732,9 +732,15 @@ fn symbols_partition_across_processes_with_no_shared_state() {
             "127.0.0.1:7482",
         ],
     );
+    // Sixty seconds to start two processes is absurd on the desk this was
+    // written on, where it takes well under one. It is not absurd on a shared
+    // runner starting both at once with a cold page cache, which is where the
+    // old twenty-second wait ran out and reported a healthy venue as broken. A
+    // generous timeout costs nothing when the code is right and seconds when it
+    // is wrong; a tight one buys nothing and fails on someone else's machine.
     assert!(
-        first.wait_for("listening", Duration::from_secs(20))
-            && second.wait_for("listening", Duration::from_secs(20)),
+        first.wait_for("listening", Duration::from_secs(60))
+            && second.wait_for("listening", Duration::from_secs(60)),
         "a partition never came up"
     );
 
