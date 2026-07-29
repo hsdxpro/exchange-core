@@ -803,10 +803,22 @@ impl<S: LogStorage> Server<S> {
         &self.metrics
     }
 
+    /// The session a pass is currently working on.
+    ///
+    /// Every caller reaches this while handling commands that session just
+    /// sent, so the slot is occupied for a reason stronger than the token being
+    /// fresh: a session marked closed keeps its slot until [`Self::drop_closed`]
+    /// runs, and that happens once, at the end of the pass, after all of this.
+    /// Nothing else empties a slot. So a closed session is still `Some` here,
+    /// and a slot freed on one pass cannot be reused until the next.
+    ///
+    /// That is the invariant this panic guards. If a future change frees a slot
+    /// mid-pass, this is where it surfaces -- immediately, rather than as a
+    /// session quietly handling somebody else's orders.
     fn session_at(&mut self, index: usize) -> &mut Session {
         self.sessions[index]
             .as_mut()
-            .expect("a ready token names a live session")
+            .expect("a slot is only emptied by drop_closed, which runs after this")
     }
 
     /// Starts a session following a channel, in both the session and the index.
