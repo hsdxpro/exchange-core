@@ -1,3 +1,5 @@
-# `cargo x` runs the local task runner. There is no CI; this is it.
+# `cargo x` runs the whole gate: format, clippy with warnings denied, then the
+# suite. CI runs this same command rather than a list of its own, so "green
+# locally" and "green on a runner" cannot drift into two definitions.
 [alias]
 x = "run --quiet -p xtask --"

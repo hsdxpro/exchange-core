@@ -1,0 +1,82 @@
+name: ci
+
+# `cargo x` is the gate this repository has always used: format, clippy with
+# warnings denied, then the whole suite. Running it here means the claim is
+# checked on machines nobody here owns.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: gate / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # Generous: the suite spawns real venue and replica processes, kills them
+    # mid-session and waits for a new leader. Those tests are patient by
+    # design, and a shared runner is slower than the desk they were written on.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-toolchain.toml` pins the version, so this installs exactly what
+      # the repository was measured with rather than whatever stable is today.
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+
+      # Downloads only, never `target/`. The lockfile holds 156 crates, so the
+      # download is worth caching; a stale build directory is not worth the
+      # class of failure it invites.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Format, clippy -D warnings, and the full suite -- the same single
+      # command a contributor runs before pushing. One definition of "green",
+      # not two that can drift apart.
+      - name: cargo x
+        run: cargo x
+
+  # The failover and machine-down suites bind fixed ports and spawn binaries.
+  # They are part of `cargo x` above; this runs them alone as well, because a
+  # port collision or a slow election looks like a flake until you can see
+  # whether they fail on their own or only alongside everything else.
+  multi-process:
+    name: failover and recovery, isolated
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Failover
+        run: cargo test -p bx-gateway --test failover -- --nocapture
+      - name: Machine down and restart
+        run: cargo test -p bx-gateway --test machine_down -- --nocapture
+      - name: Shipped binaries against shipped configuration
+        run: cargo test -p bx-gateway --test shipped_binaries -- --nocapture

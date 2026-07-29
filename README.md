@@ -6,7 +6,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/rust-stable-000000?logo=rust" alt="Rust">
+  <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
   <img src="https://img.shields.io/badge/tests-325%20passing-success" alt="325 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
@@ -35,7 +36,9 @@ table in about seven seconds.
 
 ## Quick start
 
-Needs `rustup` and nothing else. `xtask` is the task runner; there is no CI.
+Needs `rustup` and nothing else. `xtask` is the task runner, and CI runs the
+same `cargo x` on Linux and Windows rather than a list of its own -- so
+green locally and green on a runner cannot become two different things.
 
 ```bash
 cargo x
