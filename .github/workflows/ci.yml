@@ -34,10 +34,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # `rust-toolchain.toml` pins the version, so this installs exactly what
-      # the repository was measured with rather than whatever stable is today.
-      - name: Show toolchain
-        run: rustc --version && cargo --version
+      # The version comes from `rust-toolchain.toml`; the components are asked
+      # for explicitly. `rust-toolchain.toml` lists them, but rustup only
+      # acts on that when it installs the toolchain -- if the runner image
+      # already ships one, the manifest's components are never added, and the
+      # first `cargo fmt` fails with "not installed for the toolchain".
+      - name: Toolchain
+        run: |
+          rustup component add rustfmt clippy
+          rustc --version && cargo --version && cargo fmt --version
 
       # Downloads only, never `target/`. The lockfile holds 156 crates, so the
       # download is worth caching; a stale build directory is not worth the
