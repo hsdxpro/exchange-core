@@ -137,18 +137,45 @@ fn replication_sockets_carry_bounded_buffers() {
     let log = ReplicatedLog::connect(MemoryLog::new(), &[address], ACK_TIMEOUT, 1).unwrap();
     let (send, recv) = log.follower_buffer_sizes().expect("socket query failed");
 
-    // The configured value is 4 MiB. Windows reports back what was set; Linux
-    // reports double, accounting its own bookkeeping. Both bounds matter: the
-    // floor catches the configuration being silently dropped -- an unset
-    // Windows socket reports its 64 KiB nominal default while dynamically
-    // absorbing whatever is written, which is exactly the unbounded state this
-    // guards against -- and the ceiling catches it being set absurdly large.
+    // The configured value is 4 MiB, and comparing against that number
+    // directly is wrong: an operating system is free to grant less. Linux caps
+    // any request at `net.core.wmem_max`, which is 208 KiB by default, so a
+    // machine that has not been tuned reports 425,984 -- the cap, doubled for
+    // its own bookkeeping -- and the buffer is bounded exactly as intended,
+    // more tightly than asked. Demanding 4 MiB called that a failure. What
+    // this test is for is the opposite state, a buffer left to grow on its
+    // own, and a clamped request is not that.
+    //
+    // So the expectation is discovered rather than assumed: ask a scratch
+    // socket for the same bound and see what this machine grants. The
+    // replication sockets must have been treated the same way. That still
+    // catches the configuration being dropped -- a socket nobody set reports
+    // its default, which is not the clamped value -- without hard-coding a
+    // number that belongs to the kernel.
     let configured = 4 << 20;
-    for (name, size) in [("send", send), ("recv", recv)] {
+    let probe = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .unwrap();
+    probe.set_send_buffer_size(configured).unwrap();
+    probe.set_recv_buffer_size(configured).unwrap();
+    let granted = (
+        probe.send_buffer_size().unwrap(),
+        probe.recv_buffer_size().unwrap(),
+    );
+
+    for (name, size, expected) in [("send", send, granted.0), ("recv", recv, granted.1)] {
+        assert_eq!(
+            size, expected,
+            "the {name} buffer reports {size} bytes where this machine grants \
+             {expected} for the same request; the explicit bound was not applied"
+        );
         assert!(
-            size >= configured && size <= configured * 2,
+            size <= configured * 2,
             "the {name} buffer reports {size} bytes against a configured \
-             {configured}; the explicit bound was not applied"
+             {configured}; the bound is larger than anything asked for"
         );
     }
     accepted.join().unwrap();
