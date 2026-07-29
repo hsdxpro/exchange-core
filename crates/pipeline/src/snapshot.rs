@@ -20,6 +20,7 @@
 use crate::accounts::Balance;
 use bx_protocol::{
     SNAPSHOT_MAGIC, Sequence, SnapshotBalance, SnapshotHeader, SnapshotOrder, SnapshotOrderIdMark,
+    SnapshotStoppedAccount, SnapshotSymbolState,
 };
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -70,6 +71,14 @@ pub struct Snapshot {
     /// the snapshot and start accepting them again -- which is exactly the
     /// replayed order it exists to refuse.
     pub order_id_marks: Vec<SnapshotOrderIdMark>,
+    /// Symbols whose trading state is not the default, sorted.
+    ///
+    /// An operator's halt is venue state and has to survive a recovery. A venue
+    /// that came back trading a symbol somebody had stopped would be the worst
+    /// kind of recovery bug: it looks like success.
+    pub symbol_states: Vec<SnapshotSymbolState>,
+    /// Accounts stopped from opening new risk, sorted.
+    pub stopped_accounts: Vec<SnapshotStoppedAccount>,
 }
 
 impl Snapshot {
@@ -82,12 +91,16 @@ impl Snapshot {
             orders: self.orders.len() as u64,
             balances: self.balances.len() as u64,
             order_id_marks: self.order_id_marks.len() as u64,
+            symbol_states: self.symbol_states.len() as u64,
+            stopped_accounts: self.stopped_accounts.len() as u64,
             _pad: [0; 8],
         };
         out.write_all(header.as_bytes())?;
         out.write_all(self.orders.as_bytes())?;
         out.write_all(self.balances.as_bytes())?;
         out.write_all(self.order_id_marks.as_bytes())?;
+        out.write_all(self.symbol_states.as_bytes())?;
+        out.write_all(self.stopped_accounts.as_bytes())?;
         Ok(())
     }
 
@@ -127,7 +140,26 @@ impl Snapshot {
         if rest.len() < mark_bytes {
             return Err(SnapshotError::Truncated);
         }
-        let Ok(order_id_marks) = <[SnapshotOrderIdMark]>::ref_from_bytes(&rest[..mark_bytes])
+        let (marks, rest) = rest.split_at(mark_bytes);
+        let Ok(order_id_marks) = <[SnapshotOrderIdMark]>::ref_from_bytes(marks) else {
+            return Err(SnapshotError::Truncated);
+        };
+
+        let state_bytes = header.symbol_states as usize * size_of::<SnapshotSymbolState>();
+        if rest.len() < state_bytes {
+            return Err(SnapshotError::Truncated);
+        }
+        let (states, rest) = rest.split_at(state_bytes);
+        let Ok(symbol_states) = <[SnapshotSymbolState]>::ref_from_bytes(states) else {
+            return Err(SnapshotError::Truncated);
+        };
+
+        let stopped_bytes = header.stopped_accounts as usize * size_of::<SnapshotStoppedAccount>();
+        if rest.len() < stopped_bytes {
+            return Err(SnapshotError::Truncated);
+        }
+        let Ok(stopped_accounts) =
+            <[SnapshotStoppedAccount]>::ref_from_bytes(&rest[..stopped_bytes])
         else {
             return Err(SnapshotError::Truncated);
         };
@@ -137,6 +169,8 @@ impl Snapshot {
             orders: orders.to_vec(),
             balances: balances.to_vec(),
             order_id_marks: order_id_marks.to_vec(),
+            symbol_states: symbol_states.to_vec(),
+            stopped_accounts: stopped_accounts.to_vec(),
         })
     }
 }
@@ -186,6 +220,12 @@ mod tests {
                 asset: 2,
                 _pad: [0; 4],
             }],
+            symbol_states: vec![SnapshotSymbolState {
+                symbol: 1,
+                state: 1,
+                _pad: [0; 3],
+            }],
+            stopped_accounts: vec![SnapshotStoppedAccount { account: 9 }],
             order_id_marks: vec![
                 SnapshotOrderIdMark {
                     account: 7,

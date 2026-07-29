@@ -389,6 +389,12 @@ pub struct Server<S: LogStorage> {
     /// How fast one session may send. `None` disables the check entirely, so a
     /// venue that does not want it pays nothing for it.
     rate: Option<RateLimit>,
+    /// The one account allowed to halt a symbol or stop another account.
+    ///
+    /// `None` means nobody can, which is the default: a venue whose kill switch
+    /// is reachable because a configuration line was forgotten is worse than one
+    /// that has none, because it reads the same as a venue that meant to have it.
+    admin: Option<AccountId>,
     /// One allowance per account rather than per connection, so opening ten
     /// sessions does not buy ten times the rate. Held here rather than on the
     /// session for that reason, and dropped when an account's last session goes,
@@ -482,6 +488,7 @@ impl<S: LogStorage> Server<S> {
             snapshots: None,
             refused: 0,
             mode: Mode::Open,
+            admin: None,
             credentials: Credentials::new(),
             rejected_proofs: 0,
             throttled: 0,
@@ -509,6 +516,15 @@ impl<S: LogStorage> Server<S> {
     /// Bounds how fast one session may send. Unset means unlimited.
     pub const fn rate_limit(&mut self, limit: RateLimit) {
         self.rate = Some(limit);
+    }
+
+    /// Names the account permitted to halt symbols and stop other accounts.
+    ///
+    /// Checked in the gateway, before sequencing, so a command from anybody else
+    /// never reaches the journal -- the same placement as authentication and rate
+    /// limiting, and for the same reason.
+    pub const fn administrator(&mut self, account: AccountId) {
+        self.admin = Some(account);
     }
 
     /// Stamps arrival and match times onto commands and acknowledgements.
@@ -735,6 +751,30 @@ impl<S: LogStorage> Server<S> {
                 let command = self.inbound[cursor];
                 if command.is_session_control() {
                     self.apply_control(index, &command, account);
+                } else if command.account != account && !command.is_administrative() {
+                    // A session acts for exactly one account: the one it proved,
+                    // or in an open venue the one its first command claimed.
+                    //
+                    // Without this, authentication established identity at
+                    // connect and then bound nothing to it -- a session holding
+                    // one valid credential could put any account in an order and
+                    // spend that account's balance. Refused here, before
+                    // sequencing, so it never reaches the journal.
+                    //
+                    // Administrative commands are the exception by design: a halt
+                    // names the symbol and a kill switch names its subject, and
+                    // the check that they came from the administrator is below.
+                    let refusal = refused_locally(&command, RejectReason::NotPermitted);
+                    let session = self.session_at(index);
+                    encode(&refusal, &mut session.outbox);
+                    self.owes_bytes(index);
+                } else if command.is_administrative() && self.admin != Some(account) {
+                    // Refused here rather than in the pipeline, so an
+                    // unauthorised halt is never sequenced and never replayed.
+                    let refusal = refused_locally(&command, RejectReason::NotPermitted);
+                    let session = self.session_at(index);
+                    encode(&refusal, &mut session.outbox);
+                    self.owes_bytes(index);
                 } else {
                     self.inbound[kept] = command;
                     kept += 1;

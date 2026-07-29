@@ -18,8 +18,8 @@ use book::{Execution, Outcome};
 use bx_journal::{Journal, LogStorage};
 use bx_protocol::{
     AccountId, ChannelKind, Command, CommandKind, Event, EventKind, OrderId, Quantity,
-    RejectReason, Sequence, Side, SnapshotBalance, SnapshotOrder, SnapshotOrderIdMark, SymbolId,
-    Ticks, TimeInForce,
+    RejectReason, Sequence, Side, SnapshotBalance, SnapshotOrder, SnapshotOrderIdMark,
+    SnapshotStoppedAccount, SnapshotSymbolState, SymbolId, Ticks, TimeInForce, TradingState,
 };
 use fastmap::FastMap;
 use instrument::{Instrument, Instruments};
@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Every reason an order can be refused, so a count can be reported against a
 /// name rather than a number. Listing them costs a compile-time check that
 /// nothing was forgotten, which a `0..N` loop over discriminants would not give.
-const REASONS: [RejectReason; 19] = [
+const REASONS: [RejectReason; 22] = [
     RejectReason::None,
     RejectReason::UnknownAccount,
     RejectReason::UnknownSymbol,
@@ -49,10 +49,24 @@ const REASONS: [RejectReason; 19] = [
     RejectReason::NotAuthenticated,
     RejectReason::RateLimited,
     RejectReason::OrderIdNotIncreasing,
+    RejectReason::SymbolNotTrading,
+    RejectReason::AccountNotTrading,
+    RejectReason::NotPermitted,
 ];
 
 /// Slots in the reject table, one per reason.
-pub const REJECT_REASONS: usize = REASONS.len();
+///
+/// Taken from the protocol rather than from `REASONS.len()`. This array is for
+/// *reporting* counts against names and a reason missing from it merely goes
+/// unreported, but the table is indexed by discriminant -- so sizing it here
+/// meant a reason appended to the enum and forgotten in this list panicked on
+/// the first refusal that used it.
+pub const REJECT_REASONS: usize = RejectReason::COUNT;
+
+const _: () = assert!(
+    REASONS.len() == REJECT_REASONS,
+    "a reason was added to the protocol but not to REASONS, so its count would      never be reported"
+);
 
 /// The books, in a table indexed by symbol.
 ///
@@ -199,6 +213,20 @@ pub struct Exchange<S: LogStorage> {
     /// that alone would forget every ID from before and start accepting them
     /// again.
     highest_order_id: FastMap<AccountId, OrderId>,
+    /// Whether each symbol accepts new orders, indexed by symbol like the books.
+    ///
+    /// A table rather than a map because it is read on every order and the
+    /// symbol is already an index. `Trading` is the default, so a symbol nobody
+    /// has touched behaves exactly as before this existed.
+    symbol_state: Vec<TradingState>,
+    /// Accounts stopped from opening new risk. The kill switch.
+    ///
+    /// Holds only the stopped ones, so the common case is one lookup that finds
+    /// nothing and the table stays empty on a healthy venue. It is in the
+    /// snapshot for the same reason the order-ID marks are: an operator's halt
+    /// must survive a recovery, or the venue comes back letting through exactly
+    /// what was stopped.
+    stopped_accounts: FastMap<AccountId, ()>,
     events: Vec<Event>,
     /// Set once [`Self::commit`] has handed the current batch's events out, so
     /// the next enqueue knows to start a fresh batch rather than append to one
@@ -228,6 +256,8 @@ impl<S: LogStorage> Exchange<S> {
             matched_ns: 0,
             resting_per_account: FastMap::default(),
             highest_order_id: FastMap::default(),
+            symbol_state: Vec::new(),
+            stopped_accounts: FastMap::default(),
             events: Vec::new(),
             released: true,
             event_sequence: 0,
@@ -457,11 +487,34 @@ impl<S: LogStorage> Exchange<S> {
             .map(|(&account, &highest)| SnapshotOrderIdMark { account, highest })
             .collect();
         order_id_marks.sort_unstable_by_key(|mark| mark.account);
+        // Only the symbols that are not in the default state, so a venue with
+        // nothing halted writes nothing here. Sorted, like everything else in a
+        // snapshot, so the same state writes the same bytes.
+        let mut symbol_states: Vec<SnapshotSymbolState> = self
+            .symbol_state
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| **state != TradingState::default())
+            .map(|(symbol, state)| SnapshotSymbolState {
+                symbol: symbol as SymbolId,
+                state: *state as u8,
+                _pad: [0; 3],
+            })
+            .collect();
+        symbol_states.sort_unstable_by_key(|record| record.symbol);
+        let mut stopped_accounts: Vec<SnapshotStoppedAccount> = self
+            .stopped_accounts
+            .keys()
+            .map(|&account| SnapshotStoppedAccount { account })
+            .collect();
+        stopped_accounts.sort_unstable_by_key(|record| record.account);
         Snapshot {
             sequence: self.journal.next_sequence(),
             orders,
             balances,
             order_id_marks,
+            symbol_states,
+            stopped_accounts,
         }
     }
 
@@ -473,6 +526,20 @@ impl<S: LogStorage> Exchange<S> {
     pub fn restore(&mut self, snapshot: &Snapshot) {
         for mark in &snapshot.order_id_marks {
             self.highest_order_id.insert(mark.account, mark.highest);
+        }
+        for record in &snapshot.symbol_states {
+            let Some(state) = TradingState::from_wire(u64::from(record.state)) else {
+                Self::violation();
+                continue;
+            };
+            let index = record.symbol as usize;
+            if index >= self.symbol_state.len() {
+                self.symbol_state.resize(index + 1, TradingState::default());
+            }
+            self.symbol_state[index] = state;
+        }
+        for record in &snapshot.stopped_accounts {
+            self.stopped_accounts.insert(record.account, ());
         }
         for record in &snapshot.balances {
             self.accounts
@@ -536,6 +603,9 @@ impl<S: LogStorage> Exchange<S> {
                 command.deposit_asset(),
                 u128::from(command.quantity),
             ),
+            CommandKind::SetSymbolState => self.apply_symbol_state(&command),
+            CommandKind::SetAccountTrading => self.apply_account_trading(&command),
+            CommandKind::CancelAll => self.apply_cancel_all(&command),
             CommandKind::CancelReplace => {
                 // The replacement is only submitted if the original was
                 // actually cancelled. Replacing an order that does not exist
@@ -550,6 +620,83 @@ impl<S: LogStorage> Exchange<S> {
         }
     }
 
+    /// Whether a symbol currently accepts new orders.
+    #[must_use]
+    pub fn symbol_state(&self, symbol: SymbolId) -> TradingState {
+        self.symbol_state
+            .get(symbol as usize)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Whether an account may open new risk.
+    #[must_use]
+    pub fn account_may_trade(&self, account: AccountId) -> bool {
+        !self.stopped_accounts.contains_key(&account)
+    }
+
+    fn apply_symbol_state(&mut self, command: &Command) {
+        if self.instruments.get(command.symbol).is_none() {
+            self.reject(command, RejectReason::UnknownSymbol);
+            return;
+        }
+        let Some(state) = TradingState::from_wire(command.quantity) else {
+            self.reject(command, RejectReason::SymbolNotTrading);
+            return;
+        };
+        let index = command.symbol as usize;
+        if index >= self.symbol_state.len() {
+            self.symbol_state.resize(index + 1, TradingState::default());
+        }
+        self.symbol_state[index] = state;
+        self.push(command, EventKind::SymbolState, 0, command.quantity, 0, 0);
+    }
+
+    fn apply_account_trading(&mut self, command: &Command) {
+        if command.quantity == 0 {
+            self.stopped_accounts.insert(command.account, ());
+        } else {
+            self.stopped_accounts.remove(&command.account);
+        }
+        self.push(
+            command,
+            EventKind::AccountTrading,
+            0,
+            command.quantity,
+            0,
+            0,
+        );
+    }
+
+    /// Cancels everything an account has resting, on one symbol or all of them.
+    ///
+    /// Expanded into ordinary cancels so each one journals, publishes and
+    /// replays like any other -- the same reason cancel-on-disconnect is built
+    /// this way. A symbol of zero means every listed instrument, because zero is
+    /// not a valid symbol.
+    fn apply_cancel_all(&mut self, command: &Command) {
+        let symbols: Vec<SymbolId> = if command.symbol == 0 {
+            self.instruments.iter().map(|i| i.symbol).collect()
+        } else {
+            vec![command.symbol]
+        };
+        for symbol in symbols {
+            // Collected first: cancelling walks the same index this reads.
+            let orders: Vec<OrderId> = self
+                .open_orders_for(command.account, symbol)
+                .into_iter()
+                .map(|resting| resting.order)
+                .collect();
+            for order in orders {
+                let mut cancel = *command;
+                cancel.kind = CommandKind::Cancel as u8;
+                cancel.symbol = symbol;
+                cancel.order_id = order;
+                self.apply_cancel(&cancel);
+            }
+        }
+    }
+
     fn apply_new_order(&mut self, command: &Command) {
         let (Some(side), Some(tif)) = (command.side(), command.time_in_force()) else {
             self.reject(command, RejectReason::UnsupportedTimeInForce);
@@ -559,6 +706,18 @@ impl<S: LogStorage> Exchange<S> {
             self.reject(command, RejectReason::UnknownSymbol);
             return;
         };
+        // New risk only. A halted or cancel-only symbol still allows cancels and
+        // amends down, which are handled elsewhere -- a venue that stops an
+        // account from reducing its exposure is more dangerous than one that
+        // lets it trade.
+        if self.symbol_state(command.symbol) != TradingState::Trading {
+            self.reject(command, RejectReason::SymbolNotTrading);
+            return;
+        }
+        if !self.account_may_trade(command.account) {
+            self.reject(command, RejectReason::AccountNotTrading);
+            return;
+        }
         if command.quantity == 0 {
             self.reject(command, RejectReason::QuantityZero);
             return;
@@ -1229,6 +1388,55 @@ pub fn cancel_order(account: AccountId, symbol: SymbolId, order_id: OrderId) -> 
         account,
         symbol,
         order_id,
+        Side::Bid,
+        0,
+        0,
+        TimeInForce::GoodTillCancel,
+    )
+}
+
+/// Sets whether a symbol accepts new orders. Admin only.
+#[must_use]
+pub fn set_symbol_state(account: AccountId, symbol: SymbolId, state: TradingState) -> Command {
+    Command::new(
+        CommandKind::SetSymbolState,
+        account,
+        symbol,
+        0,
+        Side::Bid,
+        0,
+        state as u64,
+        TimeInForce::GoodTillCancel,
+    )
+}
+
+/// Stops or resumes an account's ability to open new risk. Admin only.
+#[must_use]
+pub fn set_account_trading(admin: AccountId, account: AccountId, may_trade: bool) -> Command {
+    let mut command = Command::new(
+        CommandKind::SetAccountTrading,
+        account,
+        0,
+        0,
+        Side::Bid,
+        0,
+        u64::from(may_trade),
+        TimeInForce::GoodTillCancel,
+    );
+    // The subject travels in `account`, which is what the pipeline acts on, so
+    // the sender is carried separately for the gateway's permission check.
+    command.replacement_id = admin;
+    command
+}
+
+/// Cancels everything an account has resting. `symbol` of zero means all.
+#[must_use]
+pub fn cancel_all(account: AccountId, symbol: SymbolId) -> Command {
+    Command::new(
+        CommandKind::CancelAll,
+        account,
+        symbol,
+        0,
         Side::Bid,
         0,
         0,

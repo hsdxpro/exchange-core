@@ -65,6 +65,7 @@ fn measurement_config() -> Config {
         listen: "127.0.0.1:7070".to_string(),
         journal: None,
         snapshot: None,
+        admin_account: None,
         target_recovery: Duration::from_secs(2),
         replay_rate: 7_600_000,
         retained_per_channel: 1 << 16,
@@ -128,6 +129,9 @@ fn run<S: LogStorage>(
         }
     }
     server.stamp_times(config.timestamps);
+    if let Some(admin) = config.admin_account {
+        server.administrator(admin);
+    }
     if config.timestamps {
         println!("stamping arrival and match times");
     }

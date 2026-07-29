@@ -248,13 +248,18 @@ fn a_second_client_sees_the_public_feed_of_the_first_clients_trading() {
     let mut watcher = venue.connect();
     watch_public(&mut watcher, 4);
 
+    // One connection per account. A session may act only for the account it is
+    // attributed to, so the taker needs its own -- which is what a real client
+    // does anyway.
+    let mut taker = venue.connect();
+
     send(
         &mut maker,
         &[limit_order(1, SYMBOL, 101, Side::Ask, 10_100, 5)],
     );
     // Give the maker's order time to rest before the taker crosses it.
     std::thread::sleep(Duration::from_millis(50));
-    send(&mut maker, &[market_order(2, SYMBOL, 201, Side::Bid, 5)]);
+    send(&mut taker, &[market_order(2, SYMBOL, 201, Side::Bid, 5)]);
 
     let mut seen = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);

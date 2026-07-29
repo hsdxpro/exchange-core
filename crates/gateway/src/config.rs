@@ -182,6 +182,12 @@ pub struct Config {
     /// Commands a second this machine replays at. Measured, not assumed.
     pub replay_rate: u64,
     pub retained_per_channel: usize,
+    /// The account permitted to halt a symbol or stop another account.
+    ///
+    /// Absent means no account can, which is the safe default: a kill switch
+    /// reachable because a line was forgotten reads exactly like one that was
+    /// meant to be there.
+    pub admin_account: Option<AccountId>,
     pub max_records_per_session: usize,
     /// Connections held at once. Beyond this the venue refuses rather than
     /// serving everyone slowly.
@@ -250,6 +256,7 @@ impl Config {
         let mut listen = None;
         let mut journal = None;
         let mut snapshot = None;
+        let mut admin_account = None;
         let mut target_recovery_ms = None;
         let mut replay_rate = None;
         let mut retained = None;
@@ -375,6 +382,7 @@ impl Config {
                 "target_recovery_ms" => target_recovery_ms = Some(number("target_recovery_ms")?),
                 "replay_rate" => replay_rate = Some(number("replay_rate")?),
                 "retained_per_channel" => retained = Some(number("retained_per_channel")?),
+                "admin_account" => admin_account = Some(number("admin_account")?),
                 "max_records_per_session" => max_records = Some(number("max_records_per_session")?),
                 "max_sessions" => max_sessions = Some(number("max_sessions")?),
                 "ack_timeout_ms" => ack_timeout_ms = Some(number("ack_timeout_ms")?),
@@ -595,6 +603,7 @@ impl Config {
             target_recovery: Duration::from_millis(target_recovery_ms),
             replay_rate,
             retained_per_channel: retained,
+            admin_account,
             max_records_per_session: usize::try_from(max_records)
                 .map_err(|_| ConfigError::whole_file("max_records_per_session is too large"))?,
             max_sessions: usize::try_from(max_sessions)

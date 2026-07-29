@@ -68,7 +68,21 @@ impl Running {
         Self::configured(authenticated, rate, false)
     }
 
+    /// A venue with an administrator, so the privileged commands are reachable.
+    fn start_with_admin(admin: u64) -> Self {
+        Self::build(true, None, false, Some(admin))
+    }
+
     fn configured(authenticated: bool, rate: Option<RateLimit>, timestamps: bool) -> Self {
+        Self::build(authenticated, rate, timestamps, None)
+    }
+
+    fn build(
+        authenticated: bool,
+        rate: Option<RateLimit>,
+        timestamps: bool,
+        admin: Option<u64>,
+    ) -> Self {
         let mut instruments = Instruments::new();
         instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000, 65_536));
         let mut server = Server::bind(
@@ -91,6 +105,9 @@ impl Running {
             server.rate_limit(rate);
         }
         server.stamp_times(timestamps);
+        if let Some(admin) = admin {
+            server.administrator(admin);
+        }
         for account in [ALICE, BOB] {
             for asset in [USD, BTC] {
                 server
@@ -861,5 +878,198 @@ fn every_order_in_one_group_shares_an_arrival_time() {
         "32 orders produced {} distinct arrival times, so the clock is being \
          read per command rather than per pass",
         stamps.len()
+    );
+}
+
+/// Proving who you are must also bind what you may act as.
+///
+/// Authentication established identity at connect and then nothing tied a
+/// command to it: a session that proved it held Alice's secret could put Bob's
+/// account in the `account` field of an order, and the pipeline reserved Bob's
+/// balance. That makes the whole handshake decorative -- anyone with any valid
+/// credential could trade every account on the venue.
+#[test]
+fn an_authenticated_session_cannot_act_for_another_account() {
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let events = authenticate(&mut client, ALICE, &ALICE_SECRET);
+    assert_eq!(
+        events.first().and_then(Event::kind),
+        Some(EventKind::Authenticated),
+        "Alice should have been let in"
+    );
+
+    // Alice, authenticated, sending an order that names Bob.
+    send(&mut client, &[order(BOB, 9_001, 10_050)]);
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| !seen.is_empty());
+
+    assert_eq!(
+        kinds(&events, EventKind::Received),
+        0,
+        "an order for another account was accepted: {events:?}"
+    );
+    let refusals: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Rejected as u8)
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "expected exactly one refusal: {events:?}"
+    );
+    assert_eq!(
+        refusals[0].reject_reason(),
+        Some(RejectReason::NotPermitted),
+        "refused, but not for acting as somebody else"
+    );
+
+    // And Alice can still trade as herself, so the rule bounds nothing else.
+    send(&mut client, &[order(ALICE, 9_002, 10_050)]);
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Received as u8)
+    });
+    assert_eq!(kinds(&events, EventKind::Received), 1);
+}
+
+/// The same rule in the open venue: a session may not change identity midway.
+///
+/// Without authentication a session is attributed from its first command, which
+/// is the venue trusting it. That is a measurement setting and documented as
+/// one -- but it must still mean *one* account per session, or the private
+/// channel and the rate-limit bucket belong to whoever the last command claimed.
+#[test]
+fn an_open_session_is_held_to_the_account_it_first_claimed() {
+    let venue = Running::start(false, None);
+    let mut client = venue.connect();
+
+    send(&mut client, &[order(ALICE, 100, 10_050)]);
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Received as u8)
+    });
+    assert_eq!(kinds(&events, EventKind::Received), 1);
+
+    // Waits for a refusal specifically. Stopping at the first event of any kind
+    // catches the trailing `Resting` from the order above and reports a pass or
+    // a failure depending on scheduling.
+    send(&mut client, &[order(BOB, 101, 10_050)]);
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Rejected as u8)
+    });
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8
+            && e.reject_reason() == Some(RejectReason::NotPermitted)),
+        "a session switched accounts midway: {events:?}"
+    );
+    assert_eq!(
+        kinds(&events, EventKind::Received),
+        0,
+        "the order for another account was also acknowledged: {events:?}"
+    );
+}
+
+/// Only the administrator may halt a symbol or stop an account.
+///
+/// The check sits in the gateway, before sequencing, so an unauthorised halt
+/// never reaches the journal and never replays. A venue where any client can
+/// halt the book has no kill switch, it has a denial of service.
+#[test]
+fn a_privileged_command_from_an_ordinary_account_is_refused() {
+    let venue = Running::start_with_admin(ALICE);
+    let mut client = venue.connect();
+    authenticate(&mut client, BOB, &BOB_SECRET);
+
+    send(
+        &mut client,
+        &[bx_pipeline::set_symbol_state(
+            BOB,
+            SYMBOL,
+            bx_protocol::TradingState::Halted,
+        )],
+    );
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Rejected as u8)
+    });
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8
+            && e.reject_reason() == Some(RejectReason::NotPermitted)),
+        "an ordinary account halted a symbol: {events:?}"
+    );
+
+    // The symbol is still trading: Bob can place an order.
+    send(&mut client, &[order(BOB, 1, 10_050)]);
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Received as u8)
+    });
+    assert_eq!(
+        kinds(&events, EventKind::Received),
+        1,
+        "the refused halt took effect anyway: {events:?}"
+    );
+}
+
+/// And the administrator's halt does take effect, end to end.
+#[test]
+fn the_administrator_can_halt_a_symbol_and_orders_stop() {
+    let venue = Running::start_with_admin(ALICE);
+    let mut admin = venue.connect();
+    authenticate(&mut admin, ALICE, &ALICE_SECRET);
+
+    let mut trader = venue.connect();
+    authenticate(&mut trader, BOB, &BOB_SECRET);
+    send(&mut trader, &[order(BOB, 10, 10_050)]);
+    let events = collect_until(&mut trader, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Received as u8)
+    });
+    assert_eq!(kinds(&events, EventKind::Received), 1);
+
+    send(
+        &mut admin,
+        &[bx_pipeline::set_symbol_state(
+            ALICE,
+            SYMBOL,
+            bx_protocol::TradingState::Halted,
+        )],
+    );
+    // Wait for the venue to have applied it.
+    let _ = collect_until(&mut admin, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Received as u8)
+    });
+
+    send(&mut trader, &[order(BOB, 11, 10_050)]);
+    let events = collect_until(&mut trader, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Rejected as u8)
+    });
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8
+            && e.reject_reason() == Some(RejectReason::SymbolNotTrading)),
+        "the halt did not reach the order path: {events:?}"
+    );
+}
+
+/// An account may flatten itself without being the administrator.
+///
+/// Deliberately unprivileged: a client that has lost track of its own state must
+/// be able to get out. Requiring an operator for that is how a bad afternoon
+/// becomes a bad week.
+#[test]
+fn an_account_may_cancel_all_of_its_own_orders() {
+    let venue = Running::start_with_admin(ALICE);
+    let mut client = venue.connect();
+    authenticate(&mut client, BOB, &BOB_SECRET);
+
+    for id in 20..23 {
+        send(&mut client, &[order(BOB, id, 10_050 + id as Ticks)]);
+    }
+    let _ = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        kinds(seen, EventKind::Resting) >= 3
+    });
+
+    send(&mut client, &[bx_pipeline::cancel_all(BOB, SYMBOL)]);
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        kinds(seen, EventKind::Canceled) >= 3
+    });
+    assert!(
+        kinds(&events, EventKind::Canceled) >= 3,
+        "cancel-all left orders resting: {events:?}"
     );
 }

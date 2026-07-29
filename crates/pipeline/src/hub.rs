@@ -77,6 +77,13 @@ impl Channel {
             // connection, and putting them on a retained channel would replay a
             // nonce to whoever subscribed next.
             EventKind::Challenge | EventKind::Authenticated => return None,
+            // A halt is public: every subscriber to the symbol needs it, or
+            // they keep sending orders into a book that is not taking them. It
+            // rides the book channel rather than one of its own, because a
+            // client that cares about a symbol's state is already following it.
+            EventKind::SymbolState => Self::Book(event.symbol),
+            // Being stopped is private to the account it happened to.
+            EventKind::AccountTrading => Self::Account(event.account),
         })
     }
 }

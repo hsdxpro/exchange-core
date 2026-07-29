@@ -131,8 +131,34 @@ Applied at the risk stage, before matching, in this order:
    pass rather than once per command, so a flood is discarded before it is sequenced.
 3. Order is inside the price band. The instrument's ladder range *is* the band, so the
    memory bound and the fat-finger control are one mechanism rather than two.
-4. Sufficient free balance; reserve it.
-5. Order count under the instrument's `max_open_orders` cap.
+4. The session is acting for its *own* account. A session may name only the account it
+   proved, or in an open venue the one its first command claimed. Without this,
+   authentication established identity at connect and then bound nothing to it, so one
+   valid credential was enough to trade every account on the venue.
+5. The symbol is trading. `Trading`, `CancelOnly` or `Halted`, set by the administrator.
+6. The account has not been stopped. The kill switch, per account.
+7. Order ID above the highest that account has used, so a client may retry an order it
+   never got an answer for without risking a second execution.
+8. Order is inside the price band.
+9. Sufficient free balance; reserve it.
+10. Order count under the instrument's `max_open_orders` cap.
+
+**Every restriction stops new risk and none of them stops reducing it.** A halted symbol
+and a stopped account both still accept cancels and amends down. A venue that will not let
+a client out of what it already holds is more dangerous than one that lets it keep trading,
+and `CancelOnly` exists precisely so a book can be drained in an orderly way rather than
+freezing everyone into their positions.
+
+The privileged commands — halting a symbol, stopping an account — are permitted only from
+the configured `admin_account`, checked in the gateway before sequencing so an unauthorised
+one never reaches the journal. There is no default administrator: a kill switch reachable
+because a configuration line was forgotten reads exactly like one that was meant to be
+there. `CancelAll` is deliberately *not* privileged, because a client that has lost track of
+its own state must be able to flatten itself without an operator.
+
+Both restrictions are journalled and both are in the snapshot. An operator's halt that did
+not survive a recovery would be the worst kind of bug: the venue comes back trading a symbol
+somebody deliberately stopped, and it looks like a successful restart.
 
 The first two happen in the gateway, ahead of the sequencer. That is not incidental: a key
 lookup, a nonce and a clock reading must never reach the deterministic path, or replay

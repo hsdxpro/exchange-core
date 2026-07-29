@@ -152,6 +152,66 @@ pub enum CommandKind {
     /// secret is never sent — see [`EventKind::Challenge`] for why that matters
     /// on this transport.
     Authenticate = 9,
+    /// Sets whether a symbol accepts new orders. `symbol` names it and
+    /// `quantity` carries a [`TradingState`].
+    ///
+    /// Journalled, because it *is* venue state: a replay that resumed trading a
+    /// symbol an operator had halted would rebuild a venue nobody asked for.
+    /// Permitted only from the configured admin account.
+    SetSymbolState = 10,
+    /// Stops or resumes an account's ability to open new risk. `account` names
+    /// it and `quantity` is 0 to stop and 1 to resume.
+    ///
+    /// The kill switch. Journalled for the same reason as
+    /// [`Self::SetSymbolState`], and it never blocks a cancel: an account that
+    /// cannot be flattened is more dangerous than one that can still trade.
+    SetAccountTrading = 11,
+    /// Cancels everything an account has resting. `account` names it, and
+    /// `symbol` narrows it to one instrument or is zero for all of them.
+    ///
+    /// What an operator reaches for when a client has gone wrong and what a
+    /// client reaches for when its own state is uncertain. Expanded into
+    /// ordinary cancels, so each one journals, publishes and replays like any
+    /// other.
+    CancelAll = 12,
+}
+
+/// Whether a symbol is open, closing, or shut.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, TryFromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+#[repr(u8)]
+pub enum TradingState {
+    /// Normal.
+    #[default]
+    Trading = 0,
+    /// Existing orders may be cancelled or amended down; no new orders rest.
+    ///
+    /// The state that matters most and the one venues actually use. Pulling a
+    /// symbol straight to [`Self::Halted`] traps everyone in their positions;
+    /// cancel-only lets the book drain in an orderly way, which is the whole
+    /// point of having a state between open and shut.
+    CancelOnly = 1,
+    /// Nothing is accepted for this symbol, not even a cancel.
+    ///
+    /// For a venue that has decided the book itself is wrong -- a bad print, a
+    /// corrupt feed -- and wants it frozen exactly as it stands while somebody
+    /// looks at it.
+    Halted = 2,
+}
+
+impl TradingState {
+    /// Decodes a wire value, returning `None` for one this version does not
+    /// define.
+    #[must_use]
+    pub const fn from_wire(value: u64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Trading),
+            1 => Some(Self::CancelOnly),
+            2 => Some(Self::Halted),
+            _ => None,
+        }
+    }
 }
 
 /// Which feed a [`CommandKind::Subscribe`] names.
@@ -216,6 +276,24 @@ pub enum RejectReason {
     /// renumbering an existing one silently changes what every deployed client
     /// reads from a message it has already received.
     OrderIdNotIncreasing = 18,
+    /// The symbol is not accepting new orders.
+    SymbolNotTrading = 19,
+    /// The account has been stopped from opening new risk.
+    AccountNotTrading = 20,
+    /// The session's account may not send this command.
+    NotPermitted = 21,
+}
+
+impl RejectReason {
+    /// How many reasons exist, so a table indexed by one can be sized from here
+    /// rather than from a number somebody keeps in step by hand.
+    ///
+    /// Two separate arrays elsewhere were sized to a literal and both were
+    /// forgotten when a reason was appended, which panicked on the first
+    /// refusal for the newest reason -- a crash reachable from the wire. The
+    /// test below pins this against the decoder, so a variant added without
+    /// updating it fails there instead.
+    pub const COUNT: usize = Self::NotPermitted as usize + 1;
 }
 
 impl fmt::Display for RejectReason {
@@ -240,6 +318,9 @@ impl fmt::Display for RejectReason {
             Self::NotAuthenticated => "not authenticated",
             Self::RateLimited => "rate limit exceeded",
             Self::OrderIdNotIncreasing => "order ID must be above the highest already used",
+            Self::SymbolNotTrading => "symbol is not accepting new orders",
+            Self::AccountNotTrading => "account is not permitted to open new orders",
+            Self::NotPermitted => "this account may not send that command",
         })
     }
 }
@@ -299,6 +380,18 @@ pub enum EventKind {
     /// that side is now empty; a real level never rests at zero, because a level
     /// that reaches zero is removed.
     Bbo = 11,
+    /// A symbol's trading state changed. `quantity` carries the
+    /// [`TradingState`].
+    ///
+    /// Published, because a halt a client cannot see is a halt it will keep
+    /// sending orders into. `symbol` names the instrument.
+    SymbolState = 12,
+    /// An account's ability to open new risk changed. `quantity` is 0 for
+    /// stopped and 1 for permitted.
+    ///
+    /// Reaches the account's own private channel, so a client learns it has been
+    /// stopped rather than inferring it from rejections.
+    AccountTrading = 13,
 }
 
 // ---------------------------------------------------------------- records
@@ -384,6 +477,9 @@ impl Event {
             16 => Some(RejectReason::NotAuthenticated),
             17 => Some(RejectReason::RateLimited),
             18 => Some(RejectReason::OrderIdNotIncreasing),
+            19 => Some(RejectReason::SymbolNotTrading),
+            20 => Some(RejectReason::AccountNotTrading),
+            21 => Some(RejectReason::NotPermitted),
             _ => None,
         }
     }
@@ -404,6 +500,8 @@ impl Event {
             9 => Some(EventKind::Challenge),
             10 => Some(EventKind::Authenticated),
             11 => Some(EventKind::Bbo),
+            12 => Some(EventKind::SymbolState),
+            13 => Some(EventKind::AccountTrading),
             _ => None,
         }
     }
@@ -510,6 +608,23 @@ impl Command {
             || self.kind == CommandKind::Authenticate as u8
     }
 
+    /// Whether this command may only come from the venue's admin account.
+    ///
+    /// These are *not* session control: they change venue state and are
+    /// journalled like an order, because a replay that did not reapply a halt
+    /// would rebuild a venue an operator never asked for. What makes them
+    /// administrative is who may send them, and that is checked in the gateway
+    /// before sequencing -- so an unauthorised one never reaches the journal.
+    ///
+    /// `CancelAll` is deliberately absent. An account cancelling its own orders
+    /// needs no privilege, and requiring one would mean a client that has lost
+    /// track of its own state cannot flatten itself.
+    #[must_use]
+    pub const fn is_administrative(&self) -> bool {
+        self.kind == CommandKind::SetSymbolState as u8
+            || self.kind == CommandKind::SetAccountTrading as u8
+    }
+
     /// The 32 bytes proving a [`CommandKind::Authenticate`]. Meaningless for any
     /// other kind: authentication names no order and no price, so it reuses the
     /// four fields that would carry them.
@@ -603,6 +718,9 @@ impl Command {
             7 => Some(CommandKind::QueryOpenOrders),
             8 => Some(CommandKind::CancelOnDisconnect),
             9 => Some(CommandKind::Authenticate),
+            10 => Some(CommandKind::SetSymbolState),
+            11 => Some(CommandKind::SetAccountTrading),
+            12 => Some(CommandKind::CancelAll),
             _ => None,
         }
     }
@@ -645,11 +763,12 @@ impl Command {
 /// Printable ASCII on purpose: a magic carrying raw control bytes makes the
 /// source file read as binary to tools that diff and search it, and is easy for
 /// an editor to mangle silently.
-/// `v2` adds the per-account highest order ID. A `v1` file is refused rather
+/// `v3` adds symbol trading states and stopped accounts; `v2` added the
+/// per-account highest order ID. A `v1` file is refused rather
 /// than read: the journal is always authoritative, so rejecting an old snapshot
 /// costs replay time, while reading one would restore a venue with no record of
 /// which IDs had been used and quietly accept a replayed order.
-pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAPv2";
+pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAPv3";
 
 /// Header of a snapshot: what it contains and where in the journal it applies.
 #[derive(
@@ -665,6 +784,10 @@ pub struct SnapshotHeader {
     /// Accounts with a highest-order-ID mark. One per account that has ever had
     /// an order accepted, so it is bounded by traders rather than by orders.
     pub order_id_marks: u64,
+    /// Symbols whose trading state is not the default.
+    pub symbol_states: u64,
+    /// Accounts stopped from opening new risk.
+    pub stopped_accounts: u64,
     /// Padding, and load-bearing.
     ///
     /// The records after this header are read straight out of the file with no
@@ -679,7 +802,7 @@ pub struct SnapshotHeader {
 
 /// A multiple of 16, so every section that follows stays aligned. Asserted
 /// rather than left to whoever edits the struct next.
-const _: () = assert!(size_of::<SnapshotHeader>() == 48);
+const _: () = assert!(size_of::<SnapshotHeader>() == 64);
 const _: () = assert!(size_of::<SnapshotHeader>().is_multiple_of(align_of::<SnapshotBalance>()));
 const _: () = assert!(size_of::<SnapshotOrder>().is_multiple_of(align_of::<SnapshotBalance>()));
 
@@ -694,6 +817,30 @@ pub struct SnapshotOrderIdMark {
 }
 
 const _: () = assert!(size_of::<SnapshotOrderIdMark>() == 16);
+
+/// One symbol's trading state, for symbols not in the default state.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+#[repr(C)]
+pub struct SnapshotSymbolState {
+    pub symbol: SymbolId,
+    pub state: u8,
+    pub _pad: [u8; 3],
+}
+
+const _: () = assert!(size_of::<SnapshotSymbolState>() == 8);
+
+/// One account stopped from opening new risk.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+#[repr(C)]
+pub struct SnapshotStoppedAccount {
+    pub account: AccountId,
+}
+
+const _: () = assert!(size_of::<SnapshotStoppedAccount>() == 8);
 
 /// One resting order, written in the exact price-then-time order it rests in,
 /// so restoring in file order reproduces queue priority.
@@ -780,6 +927,9 @@ mod tests {
             (7, CommandKind::QueryOpenOrders),
             (8, CommandKind::CancelOnDisconnect),
             (9, CommandKind::Authenticate),
+            (10, CommandKind::SetSymbolState),
+            (11, CommandKind::SetAccountTrading),
+            (12, CommandKind::CancelAll),
         ] {
             let mut command = sample();
             command.kind = byte;
@@ -787,7 +937,7 @@ mod tests {
             assert!(command.is_well_formed());
         }
         let mut unknown = sample();
-        unknown.kind = 10;
+        unknown.kind = 13;
         assert!(unknown.kind().is_none());
     }
 
@@ -893,6 +1043,8 @@ mod tests {
             (9, EventKind::Challenge),
             (10, EventKind::Authenticated),
             (11, EventKind::Bbo),
+            (12, EventKind::SymbolState),
+            (13, EventKind::AccountTrading),
         ] {
             let event = Event {
                 kind: byte,
@@ -902,7 +1054,7 @@ mod tests {
         }
         assert!(
             Event {
-                kind: 12,
+                kind: 14,
                 ..Event::default()
             }
             .kind()
@@ -968,6 +1120,8 @@ mod tests {
             orders: 2,
             balances: 3,
             order_id_marks: 4,
+            symbol_states: 5,
+            stopped_accounts: 6,
             _pad: [0; 8],
         };
         assert_eq!(
@@ -988,7 +1142,7 @@ mod tests {
     /// Every reason this version defines. The old inline list had quietly
     /// fallen two variants behind the enum, so the distinct-message test was
     /// not checking the reasons most likely to be new.
-    const ALL_REASONS: [RejectReason; 19] = [
+    const ALL_REASONS: [RejectReason; 22] = [
         RejectReason::None,
         RejectReason::UnknownAccount,
         RejectReason::UnknownSymbol,
@@ -1008,6 +1162,9 @@ mod tests {
         RejectReason::NotAuthenticated,
         RejectReason::RateLimited,
         RejectReason::OrderIdNotIncreasing,
+        RejectReason::SymbolNotTrading,
+        RejectReason::AccountNotTrading,
+        RejectReason::NotPermitted,
     ];
 
     /// `Event::reject_reason` is a hand-written match, so a variant added to
@@ -1035,5 +1192,11 @@ mod tests {
             ..Event::default()
         };
         assert_eq!(unknown.reject_reason(), None);
+        // And the count everything else sizes its tables from agrees.
+        assert_eq!(
+            RejectReason::COUNT,
+            ALL_REASONS.len(),
+            "RejectReason::COUNT is behind the enum, so a table sized from it              will be indexed out of bounds by the newest reason"
+        );
     }
 }
