@@ -18,7 +18,9 @@
 //! silently reorder the queue and change who gets filled first.
 
 use crate::accounts::Balance;
-use bx_protocol::{SNAPSHOT_MAGIC, Sequence, SnapshotBalance, SnapshotHeader, SnapshotOrder};
+use bx_protocol::{
+    SNAPSHOT_MAGIC, Sequence, SnapshotBalance, SnapshotHeader, SnapshotOrder, SnapshotOrderIdMark,
+};
 use std::fmt;
 use std::io::{self, Read, Write};
 use zerocopy::{FromBytes, IntoBytes};
@@ -61,6 +63,13 @@ pub struct Snapshot {
     pub orders: Vec<SnapshotOrder>,
     /// Account holdings, sorted, so the same state always writes the same bytes.
     pub balances: Vec<SnapshotBalance>,
+    /// Highest order ID accepted per account, sorted for the same reason.
+    ///
+    /// Carried because recovery from a snapshot replays only the journal after
+    /// it. Rebuilt from that alone, the mark would forget every ID used before
+    /// the snapshot and start accepting them again -- which is exactly the
+    /// replayed order it exists to refuse.
+    pub order_id_marks: Vec<SnapshotOrderIdMark>,
 }
 
 impl Snapshot {
@@ -72,10 +81,13 @@ impl Snapshot {
             sequence: self.sequence,
             orders: self.orders.len() as u64,
             balances: self.balances.len() as u64,
+            order_id_marks: self.order_id_marks.len() as u64,
+            _pad: [0; 8],
         };
         out.write_all(header.as_bytes())?;
         out.write_all(self.orders.as_bytes())?;
         out.write_all(self.balances.as_bytes())?;
+        out.write_all(self.order_id_marks.as_bytes())?;
         Ok(())
     }
 
@@ -106,7 +118,17 @@ impl Snapshot {
         if rest.len() < balance_bytes {
             return Err(SnapshotError::Truncated);
         }
-        let Ok(balances) = <[SnapshotBalance]>::ref_from_bytes(&rest[..balance_bytes]) else {
+        let (balances, rest) = rest.split_at(balance_bytes);
+        let Ok(balances) = <[SnapshotBalance]>::ref_from_bytes(balances) else {
+            return Err(SnapshotError::Truncated);
+        };
+
+        let mark_bytes = header.order_id_marks as usize * size_of::<SnapshotOrderIdMark>();
+        if rest.len() < mark_bytes {
+            return Err(SnapshotError::Truncated);
+        }
+        let Ok(order_id_marks) = <[SnapshotOrderIdMark]>::ref_from_bytes(&rest[..mark_bytes])
+        else {
             return Err(SnapshotError::Truncated);
         };
 
@@ -114,6 +136,7 @@ impl Snapshot {
             sequence: header.sequence,
             orders: orders.to_vec(),
             balances: balances.to_vec(),
+            order_id_marks: order_id_marks.to_vec(),
         })
     }
 }
@@ -163,6 +186,16 @@ mod tests {
                 asset: 2,
                 _pad: [0; 4],
             }],
+            order_id_marks: vec![
+                SnapshotOrderIdMark {
+                    account: 7,
+                    highest: 41,
+                },
+                SnapshotOrderIdMark {
+                    account: 8,
+                    highest: 900,
+                },
+            ],
         }
     }
 

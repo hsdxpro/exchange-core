@@ -205,10 +205,23 @@ than by waiting for a timeout.
 SUBSCRIBE {channels}  ──►  SNAPSHOT {seq = S}  ──►  DELTA {S+1}  ──►  DELTA {S+2} ...
 ```
 
-On reconnect the client sends `RESUME {channel, last_seq}`. If that sequence is still in
-the publisher's ring buffer it gets the missing deltas; if not, a fresh snapshot followed by
-deltas. The ring is fixed size, holding a few seconds of peak rate. This is the
-MoldUDP64/ITCH pattern and it makes disconnection a non-event.
+**What is built:** a reconnecting client subscribes again and is placed at the channel's
+current sequence, with a snapshot first on the two channels that carry state. The ring is
+fixed size, holding a few seconds of peak rate, and a subscriber that falls out of it is
+restated the same way.
+
+**What is not:** a client cannot name where to resume from. `RESUME {channel, last_seq}` —
+the MoldUDP64/ITCH pattern, where a client that missed a few seconds is sent just the gap —
+is designed and not implemented. Until it is, every reconnect costs a snapshot rather than
+a delta, and this section previously claimed otherwise.
+
+Sequence numbering is per channel and starts at zero when the channel is first followed. It
+is therefore **not** continuous across a restart or a promotion: a new leader replays the
+journal to rebuild state but does not re-publish, so its channels begin again. That is
+survivable only because clients do not carry cursors across — and it is the reason a cursor
+past a channel's end is refused rather than treated as current. Adding `RESUME` requires
+making the numbering continuous first, by carrying the cursors in the snapshot or by
+deriving them from the journal sequence.
 
 The publisher and the connection fanout start as one process. They separate when connection
 count actually forces it, not before.
@@ -319,6 +332,9 @@ custom transport becomes the bottleneck.
 | Subscriber stops reading | Its socket fills, the outbox grows past its budget, and the session is shed. How long that takes depends on what the kernel will hold for it first. Pinning the send buffer to make that a fixed number was tried and reverted: the same bound caps how far a healthy reader may fall behind, and it disconnected subscribers over milliseconds of jitter |
 | Order outside price band | rejected at the risk stage |
 | Self-match | cancel-newest; the resting order survives |
+| Client retries an order it got no answer for | Refused. Order IDs increase per account, so an ID already accepted cannot be sent again whatever became of the order it named — a retry is safe, because at most one attempt can ever be live. `DuplicateOrderId` means the ID is live now; `OrderIdNotIncreasing` means it was used and is finished, which is what tells a retrying client its first attempt landed |
+| Leader dies between the ack and the outcome | **Known limit.** The ack means durable, and the matching outcome follows as a separate event. A leader that dies in between leaves the client holding a durable ack it never gets an outcome for: the new leader replays state correctly but does not re-publish, so the event is gone. State is right and recoverable — the client resubscribes, is sent the book, and asks `QueryOpenOrders` — but it has to reconcile rather than be told. The fix is a published watermark in the journal and re-publishing from it on promotion |
+| Two accounts choose the same order ID | **Known limit.** Order IDs are venue-global, not per account, so an ID one account has resting is refused to another as a duplicate. One client can therefore deny another an ID and probe which IDs are in use. Real venues namespace the client order ID per client; doing that here means keying the reservation table by `(account, order_id)`, which is on the hot path and wants measuring first |
 
 A panic on a matching thread is a deliberate abort with a state dump, then replay — never a
 caught exception. An engine that continues after violating an invariant is worse than one

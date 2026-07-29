@@ -1290,7 +1290,15 @@ impl<S: LogStorage> Server<S> {
                     .resume_bytes(*channel, *cursor, &mut session.outbox)
                 {
                     Resume::Delivered { next } => *cursor = next,
-                    Resume::Lagged { .. } => lagged.push((index, *channel)),
+                    // Both need the same repair -- drop the queue and restate
+                    // the channel -- and they are counted the same way. They
+                    // are different diagnoses though: lagging is a client too
+                    // slow to keep up, while ahead is a client holding a cursor
+                    // this run never issued, which after a promotion is every
+                    // client that was connected to the previous leader.
+                    Resume::Lagged { .. } | Resume::Ahead { .. } => {
+                        lagged.push((index, *channel));
+                    }
                     Resume::NotSubscribed => {}
                 }
                 if !session.outbox.is_empty() && !session.owes {

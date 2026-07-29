@@ -91,6 +91,22 @@ pub enum Resume {
     /// missed events that no longer exist, so it must take a snapshot and
     /// rejoin at `oldest` or later. Nothing was delivered.
     Lagged { oldest: Sequence },
+    /// The subscriber asked for a sequence this channel has not reached, so its
+    /// cursor cannot have come from this channel. Nothing was delivered, and it
+    /// must snapshot.
+    ///
+    /// Reported separately from [`Self::Lagged`] because it means something
+    /// different and is worth seeing: lagging is a slow client, whereas being
+    /// ahead means the client is holding a cursor from a *different* run of the
+    /// venue -- the usual cause is a leader change, and the other is a client
+    /// that invented a number.
+    ///
+    /// This used to be folded into [`Self::Delivered`], on the reasoning that
+    /// asking past the end means there is nothing to send. That is true within
+    /// one run and wrong across a promotion: the client was told it was up to
+    /// date, received nothing, and went on believing a cursor the venue had
+    /// never issued.
+    Ahead { next: Sequence },
     /// Nobody is subscribed to that channel, so nothing is being retained.
     NotSubscribed,
 }
@@ -143,8 +159,10 @@ impl Ring {
         if from < oldest {
             return Resume::Lagged { oldest };
         }
-        // A client asking for a sequence past the end is simply up to date.
-        let mut sequence = from.min(self.next);
+        if from > self.next {
+            return Resume::Ahead { next: self.next };
+        }
+        let mut sequence = from;
         while sequence < self.next {
             out.push(self.slots[(sequence & self.mask) as usize]);
             sequence += 1;
@@ -164,7 +182,10 @@ impl Ring {
         if from < oldest {
             return Resume::Lagged { oldest };
         }
-        let mut sequence = from.min(self.next);
+        if from > self.next {
+            return Resume::Ahead { next: self.next };
+        }
+        let mut sequence = from;
         // Reserved once rather than grown per event, so a subscriber catching up
         // on a window's worth does not walk the doubling.
         out.reserve((self.next - sequence) as usize * size_of::<Event>());
@@ -426,6 +447,61 @@ mod tests {
         let (resume, events) = drain(&hub, Channel::Trades(1), 1);
         assert_eq!(resume, Resume::Delivered { next: 1 });
         assert!(events.is_empty());
+    }
+
+    /// A cursor past the end is a cursor from somebody else's run.
+    ///
+    /// This is what a promotion looks like to a client: it resumes from the
+    /// sequence the previous leader had reached, and the channel here has not
+    /// reached it. Answering `Delivered` told it that it was current, sent it
+    /// nothing, and left it holding a number this venue never issued -- so
+    /// every event afterwards looked like it arrived out of order, and the
+    /// client either resnapshotted forever or displayed a book that had
+    /// stopped moving. It has to be told to start again instead.
+    #[test]
+    fn a_cursor_past_the_end_is_refused_rather_than_called_current() {
+        let mut hub = Hub::new(RETAINED);
+        hub.subscribe(Channel::Trades(1));
+        hub.publish(&[event(EventKind::Trade, 1, 0)]);
+
+        for ahead in [2, 5_000_001, Sequence::MAX] {
+            let (resume, events) = drain(&hub, Channel::Trades(1), ahead);
+            assert_eq!(
+                resume,
+                Resume::Ahead { next: 1 },
+                "resuming from {ahead} against a channel at 1"
+            );
+            assert!(
+                events.is_empty(),
+                "nothing may be delivered against {ahead}"
+            );
+        }
+
+        // The boundary still counts as current: `next` itself is the sequence
+        // the following event will take, so a client holding it has missed
+        // nothing.
+        let (resume, events) = drain(&hub, Channel::Trades(1), 1);
+        assert_eq!(resume, Resume::Delivered { next: 1 });
+        assert!(events.is_empty());
+    }
+
+    /// The same, on the byte path the gateway actually uses.
+    ///
+    /// Two implementations of one rule, and only one of them was covered.
+    #[test]
+    fn a_cursor_past_the_end_is_refused_on_the_byte_path_too() {
+        let mut hub = Hub::new(RETAINED);
+        hub.subscribe(Channel::Trades(1));
+        hub.publish(&[event(EventKind::Trade, 1, 0)]);
+
+        let mut bytes = vec![0xAA_u8];
+        let resume = hub.resume_bytes(Channel::Trades(1), 5_000_001, &mut bytes);
+        assert_eq!(resume, Resume::Ahead { next: 1 });
+        assert_eq!(
+            bytes,
+            vec![0xAA_u8],
+            "a refused resume must leave the outbound buffer untouched"
+        );
     }
 
     #[test]

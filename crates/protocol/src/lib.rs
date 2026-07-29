@@ -204,6 +204,18 @@ pub enum RejectReason {
     /// The account is sending faster than its allowance. The command was
     /// discarded; the session stays open.
     RateLimited = 17,
+    /// The order ID is not above the highest this account has had accepted.
+    ///
+    /// Separate from [`Self::DuplicateOrderId`], which means the ID is still
+    /// live. This one means it was used at some point and is now gone, and the
+    /// distinction is the whole point: a client retrying an order it never got
+    /// an answer for needs to know that its earlier attempt *did* land, not
+    /// that some unrelated order happens to hold the ID.
+    ///
+    /// Appended rather than inserted. These discriminants are on the wire, so
+    /// renumbering an existing one silently changes what every deployed client
+    /// reads from a message it has already received.
+    OrderIdNotIncreasing = 18,
 }
 
 impl fmt::Display for RejectReason {
@@ -227,6 +239,7 @@ impl fmt::Display for RejectReason {
             Self::EngineCapacity => "matching engine capacity exhausted",
             Self::NotAuthenticated => "not authenticated",
             Self::RateLimited => "rate limit exceeded",
+            Self::OrderIdNotIncreasing => "order ID must be above the highest already used",
         })
     }
 }
@@ -370,6 +383,7 @@ impl Event {
             15 => Some(RejectReason::EngineCapacity),
             16 => Some(RejectReason::NotAuthenticated),
             17 => Some(RejectReason::RateLimited),
+            18 => Some(RejectReason::OrderIdNotIncreasing),
             _ => None,
         }
     }
@@ -631,7 +645,11 @@ impl Command {
 /// Printable ASCII on purpose: a magic carrying raw control bytes makes the
 /// source file read as binary to tools that diff and search it, and is easy for
 /// an editor to mangle silently.
-pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAPv1";
+/// `v2` adds the per-account highest order ID. A `v1` file is refused rather
+/// than read: the journal is always authoritative, so rejecting an old snapshot
+/// costs replay time, while reading one would restore a venue with no record of
+/// which IDs had been used and quietly accept a replayed order.
+pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAPv2";
 
 /// Header of a snapshot: what it contains and where in the journal it applies.
 #[derive(
@@ -644,9 +662,38 @@ pub struct SnapshotHeader {
     pub sequence: Sequence,
     pub orders: u64,
     pub balances: u64,
+    /// Accounts with a highest-order-ID mark. One per account that has ever had
+    /// an order accepted, so it is bounded by traders rather than by orders.
+    pub order_id_marks: u64,
+    /// Padding, and load-bearing.
+    ///
+    /// The records after this header are read straight out of the file with no
+    /// copy, so each section has to land on its own alignment.
+    /// [`SnapshotBalance`] holds `u128` and therefore wants 16, and it begins at
+    /// the header's length plus a whole number of 64-byte orders -- so the
+    /// header's own size decides whether that read is possible at all. At 40
+    /// bytes it was not, and the zero-copy read failed in a way that reported
+    /// itself as a truncated file.
+    pub _pad: [u8; 8],
 }
 
-const _: () = assert!(size_of::<SnapshotHeader>() == 32);
+/// A multiple of 16, so every section that follows stays aligned. Asserted
+/// rather than left to whoever edits the struct next.
+const _: () = assert!(size_of::<SnapshotHeader>() == 48);
+const _: () = assert!(size_of::<SnapshotHeader>().is_multiple_of(align_of::<SnapshotBalance>()));
+const _: () = assert!(size_of::<SnapshotOrder>().is_multiple_of(align_of::<SnapshotBalance>()));
+
+/// The highest order ID one account has had accepted.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+#[repr(C)]
+pub struct SnapshotOrderIdMark {
+    pub account: AccountId,
+    pub highest: OrderId,
+}
+
+const _: () = assert!(size_of::<SnapshotOrderIdMark>() == 16);
 
 /// One resting order, written in the exact price-then-time order it rests in,
 /// so restoring in file order reproduces queue priority.
@@ -920,6 +967,8 @@ mod tests {
             sequence: 1_000,
             orders: 2,
             balances: 3,
+            order_id_marks: 4,
+            _pad: [0; 8],
         };
         assert_eq!(
             SnapshotHeader::read_from_bytes(header.as_bytes()),
@@ -939,7 +988,7 @@ mod tests {
     /// Every reason this version defines. The old inline list had quietly
     /// fallen two variants behind the enum, so the distinct-message test was
     /// not checking the reasons most likely to be new.
-    const ALL_REASONS: [RejectReason; 18] = [
+    const ALL_REASONS: [RejectReason; 19] = [
         RejectReason::None,
         RejectReason::UnknownAccount,
         RejectReason::UnknownSymbol,
@@ -958,6 +1007,7 @@ mod tests {
         RejectReason::EngineCapacity,
         RejectReason::NotAuthenticated,
         RejectReason::RateLimited,
+        RejectReason::OrderIdNotIncreasing,
     ];
 
     /// `Event::reject_reason` is a hand-written match, so a variant added to

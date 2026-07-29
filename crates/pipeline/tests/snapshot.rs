@@ -16,7 +16,7 @@ use bx_pipeline::book::Resting;
 use bx_pipeline::instrument::AssetId;
 use bx_pipeline::snapshot::Snapshot;
 use bx_pipeline::{Exchange, accounting_violations, limit_order, market_order};
-use bx_protocol::{AccountId, EventKind, Side};
+use bx_protocol::{AccountId, EventKind, RejectReason, Side};
 use common::{
     ACCOUNTS, BTC, START_BTC, START_USD, SYMBOL, TraderPopulation, USD, funded, instruments,
 };
@@ -250,5 +250,183 @@ fn an_empty_venue_snapshots_and_restores_cleanly() {
     assert_eq!(
         restored.accounts().total_supply(USD),
         u128::from(START_USD) * 8
+    );
+}
+
+/// The case a retrying client hits, and the reason order IDs must increase.
+///
+/// A client sends an order and loses its connection before the acknowledgement
+/// arrives. It cannot tell whether the order landed, so it resends. If the
+/// first attempt had already *filled*, nothing resting held that ID any more,
+/// and the resend was accepted and filled a second time -- one intent, two
+/// trades, and no way for the client to have avoided it.
+#[test]
+fn an_order_id_that_already_traded_cannot_be_used_again() {
+    let mut exchange = funded();
+
+    // Account 2 rests, account 1 takes it. Order 500 fills completely and is
+    // gone from the book.
+    let mut maker = limit_order(2, SYMBOL, 400, Side::Ask, 10_100, 5);
+    exchange.submit(&mut maker).unwrap();
+    let mut taker = limit_order(1, SYMBOL, 500, Side::Bid, 10_100, 5);
+    let events = exchange.submit(&mut taker).unwrap().to_vec();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Filled as u8),
+        "the order was meant to trade"
+    );
+    assert!(
+        exchange.open_orders_for(1, SYMBOL).is_empty(),
+        "the taker should hold nothing after filling"
+    );
+
+    // The retry. Same ID, same intent.
+    let mut retry = limit_order(1, SYMBOL, 500, Side::Bid, 10_100, 5);
+    let events = exchange.submit(&mut retry).unwrap().to_vec();
+    let rejected: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Rejected as u8)
+        .collect();
+    assert_eq!(rejected.len(), 1, "the retry was not refused: {events:?}");
+    assert_eq!(
+        rejected[0].reject_reason(),
+        Some(RejectReason::OrderIdNotIncreasing),
+        "refused, but for a reason that does not tell the client its first \
+         attempt had landed"
+    );
+    assert!(
+        !events.iter().any(|e| e.kind == EventKind::Filled as u8),
+        "the retry traded a second time"
+    );
+}
+
+/// A lower ID is refused too, not merely an equal one.
+#[test]
+fn an_order_id_below_the_highest_used_is_refused() {
+    let mut exchange = funded();
+    let mut first = limit_order(1, SYMBOL, 900, Side::Bid, 10_050, 1);
+    exchange.submit(&mut first).unwrap();
+
+    // Below the mark, and the order that set it is gone from the picture as far
+    // as these IDs are concerned.
+    for id in [1, 899] {
+        let mut command = limit_order(1, SYMBOL, id, Side::Bid, 10_050, 1);
+        let events = exchange.submit(&mut command).unwrap().to_vec();
+        assert!(
+            events.iter().any(|e| e.kind == EventKind::Rejected as u8
+                && e.reject_reason() == Some(RejectReason::OrderIdNotIncreasing)),
+            "order ID {id} was accepted after 900"
+        );
+    }
+
+    // 900 itself is still resting, so it is refused as a live duplicate. Both
+    // refusals are correct and they say different things: one means the ID is in
+    // use right now, the other that it was used and is finished.
+    let mut same = limit_order(1, SYMBOL, 900, Side::Bid, 10_050, 1);
+    let events = exchange.submit(&mut same).unwrap().to_vec();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8
+            && e.reject_reason() == Some(RejectReason::DuplicateOrderId)),
+        "a still-resting ID should be refused as a duplicate: {events:?}"
+    );
+
+    // And the next one above it still works, so the rule bounds nothing else.
+    let mut ok = limit_order(1, SYMBOL, 901, Side::Bid, 10_050, 1);
+    let events = exchange.submit(&mut ok).unwrap().to_vec();
+    assert!(
+        !events.iter().any(|e| e.kind == EventKind::Rejected as u8),
+        "901 should have been accepted"
+    );
+}
+
+/// A rejected order leaves its ID free, because nothing happened.
+#[test]
+fn an_id_rejected_before_acceptance_may_be_sent_again() {
+    let mut exchange = funded();
+
+    // Quantity zero is refused before the mark is taken.
+    let mut bad = limit_order(1, SYMBOL, 700, Side::Bid, 10_050, 0);
+    let events = exchange.submit(&mut bad).unwrap().to_vec();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8),
+        "a zero quantity should be refused"
+    );
+
+    // Corrected and resent under the same ID.
+    let mut good = limit_order(1, SYMBOL, 700, Side::Bid, 10_050, 1);
+    let events = exchange.submit(&mut good).unwrap().to_vec();
+    assert!(
+        !events.iter().any(|e| e.kind == EventKind::Rejected as u8),
+        "the corrected order was refused: {events:?}"
+    );
+}
+
+/// The mark has to survive a snapshot, or recovery reopens the hole.
+///
+/// Recovery from a snapshot replays only the journal *after* it. A mark rebuilt
+/// from that alone forgets every ID used before, so the venue comes back
+/// accepting orders it has already traded -- the failure this rule exists to
+/// prevent, reintroduced by the recovery path.
+#[test]
+fn the_highest_order_id_survives_a_snapshot_and_replay() {
+    let mut exchange = funded();
+    let mut command = limit_order(1, SYMBOL, 4_000, Side::Bid, 10_050, 1);
+    exchange.submit(&mut command).unwrap();
+    let mut cancel = common::cancel(1, 4_000);
+    exchange.submit(&mut cancel).unwrap();
+
+    let snapshot = exchange.snapshot();
+    assert_eq!(
+        snapshot.order_id_marks.len(),
+        1,
+        "the snapshot carries no mark for the account that traded"
+    );
+
+    // Round-tripped through bytes, not just cloned: the field has to be in the
+    // file, not merely in the struct.
+    let mut bytes = Vec::new();
+    snapshot.write_to(&mut bytes).unwrap();
+    let reread = Snapshot::read_from(&mut bytes.as_slice()).unwrap();
+    assert_eq!(
+        reread, snapshot,
+        "the snapshot did not survive its own format"
+    );
+
+    let mut restored = Exchange::new(exchange.into_storage(), instruments()).unwrap();
+    restored.recover_from(&reread).unwrap();
+
+    let mut replay = limit_order(1, SYMBOL, 4_000, Side::Bid, 10_050, 1);
+    let events = restored.submit(&mut replay).unwrap().to_vec();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8
+            && e.reject_reason() == Some(RejectReason::OrderIdNotIncreasing)),
+        "a recovered venue accepted an order ID it had already used"
+    );
+}
+
+/// A full replay from zero reaches the same marks as snapshot plus replay.
+///
+/// The equivalence this file exists to defend, extended to the new state.
+#[test]
+fn full_replay_and_snapshot_replay_agree_on_the_marks() {
+    let mut exchange = funded();
+    for (account, id) in [(1_u64, 10_u64), (2, 20), (1, 30), (3, 40), (2, 50)] {
+        let mut command = limit_order(account, SYMBOL, id, Side::Bid, 10_050, 1);
+        exchange.submit(&mut command).unwrap();
+    }
+    let snapshot = exchange.snapshot();
+    let storage = exchange.into_storage();
+
+    // One log, two recoveries off it: replay reads, it does not consume.
+    let mut from_snapshot = Exchange::new(storage, instruments()).unwrap();
+    from_snapshot.recover_from(&snapshot).unwrap();
+    let marks_from_snapshot = from_snapshot.snapshot().order_id_marks;
+
+    let mut from_zero = Exchange::new(from_snapshot.into_storage(), instruments()).unwrap();
+    from_zero.recover().unwrap();
+
+    assert_eq!(
+        marks_from_snapshot,
+        from_zero.snapshot().order_id_marks,
+        "the two recovery paths disagree on which IDs have been used"
     );
 }

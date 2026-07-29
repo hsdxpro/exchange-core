@@ -18,7 +18,8 @@ use book::{Execution, Outcome};
 use bx_journal::{Journal, LogStorage};
 use bx_protocol::{
     AccountId, ChannelKind, Command, CommandKind, Event, EventKind, OrderId, Quantity,
-    RejectReason, Sequence, Side, SnapshotBalance, SnapshotOrder, SymbolId, Ticks, TimeInForce,
+    RejectReason, Sequence, Side, SnapshotBalance, SnapshotOrder, SnapshotOrderIdMark, SymbolId,
+    Ticks, TimeInForce,
 };
 use fastmap::FastMap;
 use instrument::{Instrument, Instruments};
@@ -28,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Every reason an order can be refused, so a count can be reported against a
 /// name rather than a number. Listing them costs a compile-time check that
 /// nothing was forgotten, which a `0..N` loop over discriminants would not give.
-const REASONS: [RejectReason; 18] = [
+const REASONS: [RejectReason; 19] = [
     RejectReason::None,
     RejectReason::UnknownAccount,
     RejectReason::UnknownSymbol,
@@ -47,6 +48,7 @@ const REASONS: [RejectReason; 18] = [
     RejectReason::EngineCapacity,
     RejectReason::NotAuthenticated,
     RejectReason::RateLimited,
+    RejectReason::OrderIdNotIncreasing,
 ];
 
 /// Slots in the reject table, one per reason.
@@ -176,6 +178,27 @@ pub struct Exchange<S: LogStorage> {
     /// One entry per account that is actually resting something, so memory is
     /// bounded by open orders rather than by how many accounts exist.
     resting_per_account: FastMap<(AccountId, SymbolId), Vec<OrderId>>,
+    /// The highest order ID each account has ever had accepted.
+    ///
+    /// Order IDs must increase per account, and this is what enforces it. The
+    /// reason is retry safety, not tidiness. A client that loses its connection
+    /// after sending an order and before reading the acknowledgement cannot tell
+    /// whether the order arrived. Resending risks trading twice; not resending
+    /// risks never trading at all. Neither is acceptable, and no amount of care
+    /// on the client's side fixes it, because the ambiguity is on the wire.
+    ///
+    /// With this, a resend of an ID already accepted is refused, so the client
+    /// may retry freely: at most one of its attempts can ever be live. The
+    /// [`RejectReason::DuplicateOrderId`] check above only covers an order still
+    /// *resting* -- an order that had already filled left no trace, and the
+    /// resend of it was accepted and filled a second time.
+    ///
+    /// One `u64` per account that has ever traded, and one comparison on the
+    /// order path. It is part of the snapshot because it has to be: recovery
+    /// from a snapshot replays only the journal after it, so a mark rebuilt from
+    /// that alone would forget every ID from before and start accepting them
+    /// again.
+    highest_order_id: FastMap<AccountId, OrderId>,
     events: Vec<Event>,
     /// Set once [`Self::commit`] has handed the current batch's events out, so
     /// the next enqueue knows to start a fresh batch rather than append to one
@@ -204,6 +227,7 @@ impl<S: LogStorage> Exchange<S> {
             rejects: [0; REJECT_REASONS],
             matched_ns: 0,
             resting_per_account: FastMap::default(),
+            highest_order_id: FastMap::default(),
             events: Vec::new(),
             released: true,
             event_sequence: 0,
@@ -424,10 +448,20 @@ impl<S: LogStorage> Exchange<S> {
                 _pad: [0; 4],
             })
             .collect();
+        // Sorted, for the same reason the balances are: the same state has to
+        // write the same bytes, or a golden-hash check compares hash-map
+        // iteration order rather than venue state.
+        let mut order_id_marks: Vec<SnapshotOrderIdMark> = self
+            .highest_order_id
+            .iter()
+            .map(|(&account, &highest)| SnapshotOrderIdMark { account, highest })
+            .collect();
+        order_id_marks.sort_unstable_by_key(|mark| mark.account);
         Snapshot {
             sequence: self.journal.next_sequence(),
             orders,
             balances,
+            order_id_marks,
         }
     }
 
@@ -437,6 +471,9 @@ impl<S: LogStorage> Exchange<S> {
     /// violation: a snapshot that silently drops orders would lose client money
     /// and look like a successful recovery.
     pub fn restore(&mut self, snapshot: &Snapshot) {
+        for mark in &snapshot.order_id_marks {
+            self.highest_order_id.insert(mark.account, mark.highest);
+        }
         for record in &snapshot.balances {
             self.accounts
                 .restore(record.account, record.asset, balance_of(record));
@@ -534,6 +571,17 @@ impl<S: LogStorage> Exchange<S> {
             self.reject(command, RejectReason::DuplicateOrderId);
             return;
         }
+        // Order IDs increase per account, so an ID already used is refused even
+        // once the order it named is gone. Without this, a client retrying an
+        // order it never got an answer for traded twice whenever the first
+        // attempt had already filled -- the duplicate check above finds only
+        // what is still resting.
+        if let Some(&highest) = self.highest_order_id.get(&command.account)
+            && command.order_id <= highest
+        {
+            self.reject(command, RejectReason::OrderIdNotIncreasing);
+            return;
+        }
 
         // Self-match prevention, cancel-newest: an order that would trade
         // against its own account is refused, and the resting side is left
@@ -586,6 +634,14 @@ impl<S: LogStorage> Exchange<S> {
             self.reject(command, RejectReason::InsufficientBalance);
             return;
         }
+        // Accepted, so the ID is spent whatever the matching outcome turns out
+        // to be: it may rest, fill outright, or be cancelled back by its
+        // time-in-force, and in all three cases the order happened and must not
+        // be sendable again. Only a *rejected* order leaves its ID free, which
+        // is what a client expects -- nothing happened, so the same ID may be
+        // corrected and resent.
+        self.highest_order_id
+            .insert(command.account, command.order_id);
         self.hold(
             command.order_id,
             Reservation {
