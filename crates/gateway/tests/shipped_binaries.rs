@@ -60,8 +60,13 @@ impl Venue {
         let shipped = repo.join(name);
         let text = std::fs::read_to_string(&shipped).ok()?;
 
-        let port = free_port();
-        let dir = std::env::temp_dir().join(format!("bx_shipped_{port}"));
+        // A directory nobody else will pick, without asking the OS for a port
+        // and then giving it back -- see `wait_until_listening` for why that
+        // guess was worse than it looked.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let dir = std::env::temp_dir().join(format!("bx_shipped_{}_{stamp}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok()?;
 
@@ -90,9 +95,29 @@ impl Venue {
                 }
             }
         }
-        // Always ours: a fixed port would collide between tests, and the
-        // journal must not be shared with the developer's own runs.
-        out.push_str(&format!("\nlisten = 127.0.0.1:{port}\n"));
+        // Every fixed port in the shipped file goes, not only the order-entry
+        // one. `bench.conf` names a market-data port so the load harness has
+        // somewhere predictable to watch; a test that inherited it had two
+        // venues fighting over one socket, and the loser spent a minute being
+        // waited on for an address it was never going to give.
+        let mut kept = String::with_capacity(out.len());
+        for line in out.lines() {
+            let head = line.trim_start();
+            if ["feed_listen", "metrics_listen", "tls_listen"]
+                .iter()
+                .any(|fixed| head.starts_with(fixed))
+            {
+                continue;
+            }
+            kept.push_str(line);
+            kept.push('\n');
+        }
+        out = kept;
+
+        // The venue picks its own port and says which; see
+        // `wait_until_listening` for why choosing one here was worse than it
+        // looked. The journal must not be shared with the developer's own runs.
+        out.push_str("\nlisten = 127.0.0.1:0\n");
         out.push_str(&format!("journal = {}\n", dir.join("v.log").display()));
         out.push_str(&format!("snapshot = {}\n", dir.join("v.snap").display()));
 
@@ -107,38 +132,85 @@ impl Venue {
             .spawn()
             .ok()?;
 
-        let address = format!("127.0.0.1:{port}");
         let mut venue = Self {
             child,
-            address,
+            address: String::new(),
             dir,
         };
         venue.wait_until_listening();
         Some(venue)
     }
 
-    /// Polls the port rather than sleeping a fixed time, so a slow machine does
-    /// not turn into a flaky failure.
+    /// Waits for the venue to say which port it took, and takes that as the
+    /// address.
+    ///
+    /// This used to pick a port itself -- bind zero, read the number, close the
+    /// socket, write it into the configuration -- and then poll until a connect
+    /// succeeded. Both halves were wrong in the same way. The port could be
+    /// taken between the close and the venue's bind, and two tests could be
+    /// handed the same number; worse, a *successful* connect was taken as proof
+    /// that our venue had started, so when somebody else held the port the test
+    /// talked to them and never noticed its own child had died. That is exactly
+    /// how it failed: an earlier test's venue, running open, answered a load
+    /// client that should have been refused for want of credentials, and the
+    /// assertion about authentication fired against the wrong process.
+    ///
+    /// Asking the venue removes the guess. It binds zero itself and prints the
+    /// address it got, so the test cannot be confused about whose venue it is
+    /// speaking to.
     ///
     /// Panics rather than returning, because a venue that will not start is a
     /// failure worth seeing. Returning `None` here made a broken configuration
     /// look like an absent binary and quietly skipped the test.
     fn wait_until_listening(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let Some(stdout) = self.child.stdout.take() else {
+            panic!("venue was spawned without a pipe to read its address from");
+        };
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let filling = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            while std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) > 0 {
+                if let Ok(mut held) = filling.lock() {
+                    held.push_str(&line);
+                }
+                line.clear();
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
-            if TcpStream::connect(&self.address).is_ok() {
+            if let Ok(held) = seen.lock()
+                && let Some(address) = held
+                    .lines()
+                    .find_map(|line| line.strip_prefix("listening "))
+            {
+                self.address = address.trim().to_string();
                 return;
             }
+            // Checked before the address, not only when a connect fails: a
+            // venue that exited must be reported as itself rather than waited
+            // out.
             if let Ok(Some(status)) = self.child.try_wait() {
                 let mut stderr = String::new();
                 if let Some(mut pipe) = self.child.stderr.take() {
                     let _ = pipe.read_to_string(&mut stderr);
                 }
-                panic!("venue exited with {status} before listening: {stderr}");
+                let logged = seen.lock().map(|held| held.clone()).unwrap_or_default();
+                panic!(
+                    "venue exited with {status} before listening:
+{logged}
+{stderr}"
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("venue never listened on {}", self.address);
+        let logged = seen.lock().map(|held| held.clone()).unwrap_or_default();
+        panic!(
+            "venue never said which port it took within 60s:
+{logged}"
+        );
     }
 
     fn connect(&self) -> TcpStream {
@@ -149,22 +221,6 @@ impl Venue {
             .unwrap();
         stream
     }
-}
-
-impl Drop for Venue {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// Reads until `enough` is satisfied or `window` closes, returning every whole
