@@ -825,6 +825,15 @@ impl<S: LogStorage> Server<S> {
             .transpose()
     }
 
+    /// Sends public market data to a distributor running beside the venue.
+    ///
+    /// The trading thread's share of fan-out becomes one copy of each group,
+    /// whatever the audience. See `feed` for why that audience lives on its own
+    /// port rather than on the trading session.
+    pub fn publish_to(&mut self, feed: crate::handoff::Handoff) {
+        self.venue.publish_to(feed);
+    }
+
     /// One pass: accept, read, apply as a group, commit, write.
     ///
     /// Returns how many commands were applied.

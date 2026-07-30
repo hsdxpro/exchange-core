@@ -22,6 +22,8 @@ use bx_protocol::{Command, Event, Sequence, SymbolId};
 pub struct Venue<S: LogStorage> {
     exchange: Exchange<S>,
     hub: Hub,
+    /// Where public market data goes when a feed is running beside the venue.
+    feed: Option<crate::handoff::Handoff>,
     /// Listed symbols, so a departing session's orders can be found without
     /// scanning every order in the venue.
     symbols: Vec<SymbolId>,
@@ -35,6 +37,7 @@ impl<S: LogStorage> Venue<S> {
         Ok(Self {
             exchange: Exchange::new(storage, instruments)?,
             hub: Hub::new(retained_per_channel),
+            feed: None,
             symbols,
         })
     }
@@ -53,7 +56,20 @@ impl<S: LogStorage> Venue<S> {
         }
         let events = self.exchange.commit()?;
         self.hub.publish(events);
+        // Handed to whoever distributes the public feeds, once, before this
+        // returns. One copy of the group rather than one per subscriber: the
+        // walk over an audience is the far side's problem, on the far side's
+        // thread. Never blocks, and a full seam drops rather than waits -- see
+        // `handoff`.
+        if let Some(feed) = &self.feed {
+            feed.offer(events);
+        }
         Ok(events)
+    }
+
+    /// Sends public events to a market-data distributor from now on.
+    pub fn publish_to(&mut self, feed: crate::handoff::Handoff) {
+        self.feed = Some(feed);
     }
 
     pub fn subscribe(&mut self, channel: Channel) -> Sequence {

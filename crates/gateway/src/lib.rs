@@ -9,6 +9,7 @@ pub mod auth;
 pub mod codec;
 pub mod config;
 pub mod expose;
+pub mod feed;
 pub mod handoff;
 pub mod limit;
 pub mod metrics;

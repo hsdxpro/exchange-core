@@ -21,6 +21,7 @@ use bx_election::Leadership;
 use bx_gateway::auth::{self, Credentials, Mode as AuthMode};
 use bx_gateway::config::Config;
 use bx_gateway::expose::Exporter;
+use bx_gateway::feed::Feed;
 use bx_gateway::tcp::{Server, SnapshotPolicy};
 use bx_journal::{FileLog, JournalError, LogStorage, MemoryLog, ReplicatedLog};
 use bx_pipeline::instrument::{Instrument, Instruments};
@@ -75,6 +76,7 @@ fn measurement_config() -> Config {
         tls_cert_file: None,
         tls_key_file: None,
         metrics_listen: None,
+        feed_listen: None,
         target_recovery: Duration::from_secs(2),
         replay_rate: 7_600_000,
         retained_per_channel: 1 << 16,
@@ -214,6 +216,25 @@ fn run<S: LogStorage>(
         server.tls_listen(address, cert, key)?;
         println!("tls 1.3 listening on {address}; the raw listener stays for the cross-connect");
     }
+
+    // Held for the life of the venue: dropping it stops the feed thread.
+    // Bound, not used: it must outlive the trading loop, because dropping it
+    // stops the thread that serves the feed.
+    let _feed = match &config.feed_listen {
+        Some(address) => {
+            let handoff = bx_gateway::handoff::Handoff::new();
+            server.publish_to(handoff.clone());
+            let feed = Feed::start(
+                address,
+                handoff,
+                config.retained_per_channel,
+                config.retained_per_channel * std::mem::size_of::<bx_protocol::Event>(),
+            )?;
+            println!("market data on {}, off the trading thread", feed.address());
+            Some(feed)
+        }
+        None => None,
+    };
 
     // Held for the life of the venue: dropping it stops the serving thread.
     let exporter = match &config.metrics_listen {
