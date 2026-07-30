@@ -393,11 +393,13 @@ impl Session {
     /// The TLS half of [`Self::flush`]: outbox plaintext into the record layer,
     /// ciphertext onto the socket.
     ///
-    /// rustls's own buffer is left at its default limit, so a slow client
-    /// pushes back into the outbox and the existing budget -- the thing an
-    /// operator sets and can see -- stays the only measure of how far behind a
-    /// session is. Runs even with an empty outbox, because handshake and alert
-    /// bytes want the wire without any application data owing.
+    /// rustls buffers a bounded 64 KiB of its own (checked, not assumed: a
+    /// memory bound that lives in somebody else's default is not a bound). Past
+    /// that its writer accepts nothing, so a slow client pushes back into the
+    /// outbox and the operator's budget -- the thing they set and can see --
+    /// stays the measure of how far behind a session is, plus that fixed slack.
+    /// Runs even with an empty outbox, because handshake and alert bytes want
+    /// the wire without any application data owing.
     fn flush_through_tls(&mut self) {
         let tls = self.tls.as_mut().expect("checked by the caller");
         loop {
@@ -868,6 +870,25 @@ impl<S: LogStorage> Server<S> {
         }
 
         self.inbound.clear();
+        // The watermark goes in *first*, before this pass reads a socket, so it
+        // sequences ahead of every command the pass is about to take.
+        //
+        // The ordering is the whole claim. Appended at the end of the group
+        // instead -- which is how this was first written -- it sequences after
+        // commands committed in the same pass, whose outcome events are written
+        // to sockets later in that same pass. A venue dying in between would
+        // leave a marker asserting those outcomes had been handed to the feed,
+        // and recovery would drop exactly the events the client never got. In
+        // front, it can only ever claim what earlier passes produced, and an
+        // earlier pass flushed before this one began.
+        //
+        // The counter only advances on a committed group, so this fires only
+        // after real traffic. On an idle venue it costs one 64-byte record once
+        // and then nothing, because the reset holds until groups commit again.
+        if self.groups_since_watermark >= WATERMARK_EVERY {
+            self.groups_since_watermark = 0;
+            self.inbound.push(Command::watermark());
+        }
         // One clock reading for the whole pass, not one per command. A client
         // that sent a thousand orders in a single write refills its bucket
         // against this one `Instant::now()`; the per-command cost is a compare
@@ -1002,14 +1023,6 @@ impl<S: LogStorage> Server<S> {
             self.inbound.truncate(kept);
         }
 
-        // The watermark rides an ordinary group. Injected before commit, so it
-        // sequences after everything whose outcomes have already been handed to
-        // the feed -- which is exactly the claim it journals. One 64-byte record
-        // per interval; nothing on the path when the venue is idle.
-        if self.groups_since_watermark >= WATERMARK_EVERY && !self.inbound.is_empty() {
-            self.groups_since_watermark = 0;
-            self.inbound.push(Command::watermark());
-        }
         let applied = self.inbound.len();
         if applied > 0 {
             if self.timestamps {

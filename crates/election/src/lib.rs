@@ -181,7 +181,6 @@ impl Leadership {
         // done anything.
         if peers.iter().map(|(peer, _)| *peer).min() == Some(id) {
             let raft = raft.clone();
-            let members = members.clone();
             runtime.spawn(async move {
                 // Fails once the cluster exists, which is the ordinary case on
                 // every restart after the first.

@@ -147,3 +147,48 @@ fn a_watermark_survives_the_chain() {
         "a journalled record left the chain head unchanged"
     );
 }
+
+#[test]
+fn a_watermark_clears_outcomes_sequenced_before_it_in_the_same_batch() {
+    // Why the gateway injects the marker ahead of the commands a pass reads,
+    // rather than appending it to the group.
+    //
+    // The pipeline's rule is positional and has to be: everything before the
+    // marker is claimed as told. So a marker committed *after* commands in the
+    // same group claims their outcomes -- and those outcomes reach a socket
+    // later in the same pass, so a venue dying in between would drop exactly
+    // the events the client never received. This test states the pipeline
+    // behaviour that makes the gateway's ordering load-bearing.
+    let mut exchange = funded();
+    let mut batch = [
+        limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1),
+        Command::watermark(),
+    ];
+    exchange.submit_batch(&mut batch).unwrap();
+
+    let storage = exchange.into_storage();
+    let mut recovered = Exchange::new(storage, instruments()).unwrap();
+    recovered.recover().unwrap();
+    assert!(
+        recovered.take_pending_outcomes(1).is_none(),
+        "an outcome sequenced before the marker survived it, so the marker \
+         means something other than what it says"
+    );
+
+    // The other order, which is the one the gateway produces: the marker first,
+    // claiming only what came before, and the order's outcome kept.
+    let mut exchange = funded();
+    let mut batch = [
+        Command::watermark(),
+        limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1),
+    ];
+    exchange.submit_batch(&mut batch).unwrap();
+
+    let storage = exchange.into_storage();
+    let mut recovered = Exchange::new(storage, instruments()).unwrap();
+    recovered.recover().unwrap();
+    assert!(
+        recovered.take_pending_outcomes(1).is_some(),
+        "a marker sequenced ahead of a command swallowed that command's outcome"
+    );
+}

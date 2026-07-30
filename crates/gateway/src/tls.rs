@@ -68,3 +68,74 @@ fn pem_error(path: &Path, e: &dyn std::fmt::Display) -> io::Error {
         format!("{}: {e}", path.display()),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A temp file that removes itself, so a failing test leaves nothing behind.
+    struct Written(std::path::PathBuf);
+
+    impl Written {
+        fn new(name: &str, contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("bx-tls-{}-{name}", std::process::id()));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Written {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn message(cert: &Path, key: &Path) -> String {
+        server_config(cert, key)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| panic!("the identity was accepted"))
+    }
+
+    #[test]
+    fn a_missing_certificate_names_the_file() {
+        // What an operator sees when a path is wrong: a venue that stops at
+        // startup saying which file, not one that starts and fails the first
+        // handshake.
+        let key = Written::new("absent.key", "");
+        let absent = std::path::Path::new("no-such-certificate.pem");
+        let said = message(absent, &key.0);
+        assert!(said.contains("no-such-certificate.pem"), "{said}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_pem_is_refused() {
+        let cert = Written::new("garbage.crt", "this is not a certificate\n");
+        let key = Written::new("garbage.key", "nor is this a key\n");
+        let said = message(&cert.0, &key.0);
+        assert!(said.contains("garbage.crt"), "{said}");
+    }
+
+    #[test]
+    fn a_certificate_without_its_key_is_refused() {
+        // The failure that only shows at handshake time if nothing checks it
+        // here: two files that are each valid PEM and do not belong together.
+        let first = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let second = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = Written::new("mismatch.crt", &first.cert.pem());
+        let key = Written::new("mismatch.key", &second.key_pair.serialize_pem());
+        let said = message(&cert.0, &key.0);
+        assert!(
+            said.contains("do not make a working identity"),
+            "a certificate and a stranger's key were accepted: {said}"
+        );
+    }
+
+    #[test]
+    fn a_matching_pair_loads() {
+        let made = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = Written::new("good.crt", &made.cert.pem());
+        let key = Written::new("good.key", &made.key_pair.serialize_pem());
+        server_config(&cert.0, &key.0).expect("a matching pair is a working identity");
+    }
+}

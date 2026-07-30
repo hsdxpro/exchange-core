@@ -39,7 +39,7 @@ impl Venue {
     }
 
     /// Everything published on a channel since `from`, and where to read next.
-    fn drain(&mut self, channel: Channel, from: Sequence) -> (Vec<Event>, Sequence) {
+    fn drain(&self, channel: Channel, from: Sequence) -> (Vec<Event>, Sequence) {
         let mut out = Vec::new();
         match self.hub.resume(channel, from, &mut out) {
             Resume::Delivered { next } => (out, next),
