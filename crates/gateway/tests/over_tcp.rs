@@ -1899,3 +1899,64 @@ fn a_private_resume_answers_for_the_symbol_it_names_and_no_others() {
         "a private resume answered for symbols the client did not name: {events:?}"
     );
 }
+
+/// No channel's repair may spend another channel's queued bytes -- checked on
+/// every channel that can be repaired, not just the one that was broken.
+///
+/// The session outbox is shared and the cursors are not, so any repair path that
+/// touches the buffer as a whole loses events whose cursor has already moved past
+/// them. That was a real defect on the book channel, and the reason to check the
+/// others is that each arm is written separately: the next channel added is the
+/// one that will reintroduce it.
+#[test]
+fn no_channels_repair_discards_another_channels_queued_events() {
+    let venue = Running::start();
+    let mut trader = venue.connect();
+    send(
+        &mut trader,
+        &[
+            limit_order(1, SYMBOL, 1, Side::Ask, 10_100, 5),
+            limit_order(1, SYMBOL, 2, Side::Ask, 10_110, 5),
+        ],
+    );
+    let _ = collect_until(&mut trader, Duration::from_millis(400), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Resting as u8)
+            .count()
+            >= 2
+    });
+
+    for kind in [
+        ChannelKind::Book,
+        ChannelKind::Bbo,
+        ChannelKind::Trades,
+        ChannelKind::Checkpoint,
+    ] {
+        let mut client = venue.connect();
+        send(
+            &mut client,
+            &[
+                // Queued first, and belonging to the private feed.
+                query_open_orders(1, SYMBOL),
+                // Ahead of anything this run issued, so the channel repairs.
+                Command::resuming(1, SYMBOL, kind, u64::MAX / 2),
+            ],
+        );
+        let seen = collect_until(&mut client, Duration::from_secs(10), |seen| {
+            seen.iter()
+                .filter(|e| e.kind == EventKind::OrderState as u8)
+                .count()
+                >= 2
+        });
+        let states: Vec<u64> = seen
+            .iter()
+            .filter(|e| e.kind == EventKind::OrderState as u8)
+            .map(|e| e.order_id)
+            .collect();
+        assert_eq!(
+            states.len(),
+            2,
+            "repairing {kind:?} discarded the private feed's queued events: got {states:?}"
+        );
+    }
+}

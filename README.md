@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-394%20passing-success" alt="394 tests">
+  <img src="https://img.shields.io/badge/tests-402%20passing-success" alt="402 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -29,7 +29,7 @@
 - **6.6M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **0.9 ms** to restart from a snapshot instead of 9.6 ms replaying from zero
-- **394 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
+- **402 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
 - Ed25519 logon, a per-symbol kill switch, and an optional hash chain a client can check against the stream
 
 Every number measured on the machine this was built on. `cargo x latency` reproduces the
@@ -49,7 +49,7 @@ green locally and green on a runner cannot become two different things.
 cargo x
 ```
 
-Format, `clippy -D warnings`, and all 394 tests.
+Format, `clippy -D warnings`, and all 402 tests.
 
 ```bash
 cargo x latency
@@ -293,13 +293,13 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 ## Testing
 
-394 tests. The ones worth reading:
+402 tests. The ones worth reading:
 
 | Test | What it proves |
 |---|---|
 | [`pipeline/tests/simulation.rs`](crates/pipeline/tests/simulation.rs) | The venue crashed repeatedly from a seed; recovery reproduces the last committed state order for order, and nothing uncommitted survives. |
 | [`pipeline/tests/snapshot.rs`](crates/pipeline/tests/snapshot.rs) | A snapshot restart lands in exactly the state a full replay does — including queue position, not merely depth. |
-| [`gateway/tests/over_tcp.rs`](crates/gateway/tests/over_tcp.rs) | Real sockets: a record torn across two writes, a slow client shed and rebuilding, cancel-on-disconnect withdrawing every quote. |
+| [`gateway/tests/over_tcp.rs`](crates/gateway/tests/over_tcp.rs) | Real sockets: a record torn across two writes, a slow client shed and rebuilding, cancel-on-disconnect withdrawing every quote. Repairing any one channel is checked against every other channel's queued events — a session has one outbox and a cursor per feed, so a repair that touches the buffer as a whole loses fills nothing will resend. |
 | [`gateway/tests/failover.rs`](crates/gateway/tests/failover.rs) | The binaries a deployment actually runs. The leader is killed mid-session and a node with an empty log is promoted at a higher term, then checked against everything the dead leader acknowledged. |
 | [`gateway/tests/machine_down.rs`](crates/gateway/tests/machine_down.rs) | A standalone venue killed mid-trading recovers every acknowledged order on restart, refuses duplicates of them, and serves. A follower killed mid-trading stops nothing, and is backfilled to the leader's exact log when it returns. |
 | [`gateway/tests/shipped_binaries.rs`](crates/gateway/tests/shipped_binaries.rs) | `venue` and `load` run as a pair against the shipped configuration files — the only tests that can catch the binaries and their config drifting apart. |
