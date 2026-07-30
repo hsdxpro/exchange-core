@@ -222,10 +222,12 @@ fn run<S: LogStorage>(
     // Held for the life of the venue: dropping it stops the feed thread.
     // Bound, not used: it must outlive the trading loop, because dropping it
     // stops the thread that serves the feed.
+    let mut published = None;
     let _feed = match &config.feed_listen {
         Some(address) => {
             let handoff = bx_gateway::handoff::Handoff::new();
             server.publish_to(handoff.clone());
+            published = Some(handoff.clone());
             // The run identifier a receiver uses to tell "sequence 5 again"
             // from "sequence 5 still" across a promotion, since channel
             // numbering restarts when a venue does. Derived from the term and
@@ -345,7 +347,13 @@ fn run<S: LogStorage>(
             // Published on the cadence the venue already reports on, so the
             // scrape endpoint costs no clock read and no work per request.
             if let Some(exporter) = &exporter {
-                exporter.publish(server.metrics().prometheus());
+                let mut text = server.metrics().prometheus();
+                // Distribution has its own way of falling behind, and it is not
+                // visible in the venue's counters at all.
+                if let (Some(feed), Some(handoff)) = (&_feed, &published) {
+                    text.push_str(&feed.prometheus(handoff));
+                }
+                exporter.publish(text);
             }
             let refused = server.venue().exchange().rejects_by_reason();
             if !refused.is_empty() {

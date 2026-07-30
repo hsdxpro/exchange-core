@@ -196,6 +196,66 @@ impl Feed {
     pub fn counts(&self) -> &Counts {
         &self.counts
     }
+
+    /// The feed's counters in Prometheus exposition format, for appending to
+    /// the venue's.
+    ///
+    /// These were kept and shown to nobody until this existed, which is the
+    /// worse half of the bargain: the work of maintaining them without the
+    /// benefit. Two of them are the only warning an operator gets that
+    /// distribution, rather than matching, is the thing falling behind --
+    /// `bx_feed_batches_dropped_total` is the venue finding no free buffer to
+    /// hand a group over in, and a subscriber sees those as a gap in its
+    /// sequence.
+    #[must_use]
+    pub fn prometheus(&self, handoff: &Handoff) -> String {
+        use std::fmt::Write;
+        let (batches_dropped, events_dropped) = handoff.dropped();
+        let mut out = String::with_capacity(1_024);
+        for (name, help, kind, value) in [
+            (
+                "bx_feed_subscribers",
+                "Market-data subscribers connected.",
+                "gauge",
+                self.counts.subscribers.load(Ordering::Relaxed),
+            ),
+            (
+                "bx_feed_shed_total",
+                "Subscribers dropped for owing more than their budget allows.",
+                "counter",
+                self.counts.shed.load(Ordering::Relaxed),
+            ),
+            (
+                "bx_feed_events_total",
+                "Events taken from the venue and distributed.",
+                "counter",
+                self.counts.events.load(Ordering::Relaxed),
+            ),
+            (
+                "bx_feed_batches_total",
+                "Groups taken from the venue.",
+                "counter",
+                self.counts.batches.load(Ordering::Relaxed),
+            ),
+            (
+                "bx_feed_batches_dropped_total",
+                "Groups the venue could not hand over because the feed was behind.",
+                "counter",
+                batches_dropped,
+            ),
+            (
+                "bx_feed_events_dropped_total",
+                "Events inside those groups, which is how much a subscriber missed.",
+                "counter",
+                events_dropped,
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} {kind}");
+            let _ = writeln!(out, "{name} {value}");
+        }
+        out
+    }
 }
 
 impl Drop for Feed {
@@ -633,4 +693,64 @@ pub fn framed(event: &Event) -> Vec<u8> {
     let mut out = Vec::new();
     encode(event, &mut out);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_feed_exports_the_counters_an_operator_pages_on() {
+        let handoff = Handoff::new();
+        let feed = Feed::start("127.0.0.1:0", handoff.clone(), 64, 4_096, None)
+            .expect("the feed did not bind");
+        let text = feed.prometheus(&handoff);
+
+        // The two that matter most: distribution falling behind is invisible in
+        // the venue's own counters, so if these are missing an operator learns
+        // about a gapped feed from a client complaining.
+        for name in [
+            "bx_feed_subscribers",
+            "bx_feed_shed_total",
+            "bx_feed_events_total",
+            "bx_feed_batches_total",
+            "bx_feed_batches_dropped_total",
+            "bx_feed_events_dropped_total",
+        ] {
+            assert!(text.contains(name), "{name} is not exported:\n{text}");
+        }
+        // Same shape rule the venue's exposition follows: every sample is
+        // declared, and every value parses as a number.
+        let mut declared: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                declared.push(rest.split(' ').next().unwrap());
+                continue;
+            }
+            if line.starts_with("# HELP ") {
+                continue;
+            }
+            let (name, value) = line.rsplit_once(' ').expect("not a sample line");
+            value.parse::<u64>().expect("value is not a number");
+            assert!(declared.contains(&name), "{name} has no TYPE line");
+        }
+    }
+
+    #[test]
+    fn a_dropped_batch_shows_up_in_what_the_feed_reports() {
+        // The counter that says the venue could not hand a group over. A
+        // subscriber sees those as a sequence gap; without this an operator
+        // sees nothing at all.
+        let handoff = Handoff::new();
+        let feed = Feed::start("127.0.0.1:0", handoff.clone(), 64, 4_096, None)
+            .expect("feed did not bind");
+        let event = [Event::default()];
+        // Fill the seam without draining it, then overflow it.
+        while handoff.offer(&event) {}
+        assert!(
+            feed.prometheus(&handoff)
+                .contains("bx_feed_batches_dropped_total 1"),
+            "a drop happened and the exposition did not say so"
+        );
+    }
 }
