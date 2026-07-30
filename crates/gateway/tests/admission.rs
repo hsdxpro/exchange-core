@@ -7,14 +7,17 @@
 //! can be shown by calling a verifier directly, because both are about what the
 //! *server loop* does with a socket.
 
-use bx_gateway::auth::{Credentials, SECRET_LEN, prove};
+use bx_gateway::auth::Credentials;
 use bx_gateway::codec::encode;
 use bx_gateway::limit::RateLimit;
 use bx_gateway::tcp::{Server, read_events};
 use bx_journal::MemoryLog;
 use bx_pipeline::instrument::{Instrument, Instruments};
 use bx_pipeline::limit_order;
-use bx_protocol::{CHALLENGE_LEN, Command, Event, EventKind, PROOF_LEN, RejectReason, Side, Ticks};
+use bx_protocol::{
+    CHALLENGE_LEN, Command, Event, EventKind, PROOF_LEN, RejectReason, SIGNATURE_LEN, Side, Ticks,
+};
+use ed25519_dalek::{Signer, SigningKey};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -34,8 +37,14 @@ const BATCH: usize = 4_096;
 
 const ALICE: u64 = 1;
 const BOB: u64 = 2;
-const ALICE_SECRET: [u8; SECRET_LEN] = [0x11; SECRET_LEN];
-const BOB_SECRET: [u8; SECRET_LEN] = [0x22; SECRET_LEN];
+/// Signing keys, from fixed seeds so a failure is reproducible.
+fn alice_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x11; 32])
+}
+
+fn bob_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x22; 32])
+}
 
 /// A running venue, and the handle that stops it.
 struct Running {
@@ -97,8 +106,12 @@ impl Running {
 
         if authenticated {
             let mut credentials = Credentials::new();
-            credentials.insert(ALICE, ALICE_SECRET);
-            credentials.insert(BOB, BOB_SECRET);
+            credentials
+                .insert(ALICE, alice_key().verifying_key().to_bytes())
+                .unwrap();
+            credentials
+                .insert(BOB, bob_key().verifying_key().to_bytes())
+                .unwrap();
             server.require_authentication(credentials);
         }
         if let Some(rate) = rate {
@@ -230,14 +243,21 @@ fn challenge_from(stream: &mut TcpStream) -> [u8; CHALLENGE_LEN] {
     first.challenge()
 }
 
-/// The whole client side of authentication: read the nonce, sign it, send it.
-fn authenticate(stream: &mut TcpStream, account: u64, secret: &[u8; SECRET_LEN]) -> Vec<Event> {
+/// The whole client side of authentication: read the nonce, sign it, send both
+/// halves of the signature.
+fn authenticate(stream: &mut TcpStream, account: u64, key: &SigningKey) -> Vec<Event> {
     let nonce = challenge_from(stream);
     send(
         stream,
-        &[Command::authenticating(account, prove(secret, &nonce))],
+        &Command::authenticating(account, &signature(key, &nonce)),
     );
     collect_until(stream, Duration::from_secs(5), |seen| !seen.is_empty())
+}
+
+/// A signature over what the venue will verify: the domain, then the nonce.
+fn signature(key: &SigningKey, nonce: &[u8; CHALLENGE_LEN]) -> [u8; SIGNATURE_LEN] {
+    key.sign(&bx_gateway::auth::signed_message(nonce))
+        .to_bytes()
 }
 
 fn order(account: u64, id: u64, price: Ticks) -> Command {
@@ -339,7 +359,7 @@ fn a_correct_proof_admits_the_session_and_it_can_then_trade() {
     let venue = Running::start(true, None);
     let mut client = venue.connect();
 
-    let events = authenticate(&mut client, ALICE, &ALICE_SECRET);
+    let events = authenticate(&mut client, ALICE, &alice_key());
     assert_eq!(
         kinds(&events, EventKind::Authenticated),
         1,
@@ -366,7 +386,7 @@ fn a_wrong_proof_closes_the_connection() {
     // Right account, wrong secret.
     send(
         &mut client,
-        &[Command::authenticating(ALICE, prove(&BOB_SECRET, &nonce))],
+        &Command::authenticating(ALICE, &signature(&bob_key(), &nonce)),
     );
     let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
     assert_eq!(
@@ -394,8 +414,8 @@ fn a_proof_captured_from_one_connection_does_not_open_another() {
 
     let mut first = venue.connect();
     let nonce = challenge_from(&mut first);
-    let captured = prove(&ALICE_SECRET, &nonce);
-    send(&mut first, &[Command::authenticating(ALICE, captured)]);
+    let captured = signature(&alice_key(), &nonce);
+    send(&mut first, &Command::authenticating(ALICE, &captured));
     let events = collect_until(&mut first, Duration::from_secs(2), |seen| !seen.is_empty());
     assert_eq!(
         kinds(&events, EventKind::Authenticated),
@@ -407,7 +427,7 @@ fn a_proof_captured_from_one_connection_does_not_open_another() {
     let mut second = venue.connect();
     let replayed_nonce = challenge_from(&mut second);
     assert_ne!(nonce, replayed_nonce, "the venue reissued a nonce");
-    send(&mut second, &[Command::authenticating(ALICE, captured)]);
+    send(&mut second, &Command::authenticating(ALICE, &captured));
 
     let events = collect_until(&mut second, Duration::from_secs(2), |seen| !seen.is_empty());
     assert_eq!(
@@ -427,7 +447,7 @@ fn one_accounts_secret_does_not_open_another_account() {
     // Bob's own secret, correctly signed -- but claiming to be Alice.
     send(
         &mut client,
-        &[Command::authenticating(ALICE, prove(&BOB_SECRET, &nonce))],
+        &Command::authenticating(ALICE, &signature(&bob_key(), &nonce)),
     );
     let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
     assert_eq!(kinds(&events, EventKind::Authenticated), 0);
@@ -443,7 +463,7 @@ fn an_unknown_account_is_refused_like_a_bad_proof() {
     let nonce = challenge_from(&mut client);
     send(
         &mut client,
-        &[Command::authenticating(9_999, prove(&ALICE_SECRET, &nonce))],
+        &Command::authenticating(9_999, &signature(&alice_key(), &nonce)),
     );
     let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
     assert_eq!(
@@ -463,7 +483,7 @@ fn a_client_may_pipeline_its_opening_orders_behind_the_proof() {
     let mut client = venue.connect();
     let nonce = challenge_from(&mut client);
 
-    let mut batch = vec![Command::authenticating(ALICE, prove(&ALICE_SECRET, &nonce))];
+    let mut batch = Command::authenticating(ALICE, &signature(&alice_key(), &nonce)).to_vec();
     for id in 1..=5_i64 {
         batch.push(order(ALICE, id as u64, 10_500 - id));
     }
@@ -667,7 +687,7 @@ fn authentication_and_rate_limiting_compose() {
     // charged against the allowance in a way that starves the first orders.
     let venue = Running::start(true, Some(RateLimit::new(1_000, 50)));
     let mut client = venue.connect();
-    let events = authenticate(&mut client, BOB, &BOB_SECRET);
+    let events = authenticate(&mut client, BOB, &bob_key());
     assert_eq!(kinds(&events, EventKind::Authenticated), 1, "{events:?}");
 
     let batch: Vec<Command> = (1..=20).map(|id| order(BOB, id, 10_400)).collect();
@@ -688,7 +708,7 @@ fn a_proof_is_never_charged_to_the_venue_as_a_command() {
     // never moved for it.
     let venue = Running::start(true, None);
     let mut client = venue.connect();
-    let events = authenticate(&mut client, ALICE, &ALICE_SECRET);
+    let events = authenticate(&mut client, ALICE, &alice_key());
     let admitted = events
         .iter()
         .find(|e| e.kind == EventKind::Authenticated as u8)
@@ -717,7 +737,7 @@ fn a_proof_is_never_charged_to_the_venue_as_a_command() {
     let first = sequence_of(&mut client, 1);
     send(
         &mut client,
-        &[Command::authenticating(ALICE, [0; PROOF_LEN])],
+        &Command::authenticating(ALICE, &[0; SIGNATURE_LEN]),
     );
     let second = sequence_of(&mut client, 2);
     assert_eq!(
@@ -727,14 +747,31 @@ fn a_proof_is_never_charged_to_the_venue_as_a_command() {
     );
 }
 
+/// A signature survives the split into two records and back.
+///
+/// Truncation is the kind of thing that happens silently when a record is
+/// repacked, and half a signature verifies against nothing -- so this checks the
+/// bytes a client signs are exactly the bytes the venue reassembles.
 #[test]
-fn the_proof_bytes_are_exactly_a_full_hmac() {
-    // A truncated tag is a weaker tag, and truncation is the kind of thing that
-    // happens silently when a record is repacked.
+fn a_signature_survives_the_split_into_two_records() {
     assert_eq!(PROOF_LEN, 32);
+    assert_eq!(SIGNATURE_LEN, 64);
     assert_eq!(CHALLENGE_LEN, 16);
-    let proof = prove(&ALICE_SECRET, &[0; CHALLENGE_LEN]);
-    assert_eq!(Command::authenticating(ALICE, proof).proof(), proof);
+
+    let signed = signature(&alice_key(), &[0; CHALLENGE_LEN]);
+    let [first, second] = Command::authenticating(ALICE, &signed);
+    assert_eq!(first.kind(), Some(bx_protocol::CommandKind::Authenticate));
+    assert_eq!(
+        second.kind(),
+        Some(bx_protocol::CommandKind::AuthenticateContinued)
+    );
+    assert_eq!(first.account, ALICE);
+    assert_eq!(second.account, ALICE, "both halves must name one account");
+
+    let mut rebuilt = [0_u8; SIGNATURE_LEN];
+    rebuilt[..PROOF_LEN].copy_from_slice(&first.proof());
+    rebuilt[PROOF_LEN..].copy_from_slice(&second.proof());
+    assert_eq!(rebuilt, signed, "the signature did not survive the split");
 }
 
 // ----------------------------------------------------------------- metrics
@@ -892,7 +929,7 @@ fn every_order_in_one_group_shares_an_arrival_time() {
 fn an_authenticated_session_cannot_act_for_another_account() {
     let venue = Running::start(true, None);
     let mut client = venue.connect();
-    let events = authenticate(&mut client, ALICE, &ALICE_SECRET);
+    let events = authenticate(&mut client, ALICE, &alice_key());
     assert_eq!(
         events.first().and_then(Event::kind),
         Some(EventKind::Authenticated),
@@ -976,7 +1013,7 @@ fn an_open_session_is_held_to_the_account_it_first_claimed() {
 fn a_privileged_command_from_an_ordinary_account_is_refused() {
     let venue = Running::start_with_admin(ALICE);
     let mut client = venue.connect();
-    authenticate(&mut client, BOB, &BOB_SECRET);
+    authenticate(&mut client, BOB, &bob_key());
 
     send(
         &mut client,
@@ -1012,10 +1049,10 @@ fn a_privileged_command_from_an_ordinary_account_is_refused() {
 fn the_administrator_can_halt_a_symbol_and_orders_stop() {
     let venue = Running::start_with_admin(ALICE);
     let mut admin = venue.connect();
-    authenticate(&mut admin, ALICE, &ALICE_SECRET);
+    authenticate(&mut admin, ALICE, &alice_key());
 
     let mut trader = venue.connect();
-    authenticate(&mut trader, BOB, &BOB_SECRET);
+    authenticate(&mut trader, BOB, &bob_key());
     send(&mut trader, &[order(BOB, 10, 10_050)]);
     let events = collect_until(&mut trader, Duration::from_secs(5), |seen| {
         seen.iter().any(|e| e.kind == EventKind::Received as u8)
@@ -1055,7 +1092,7 @@ fn the_administrator_can_halt_a_symbol_and_orders_stop() {
 fn an_account_may_cancel_all_of_its_own_orders() {
     let venue = Running::start_with_admin(ALICE);
     let mut client = venue.connect();
-    authenticate(&mut client, BOB, &BOB_SECRET);
+    authenticate(&mut client, BOB, &bob_key());
 
     for id in 20..23 {
         send(&mut client, &[order(BOB, id, 10_050 + id as Ticks)]);
@@ -1072,4 +1109,190 @@ fn an_account_may_cancel_all_of_its_own_orders() {
         kinds(&events, EventKind::Canceled) >= 3,
         "cancel-all left orders resting: {events:?}"
     );
+}
+
+// ------------------------------------------------- the two-record handshake
+
+/// A first half on its own proves nothing and lets nothing through.
+///
+/// The dangerous shape would be a venue that treated the first record as an
+/// attempt and admitted the session on 32 of the 64 bytes.
+#[test]
+fn half_a_signature_does_not_authenticate() {
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let nonce = challenge_from(&mut client);
+    let [first, _second] = Command::authenticating(ALICE, &signature(&alice_key(), &nonce));
+
+    send(&mut client, &[first]);
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
+    assert_eq!(
+        kinds(&events, EventKind::Authenticated),
+        0,
+        "half a signature authenticated: {events:?}"
+    );
+
+    // And the session still cannot trade.
+    send(&mut client, &[order(ALICE, 1, 10_050)]);
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8
+            && e.reject_reason() == Some(RejectReason::NotAuthenticated)),
+        "a half-authenticated session was allowed to send: {events:?}"
+    );
+}
+
+/// A continuation with no first half is refused, not treated as a whole one.
+#[test]
+fn a_continuation_without_a_first_half_is_refused() {
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let nonce = challenge_from(&mut client);
+    let [_first, second] = Command::authenticating(ALICE, &signature(&alice_key(), &nonce));
+
+    send(&mut client, &[second]);
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
+    assert_eq!(kinds(&events, EventKind::Authenticated), 0);
+    assert!(events.iter().any(|e| e.kind == EventKind::Rejected as u8));
+}
+
+/// The two halves must be adjacent. Anything between them abandons the attempt.
+///
+/// Otherwise a client could interleave two attempts and have the venue assemble
+/// whichever pairing happened to verify.
+#[test]
+fn a_signature_split_by_other_traffic_is_abandoned() {
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let nonce = challenge_from(&mut client);
+    let [first, second] = Command::authenticating(ALICE, &signature(&alice_key(), &nonce));
+
+    // First half, then an order, then the continuation.
+    send(&mut client, &[first, order(ALICE, 1, 10_050), second]);
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| seen.len() >= 2);
+    assert_eq!(
+        kinds(&events, EventKind::Authenticated),
+        0,
+        "an interleaved signature authenticated: {events:?}"
+    );
+}
+
+/// Halves from two different accounts cannot be spliced together.
+#[test]
+fn halves_naming_different_accounts_do_not_combine() {
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let nonce = challenge_from(&mut client);
+    let [alice_first, _] = Command::authenticating(ALICE, &signature(&alice_key(), &nonce));
+    let [_, bob_second] = Command::authenticating(BOB, &signature(&bob_key(), &nonce));
+
+    send(&mut client, &[alice_first, bob_second]);
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
+    assert_eq!(
+        kinds(&events, EventKind::Authenticated),
+        0,
+        "spliced halves authenticated: {events:?}"
+    );
+}
+
+/// A signature over the bare nonce -- what a wallet signing an opaque string
+/// elsewhere would produce -- is refused end to end.
+///
+/// The unit test covers the verifier; this covers the whole path, so a gateway
+/// that reconstructed the message differently would be caught.
+#[test]
+fn a_signature_missing_the_domain_prefix_is_refused_over_the_wire() {
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let nonce = challenge_from(&mut client);
+    let bare = alice_key().sign(&nonce).to_bytes();
+
+    send(&mut client, &Command::authenticating(ALICE, &bare));
+    let events = collect_until(&mut client, Duration::from_secs(2), |seen| !seen.is_empty());
+    assert_eq!(
+        kinds(&events, EventKind::Authenticated),
+        0,
+        "a signature without the venue's domain prefix authenticated: {events:?}"
+    );
+}
+
+/// Both halves in one write are fine: a client pipelines them, as it should.
+#[test]
+fn both_halves_in_a_single_write_authenticate() {
+    let venue = Running::start(true, None);
+    let mut client = venue.connect();
+    let events = authenticate(&mut client, ALICE, &alice_key());
+    assert_eq!(kinds(&events, EventKind::Authenticated), 1);
+}
+
+// -------------------------------------------------------------- revocation
+
+/// Revoking a key closes the sessions using it and stops the next logon.
+///
+/// Closing the open ones is the point. Dropping the key alone stops only the
+/// *next* connection, and a stolen key whose session is already open could go on
+/// cancelling orders -- cancels stay permitted under every other restriction, so
+/// revocation has to reach the connection itself.
+#[test]
+fn revoking_a_key_closes_its_sessions_and_stops_the_next_logon() {
+    let venue = Running::start_with_admin(ALICE);
+    let mut admin = venue.connect();
+    authenticate(&mut admin, ALICE, &alice_key());
+
+    let mut victim = venue.connect();
+    let events = authenticate(&mut victim, BOB, &bob_key());
+    assert_eq!(kinds(&events, EventKind::Authenticated), 1);
+
+    send(&mut admin, &[Command::revoking_key(BOB)]);
+    let _ = collect_until(&mut admin, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Received as u8)
+    });
+
+    // The open session is gone: the socket reaches end of stream.
+    let mut closed = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let mut batch = Vec::new();
+        match read_events(&mut victim, 1, &mut batch) {
+            Ok(()) if batch.is_empty() => {
+                closed = true;
+                break;
+            }
+            Ok(()) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(closed, "a revoked account's session stayed open");
+
+    // And a fresh logon with the same key is refused.
+    let mut again = venue.connect();
+    let events = authenticate(&mut again, BOB, &bob_key());
+    assert_eq!(
+        kinds(&events, EventKind::Authenticated),
+        0,
+        "a revoked key authenticated again: {events:?}"
+    );
+}
+
+/// Only the administrator may revoke.
+#[test]
+fn an_ordinary_account_cannot_revoke_a_key() {
+    let venue = Running::start_with_admin(ALICE);
+    let mut client = venue.connect();
+    authenticate(&mut client, BOB, &bob_key());
+
+    send(&mut client, &[Command::revoking_key(ALICE)]);
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Rejected as u8)
+    });
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8
+            && e.reject_reason() == Some(RejectReason::NotPermitted)),
+        "an ordinary account revoked a key: {events:?}"
+    );
+
+    // Alice's key still works.
+    let mut admin = venue.connect();
+    let events = authenticate(&mut admin, ALICE, &alice_key());
+    assert_eq!(kinds(&events, EventKind::Authenticated), 1);
 }

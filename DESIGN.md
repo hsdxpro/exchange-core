@@ -316,7 +316,7 @@ reality.
 | Matching path | one thread per partition, no async runtime | thread pinning |
 | Encoding | fixed 64-byte records via `zerocopy` | — |
 | Transport | TCP, unencrypted, `mio` readiness | raw UDP or shm for colo |
-| Gateway | sessions, framing, group commit, HMAC challenge, per-account rate limits | — |
+| Gateway | sessions, framing, group commit, Ed25519 challenge, per-account rate limits | `ed25519-dalek` |
 | Durability | group commit; quorum to followers, fenced by term | — |
 | Consensus | `openraft`, on a separate leadership log | — |
 | Journal I/O | buffered `std`, one write and one sync per group | `io_uring`, SQPOLL |

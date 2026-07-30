@@ -56,8 +56,8 @@ use bx_pipeline::hub::{Channel, Resume};
 use bx_pipeline::instrument::Instruments;
 use bx_pipeline::snapshot::Snapshot;
 use bx_protocol::{
-    AccountId, CHALLENGE_LEN, Command, CommandKind, Event, EventKind, RejectReason, Sequence, Side,
-    SymbolId, Ticks,
+    AccountId, CHALLENGE_LEN, Command, CommandKind, Event, EventKind, PROOF_LEN, RejectReason,
+    SIGNATURE_LEN, Sequence, Side, SymbolId, Ticks,
 };
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
@@ -113,6 +113,18 @@ struct Session {
     /// able to say "this one owes bytes" without searching a list.
     owes: bool,
     open: bool,
+    /// First 32 bytes of a signature and the account that sent them, waiting for
+    /// the continuation record.
+    ///
+    /// A signature is 64 bytes and a record carries 32, so answering a challenge
+    /// takes a pair. Present only between the two halves of one attempt.
+    ///
+    /// The account is kept because both halves must name the same one. Without
+    /// that, a client could pair the first half of an attempt for one account
+    /// with the second half of an attempt for another and have the venue verify
+    /// the assembled bytes against whichever key the last record happened to
+    /// name.
+    half_signature: Option<([u8; PROOF_LEN], AccountId)>,
 }
 
 /// One account's send allowance, shared by every session trading as it.
@@ -186,12 +198,24 @@ impl Session {
             queued: false,
             owes: false,
             open: true,
+            half_signature: None,
         }
     }
 
     /// True while the session still owes proof of who it is.
     const fn unproven(&self) -> bool {
         self.challenge.is_some()
+    }
+
+    /// Abandons a half-delivered signature.
+    ///
+    /// Anything other than the matching continuation record immediately after
+    /// the first half ends the attempt. A signature assembled from two records
+    /// that arrived either side of other traffic is one nobody can reason about,
+    /// and accepting it would let a client interleave attempts and have the venue
+    /// try whichever pairing happens to verify.
+    const fn forget_half_signature(&mut self) {
+        self.half_signature = None;
     }
 
     fn stop_following(&mut self, channel: Channel) {
@@ -385,6 +409,9 @@ pub struct Server<S: LogStorage> {
     /// discarded for exceeding an allowance. Both are the shape of an attack as
     /// much as a bug, so they are counted rather than merely acted on.
     rejected_proofs: u64,
+    /// Keys dropped by an administrator. Worth seeing: a rising count means
+    /// somebody is responding to a compromise.
+    keys_revoked: u64,
     throttled: u64,
     /// How fast one session may send. `None` disables the check entirely, so a
     /// venue that does not want it pays nothing for it.
@@ -491,6 +518,7 @@ impl<S: LogStorage> Server<S> {
             admin: None,
             credentials: Credentials::new(),
             rejected_proofs: 0,
+            keys_revoked: 0,
             throttled: 0,
             rate: None,
             allowances: FastMap::default(),
@@ -749,7 +777,9 @@ impl<S: LogStorage> Server<S> {
             let mut kept = start;
             for cursor in start..end {
                 let command = self.inbound[cursor];
-                if command.is_session_control() {
+                if command.kind() == Some(CommandKind::RevokeKey) {
+                    self.revoke_key(index, &command, account);
+                } else if command.is_session_control() {
                     self.apply_control(index, &command, account);
                 } else if command.account != account && !command.is_administrative() {
                     // A session acts for exactly one account: the one it proved,
@@ -902,18 +932,49 @@ impl<S: LogStorage> Server<S> {
                 continue;
             };
 
-            if command.kind() != Some(CommandKind::Authenticate) {
-                let session = self.session_at(index);
-                encode(
-                    &refused_locally(&command, RejectReason::NotAuthenticated),
-                    &mut session.outbox,
-                );
-                self.owes_bytes(index);
-                continue;
-            }
+            let held = self.session_at(index).half_signature;
+            let first_half = match (command.kind(), held) {
+                // First half. Nothing is verified yet: a signature is only a
+                // signature once both halves are in hand. Overwrites any half
+                // already held, which is what starting a fresh attempt means.
+                (Some(CommandKind::Authenticate), _) => {
+                    let account = command.account;
+                    let proof = command.proof();
+                    self.session_at(index).half_signature = Some((proof, account));
+                    continue;
+                }
+                // Second half, in the right place and for the same account.
+                (Some(CommandKind::AuthenticateContinued), Some((first, account)))
+                    if account == command.account =>
+                {
+                    first
+                }
+                // Anything else while unproven: a continuation with no first
+                // half, a continuation naming a different account, or ordinary
+                // traffic before proving. All the same answer -- refused with a
+                // reason, because a client told nothing retries forever -- and
+                // any half held is abandoned.
+                _ => {
+                    let session = self.session_at(index);
+                    session.forget_half_signature();
+                    encode(
+                        &refused_locally(&command, RejectReason::NotAuthenticated),
+                        &mut session.outbox,
+                    );
+                    self.owes_bytes(index);
+                    continue;
+                }
+            };
+
+            // Both halves, in order, from one session, for one account.
+            let mut signature = [0_u8; SIGNATURE_LEN];
+            signature[..PROOF_LEN].copy_from_slice(&first_half);
+            signature[PROOF_LEN..].copy_from_slice(&command.proof());
+            self.session_at(index).forget_half_signature();
+
             if !self
                 .credentials
-                .verifies(command.account, &challenge, &command.proof())
+                .verifies(command.account, &challenge, &signature)
             {
                 self.rejected_proofs += 1;
                 let session = self.session_at(index);
@@ -950,6 +1011,52 @@ impl<S: LogStorage> Server<S> {
             self.claim_allowance(account, Some(Instant::now()));
         }
         self.inbound.truncate(kept);
+    }
+
+    /// Drops an account's key and closes every session trading as it.
+    ///
+    /// Admin only, and handled here rather than in the pipeline: keys are not
+    /// deterministic venue state, and a replay that reapplied a revocation would
+    /// need the key material in the journal.
+    ///
+    /// Closing the sessions is the point. Dropping the key stops the *next*
+    /// logon, and a stolen key whose session is already open could otherwise go
+    /// on cancelling orders -- cancels stay permitted under every other
+    /// restriction, deliberately, so revocation has to reach the connection
+    /// itself.
+    ///
+    /// This is the immediate half. The lasting half is removing the key from the
+    /// configuration, because that is where it comes back from on a restart.
+    fn revoke_key(&mut self, index: usize, command: &Command, sender: AccountId) {
+        if self.admin != Some(sender) {
+            let refusal = refused_locally(command, RejectReason::NotPermitted);
+            let session = self.session_at(index);
+            encode(&refusal, &mut session.outbox);
+            self.owes_bytes(index);
+            return;
+        }
+        let revoked = command.account;
+        self.credentials.revoke(revoked);
+        self.keys_revoked += 1;
+        for held in 0..self.sessions.len() {
+            let closing = self.sessions[held]
+                .as_ref()
+                .is_some_and(|session| session.open && session.account == Some(revoked));
+            if closing {
+                if let Some(session) = self.sessions[held].as_mut() {
+                    session.open = false;
+                }
+                self.closing.push(held);
+            }
+        }
+        let acknowledgement = Event {
+            account: revoked,
+            kind: EventKind::Received as u8,
+            ..Event::default()
+        };
+        let session = self.session_at(index);
+        encode(&acknowledgement, &mut session.outbox);
+        self.owes_bytes(index);
     }
 
     /// Attaches this session to its account's allowance, creating it if this is

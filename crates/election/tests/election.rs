@@ -15,7 +15,16 @@ use std::time::{Duration, Instant};
 /// Generous. A cluster settles in about a second by design — a heartbeat every
 /// 250 ms against a 1–2 second patience — and a loaded test machine is slower
 /// than a venue.
-const SETTLE: Duration = Duration::from_secs(20);
+/// How long an election may take before the test gives up.
+///
+/// Sixty seconds is absurd for a Raft election, which settles in about a second
+/// on an idle machine. It is not absurd on a shared runner, or on a desk running
+/// two other test suites: the node has to miss heartbeats, time out, campaign and
+/// win, and every one of those steps is a timer competing for a core. This ran
+/// out at twenty while the machine was busy, reporting a working election as a
+/// broken one. A generous limit costs nothing when the code is right and seconds
+/// when it is wrong.
+const SETTLE: Duration = Duration::from_secs(60);
 
 struct Scratch(PathBuf);
 

@@ -1,0 +1,40 @@
+# Supply-chain checks, so "no known vulnerable dependencies" is something CI
+# verifies rather than something nobody looked at.
+#
+# This venue's dependency list is short and every entry is justified where it is
+# declared. That makes the check cheap and makes a new advisory or a new licence
+# impossible to miss.
+
+[advisories]
+# A crate with a filed advisory fails the build. `unmaintained` is a warning
+# rather than a failure: a crate can be finished rather than abandoned, and
+# treating the two the same means the check gets ignored.
+yanked = "deny"
+unmaintained = "workspace"
+
+[bans]
+# Two versions of the same crate in one binary is usually somebody's transitive
+# dependency lagging, and it is worth seeing rather than failing over.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+# Permissive only. A copyleft dependency in a venue that may be distributed as a
+# binary is a decision for a person, not something to discover at release.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

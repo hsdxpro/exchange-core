@@ -18,9 +18,10 @@
 //!   empty instrument list should stop the venue before it accepts an order, not
 //!   surface as strange behaviour under load.
 
-use crate::auth::{self, Credentials, Mode, SECRET_LEN};
+use crate::auth::{self, Credentials, Mode};
 use crate::limit::RateLimit;
 use bx_pipeline::instrument::{Instrument, Instruments, MAX_OPEN_ORDERS_LIMIT, MAX_SYMBOL};
+use bx_protocol::PUBLIC_KEY_LEN;
 use bx_protocol::{AccountId, Ticks};
 use std::fmt;
 use std::path::PathBuf;
@@ -69,23 +70,23 @@ enum Section {
     Credential,
 }
 
-/// One account's secret, before validation.
+/// One account's public key, before validation.
 #[derive(Debug, Default)]
 struct CredentialDraft {
     line: usize,
     account: Option<u64>,
-    secret: Option<[u8; SECRET_LEN]>,
+    secret: Option<[u8; PUBLIC_KEY_LEN]>,
 }
 
 impl CredentialDraft {
-    fn finish(self) -> Result<(AccountId, [u8; SECRET_LEN])> {
+    fn finish(self) -> Result<(AccountId, [u8; PUBLIC_KEY_LEN])> {
         let line = self.line;
         let account = self
             .account
             .ok_or_else(|| ConfigError::at(line, "credential is missing account"))?;
         let secret = self
             .secret
-            .ok_or_else(|| ConfigError::at(line, "credential is missing secret"))?;
+            .ok_or_else(|| ConfigError::at(line, "credential is missing public_key"))?;
         Ok((account, secret))
     }
 }
@@ -225,7 +226,7 @@ pub struct Config {
     /// defaulted: a venue that is open because a key was forgotten looks exactly
     /// like one that is open on purpose.
     pub authentication: Mode,
-    /// Account secrets, one per `[credential]` block. Required to be non-empty
+    /// Account public keys, one per `[credential]` block. Required to be non-empty
     /// when authentication is required, or nobody could ever connect.
     pub credentials: Credentials,
     /// How fast one account may send. None means unlimited, and costs nothing.
@@ -326,12 +327,23 @@ impl Config {
                         draft.account = Some(number("account")?);
                         continue;
                     }
-                    "secret" => {
+                    // `public_key`, not `secret`: the venue holds no secret for
+                    // an account any more. The old name is refused rather than
+                    // accepted quietly, because a file that still says `secret`
+                    // was written for a venue that could forge its clients'
+                    // logons and the operator should be told.
+                    "public_key" => {
                         draft.secret = Some(
-                            auth::secret_from_hex(value)
+                            auth::public_key_from_hex(value)
                                 .map_err(|why| ConfigError::at(line, why))?,
                         );
                         continue;
+                    }
+                    "secret" => {
+                        return Err(ConfigError::at(
+                            line,
+                            "credentials take `public_key` now, not `secret`: the venue                              verifies an Ed25519 signature and holds no secret of yours",
+                        ));
                     }
                     _ => {}
                 }
@@ -516,7 +528,9 @@ impl Config {
         let mut credentials = Credentials::new();
         for draft in secrets {
             let (account, secret) = draft.finish()?;
-            credentials.insert(account, secret);
+            credentials
+                .insert(account, secret)
+                .map_err(|why| ConfigError::at(0, why))?;
         }
         if authentication == Mode::Required && credentials.is_empty() {
             return Err(ConfigError::whole_file(
@@ -654,7 +668,7 @@ replica = 10.0.0.3:7100
 
 [credential]
 account = 1
-secret = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+public_key = d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737
 
 [instrument]
 symbol = 1
@@ -718,8 +732,8 @@ max_open_orders = 1000000
         // It would start, listen, challenge every client, and refuse all of
         // them. Better to fail at startup than to look healthy and serve nobody.
         let text = VALID.replace(
-            "[credential]\naccount = 1\nsecret = \
-             00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n",
+            "[credential]\naccount = 1\npublic_key = \
+             d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737\n",
             "",
         );
         assert!(refusal(&text).contains("no [credential] block"));
@@ -733,10 +747,10 @@ max_open_orders = 1000000
     }
 
     #[test]
-    fn a_malformed_secret_names_its_line() {
+    fn a_malformed_public_key_names_its_line() {
         let text = VALID.replace(
-            "secret = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-            "secret = abc",
+            "public_key = d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+            "public_key = abc",
         );
         let message = refusal(&text);
         assert!(message.contains("64 hex characters"), "{message}");

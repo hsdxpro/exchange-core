@@ -219,7 +219,7 @@ No crate on the matching path has a dependency it could reach; the engine stands
 - `protocol`, `journal`, `pipeline`: `zerocopy` for fixed-layout casts.
 - `journal`: `socket2` at connection setup only, to bound kernel buffers on replication
   sockets — the one buffer the venue does not otherwise own.
-- `gateway`: `mio`, `hmac`, `sha2`, `getrandom`, confined there.
+- `gateway`: `mio`, `ed25519-dalek`, `getrandom`, confined there.
 - 156 crates in the lockfile, 123 from one decision — `openraft` + `tokio` in
   `crates/election`, used by the `venue` binary, not the gateway library. Large for one
   feature, accepted because writing consensus correctly is harder than depending on it.
@@ -238,7 +238,7 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 | **The journal is the only source of truth** | Everything else is derived state, so recovery is a snapshot load followed by a replay. |
 | **Determinism after the sequencer** | No clock reads, no randomness, no `HashMap` order reaching output, so a replay reproduces the original exactly. |
 | **Nothing acknowledged before it is durable** | A group's events are released only after its commit succeeds. |
-| **The secret never crosses the wire** | With no TLS, anything a client *sends* is replayable — so the venue issues a nonce and the client returns `HMAC-SHA256` of it. |
+| **No secret exists to steal** | The venue issues a nonce and the client returns an Ed25519 signature over a domain string and that nonce. The venue holds only public keys, so reading its configuration yields nothing signable — and a signature made elsewhere with the same key is not a logon. |
 | **Cancel-on-disconnect is opt-in** | A market maker needs its quotes pulled on disconnect; a week-long limit order does not. |
 | **Replication is fenced by term** | A replaced leader cannot keep writing, and two leaders cannot acknowledge into diverging logs. |
 | **Failover needs no person** | `openraft` runs a *separate* leadership log. What crosses into the venue is the term — which Raft already guarantees is unique per leader, and therefore *is* a fencing token. |

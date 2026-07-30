@@ -1,1 +1,22 @@
 target/
+
+# Key material never belongs in the repository.
+#
+# A venue's security rests on the private half of an account's key staying
+# private, and the usual way that fails is not an attack: it is a key pasted into
+# a file that then gets committed. `keygen` prints a private key once, to the
+# terminal, and writes it nowhere -- these patterns are the second line of
+# defence for anyone who saves it next to the code anyway.
+#
+# The committed configs carry only public keys, and the example among them has no
+# recorded private half.
+*.key
+*.keys
+*.pem
+*private_key*
+venue.keys
+*.raft
+
+# A venue's state rather than its source. Not secret, but a committed journal
+# makes a recovery test pass against yesterday.
+*.snap

@@ -28,16 +28,43 @@ pub type Quantity = u64;
 
 /// Bumped whenever any record layout changes. A peer sending a different
 /// version is rejected at the handshake rather than misread.
-pub const WIRE_VERSION: u8 = 1;
+///
+/// `2` replaced the HMAC proof with an Ed25519 signature, which takes two
+/// records instead of one.
+pub const WIRE_VERSION: u8 = 2;
 
 /// Bytes of nonce in an [`EventKind::Challenge`]. 128 bits, so a nonce does not
 /// repeat within a venue's lifetime and a proof cannot be replayed onto a later
 /// connection.
 pub const CHALLENGE_LEN: usize = 16;
 
-/// Bytes of proof in a [`CommandKind::Authenticate`]: a full HMAC-SHA256 tag,
-/// untruncated.
+/// Bytes a single record can carry of a signature: four 8-byte fields an
+/// authentication message has no other use for.
 pub const PROOF_LEN: usize = 32;
+
+/// Bytes in an Ed25519 signature.
+///
+/// Twice what one record carries, which is why authenticating takes two: a
+/// 64-byte record has about 40 usable bytes once the header is accounted for,
+/// and every signature scheme at this security level -- Ed25519, Schnorr,
+/// compact ECDSA -- is 64. Splitting the message is the only option that keeps
+/// the fixed record width, and authentication happens once per connection so it
+/// costs nothing on the order path.
+pub const SIGNATURE_LEN: usize = 64;
+
+/// Bytes in an Ed25519 public key.
+pub const PUBLIC_KEY_LEN: usize = 32;
+
+/// Prefixed to the nonce before signing, so a signature made for this venue
+/// cannot be anything else and a signature made elsewhere cannot be a logon.
+///
+/// This matters most when the key is one the account already uses on chain. A
+/// wallet asked to sign an opaque 16-byte string somewhere else would produce
+/// exactly what this venue's challenge expects, and that signature would then
+/// authenticate as the account. Ethereum's EIP-191 prefix exists for the same
+/// reason. The version in the string means a future change to what is signed
+/// cannot be confused with this one.
+pub const AUTH_DOMAIN: &[u8] = b"bx-venue-auth-v1";
 
 // ---------------------------------------------------------------- enums
 
@@ -166,6 +193,25 @@ pub enum CommandKind {
     /// [`Self::SetSymbolState`], and it never blocks a cancel: an account that
     /// cannot be flattened is more dangerous than one that can still trade.
     SetAccountTrading = 11,
+    /// The second half of a signature, following the [`Self::Authenticate`] that
+    /// carried the first.
+    ///
+    /// Must be the very next command from that session. Anything else abandons
+    /// the attempt: a signature assembled from two records that arrived either
+    /// side of other traffic is a signature nobody can reason about.
+    AuthenticateContinued = 13,
+    /// Drops an account's key, so it can no longer authenticate.
+    ///
+    /// Handled in the gateway and deliberately *not* journalled, for the same
+    /// reason authentication itself is not: keys are not deterministic venue
+    /// state, and a replay that reapplied a revocation would need the key
+    /// material in the log. Sessions already open for that account are closed.
+    ///
+    /// This is the immediate half of revoking a key. The lasting half is
+    /// removing it from the configuration, because that is where it comes back
+    /// from on a restart. Stopping the account from trading is a *different*
+    /// thing and is journalled -- see [`Self::SetAccountTrading`].
+    RevokeKey = 14,
     /// Cancels everything an account has resting. `account` names it, and
     /// `symbol` narrows it to one instrument or is zero for all of them.
     ///
@@ -606,6 +652,8 @@ impl Command {
             || self.kind == CommandKind::QueryOpenOrders as u8
             || self.kind == CommandKind::CancelOnDisconnect as u8
             || self.kind == CommandKind::Authenticate as u8
+            || self.kind == CommandKind::AuthenticateContinued as u8
+            || self.kind == CommandKind::RevokeKey as u8
     }
 
     /// Whether this command may only come from the venue's admin account.
@@ -638,25 +686,48 @@ impl Command {
         proof
     }
 
-    /// Builds the answer to a challenge. `proof` comes from signing the nonce
-    /// with the account's secret; this only carries it.
+    /// Carries 32 bytes of signature under `kind`.
     #[must_use]
-    pub fn authenticating(account: AccountId, proof: [u8; PROOF_LEN]) -> Self {
+    fn carrying(kind: CommandKind, account: AccountId, half: &[u8]) -> Self {
         let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("eight bytes"));
         Self {
             sequence: 0,
             ingress_ns: 0,
             account,
-            order_id: word(&proof[..8]),
-            replacement_id: word(&proof[8..16]),
-            quantity: word(&proof[16..24]),
-            price: i64::from_le_bytes(proof[24..].try_into().expect("eight bytes")),
+            order_id: word(&half[..8]),
+            replacement_id: word(&half[8..16]),
+            quantity: word(&half[16..24]),
+            price: i64::from_le_bytes(half[24..32].try_into().expect("eight bytes")),
             symbol: 0,
-            kind: CommandKind::Authenticate as u8,
+            kind: kind as u8,
             side: 0,
             time_in_force: 0,
             order_type: 0,
         }
+    }
+
+    /// The two records answering a challenge, in the order they must be sent.
+    ///
+    /// A signature is 64 bytes and a record carries 32, so the answer is a pair.
+    /// They must arrive adjacent, from the same session, in this order.
+    #[must_use]
+    pub fn authenticating(account: AccountId, signature: &[u8; SIGNATURE_LEN]) -> [Self; 2] {
+        [
+            Self::carrying(CommandKind::Authenticate, account, &signature[..32]),
+            Self::carrying(
+                CommandKind::AuthenticateContinued,
+                account,
+                &signature[32..],
+            ),
+        ]
+    }
+
+    /// Asks the venue to drop an account's key. Admin only.
+    #[must_use]
+    pub fn revoking_key(account: AccountId) -> Self {
+        let mut command = Self::carrying(CommandKind::RevokeKey, account, &[0_u8; 32]);
+        command.account = account;
+        command
     }
 
     /// Asset credited by a [`CommandKind::Deposit`]. Meaningless for any other
@@ -721,6 +792,8 @@ impl Command {
             10 => Some(CommandKind::SetSymbolState),
             11 => Some(CommandKind::SetAccountTrading),
             12 => Some(CommandKind::CancelAll),
+            13 => Some(CommandKind::AuthenticateContinued),
+            14 => Some(CommandKind::RevokeKey),
             _ => None,
         }
     }
@@ -930,6 +1003,8 @@ mod tests {
             (10, CommandKind::SetSymbolState),
             (11, CommandKind::SetAccountTrading),
             (12, CommandKind::CancelAll),
+            (13, CommandKind::AuthenticateContinued),
+            (14, CommandKind::RevokeKey),
         ] {
             let mut command = sample();
             command.kind = byte;
@@ -937,7 +1012,7 @@ mod tests {
             assert!(command.is_well_formed());
         }
         let mut unknown = sample();
-        unknown.kind = 13;
+        unknown.kind = 15;
         assert!(unknown.kind().is_none());
     }
 
@@ -1070,21 +1145,49 @@ mod tests {
         assert_eq!(event.challenge(), nonce);
     }
 
+    /// A 64-byte signature survives being split across two records.
+    ///
+    /// Bytes are distinct per position, so a field packed in the wrong order
+    /// shows up rather than passing on a symmetric pattern -- and the halves are
+    /// checked separately, because a builder that put the same half in both
+    /// records would round-trip a symmetric input perfectly.
     #[test]
-    fn a_proof_round_trips_through_the_record() {
-        let mut proof = [0_u8; PROOF_LEN];
-        for (index, byte) in proof.iter_mut().enumerate() {
-            // Distinct per byte, so a field packed in the wrong order shows up
-            // rather than passing on a symmetric pattern.
-            *byte = u8::try_from(index).expect("32 fits in a byte") ^ 0xa5;
+    fn a_signature_round_trips_through_two_records() {
+        let mut signature = [0_u8; SIGNATURE_LEN];
+        for (index, byte) in signature.iter_mut().enumerate() {
+            *byte = u8::try_from(index).expect("64 fits in a byte") ^ 0xa5;
         }
-        let command = Command::authenticating(77, proof);
-        assert_eq!(command.kind(), Some(CommandKind::Authenticate));
-        assert_eq!(command.account, 77);
-        assert_eq!(command.proof(), proof);
+        let [first, second] = Command::authenticating(77, &signature);
+
+        assert_eq!(first.kind(), Some(CommandKind::Authenticate));
+        assert_eq!(second.kind(), Some(CommandKind::AuthenticateContinued));
+        assert_eq!(first.account, 77);
+        assert_eq!(second.account, 77, "both halves must name one account");
+        assert_eq!(first.proof(), signature[..PROOF_LEN]);
+        assert_eq!(second.proof(), signature[PROOF_LEN..]);
+        assert_ne!(
+            first.proof(),
+            second.proof(),
+            "both records carry the same half"
+        );
+        assert!(
+            first.is_session_control() && second.is_session_control(),
+            "an authentication must never reach the journal"
+        );
+    }
+
+    #[test]
+    fn revoking_a_key_names_the_account_and_stays_out_of_the_journal() {
+        let command = Command::revoking_key(42);
+        assert_eq!(command.kind(), Some(CommandKind::RevokeKey));
+        assert_eq!(command.account, 42);
         assert!(
             command.is_session_control(),
-            "an authentication must never reach the journal"
+            "a revocation must not be journalled: keys are not deterministic state"
+        );
+        assert!(
+            !command.is_administrative(),
+            "revocation is checked against the administrator by the gateway, not              by the journalled-admin path"
         );
     }
 

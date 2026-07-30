@@ -62,6 +62,20 @@ jobs:
       - name: cargo x
         run: cargo x
 
+  # Dependencies, checked against the advisory database and the licence list in
+  # `deny.toml`. Its own job because it needs no build: a new advisory against a
+  # crate we already ship should turn CI red on the next run, not wait for
+  # somebody to notice.
+  dependencies:
+    name: advisories and licences
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
   # The failover and machine-down suites bind fixed ports and spawn binaries.
   # They are part of `cargo x` above; this runs them alone as well, because a
   # port collision or a slow election looks like a flake until you can see

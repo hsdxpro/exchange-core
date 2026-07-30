@@ -272,7 +272,7 @@ fn every_order_is_acknowledged_exactly_once() {
         ("authentication", "open"),
         ("[credential]", ""),
         ("account", ""),
-        ("secret", ""),
+        ("public_key", ""),
     ]) else {
         eprintln!("skipping: venue binary or venue.conf unavailable");
         return;
@@ -401,7 +401,7 @@ fn a_second_connection_on_a_traded_account_is_acknowledged() {
         ("authentication", "open"),
         ("[credential]", ""),
         ("account", ""),
-        ("secret", ""),
+        ("public_key", ""),
     ]) else {
         eprintln!("skipping: venue binary or venue.conf unavailable");
         return;

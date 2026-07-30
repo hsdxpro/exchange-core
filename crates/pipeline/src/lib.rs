@@ -589,13 +589,17 @@ impl<S: LogStorage> Exchange<S> {
             CommandKind::Subscribe
             | CommandKind::Unsubscribe
             | CommandKind::QueryOpenOrders
-            | CommandKind::CancelOnDisconnect => {
+            | CommandKind::CancelOnDisconnect
+            // Revoking a key is gateway business: keys are not deterministic
+            // venue state, and a replay that reapplied a revocation would need
+            // the key material in the log.
+            | CommandKind::RevokeKey => {
                 self.reject(&command, RejectReason::UnsupportedTimeInForce);
             }
             // Authentication happens in the gateway, before sequencing, and a
             // proof in the journal would mean a secret had been written to disk
             // and replayed on every recovery. Refused here as the last barrier.
-            CommandKind::Authenticate => {
+            CommandKind::Authenticate | CommandKind::AuthenticateContinued => {
                 self.reject(&command, RejectReason::NotAuthenticated);
             }
             CommandKind::Deposit => self.accounts.deposit(

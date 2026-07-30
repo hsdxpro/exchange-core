@@ -1343,12 +1343,26 @@ fn a_batch_written_at_once_commits_as_one_group() {
         "not every order in the batch was acknowledged"
     );
 
-    let (groups_after, commands_after) = venue.grouping();
-    let groups = groups_after - groups_before;
-    let commands = commands_after - commands_before;
-    assert_eq!(
-        commands, ORDERS as usize,
-        "the venue saw {commands} commands for a batch of {ORDERS}"
+    // The counters are published by the server thread every couple of hundred
+    // microseconds, so they are read until they have caught up rather than once.
+    // Asserting an exact count against a sampled counter is a race, and it was
+    // one: the reading landed mid-batch and reported fewer commands than were
+    // sent.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut groups = 0;
+    let mut commands = 0;
+    while Instant::now() < deadline {
+        let (groups_after, commands_after) = venue.grouping();
+        groups = groups_after - groups_before;
+        commands = commands_after - commands_before;
+        if commands >= ORDERS as usize {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        commands >= ORDERS as usize,
+        "the venue counted {commands} commands for a batch of {ORDERS}"
     );
     // A pass is bounded, so a large batch may span a few of them -- the point is
     // that it is nothing like one group per command.

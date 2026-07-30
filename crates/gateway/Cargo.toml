@@ -20,19 +20,25 @@ zerocopy = { version = "0.8", features = ["derive"] }
 # idle connection and capped a gateway at a few hundred clients. Hand-rolling
 # per-platform readiness is not a thing to hand-roll.
 mio = { version = "1", features = ["os-poll", "net"] }
-# Authentication. The venue takes no TLS by design, so a bearer token would be
-# replayable by anyone on the wire; the client signs a per-connection nonce
-# instead and the secret is never sent. HMAC-SHA256 is the standard construction
-# for exactly that, and hand-rolling a MAC is in the same category as
-# hand-rolling consensus. Both crates are RustCrypto, and they reach the gateway
-# only -- authentication happens before the sequencer, so nothing here can touch
-# the deterministic path.
-hmac = "0.12"
-sha2 = "0.10"
+# Authentication. The client signs a per-connection nonce and the key never
+# crosses the wire. Asymmetric rather than an HMAC, which is what this used to
+# be: an HMAC secret is symmetric, so whoever reads the venue's key file can
+# forge every account's logon, while here the venue holds only public keys and a
+# breach of its configuration yields nothing signable. Binance deprecated its
+# HMAC keys for the same reason.
+#
+# Reaches the gateway only -- authentication happens before the sequencer, so
+# nothing here can touch the deterministic path, and it runs once per connection
+# rather than per order.
+ed25519-dalek = "3"
 # A nonce a client cannot predict has to come from the OS. `getrandom` is the
 # thin syscall wrapper underneath every Rust RNG, and it is all that is wanted:
 # there is no distribution to sample, just sixteen bytes.
 getrandom = "0.3"
+
+[[bin]]
+name = "keygen"
+path = "src/bin/keygen.rs"
 
 [dev-dependencies]
 # Tests only. `over_tcp` pins a client's receive buffer small so that "a client
