@@ -220,6 +220,28 @@ from 30.5 to 23.3 µs and throughput from 1.97M to 2.53M. The same three
 mechanisms the venue's own loop uses, which is where they should have been
 copied from in the first place.
 
+### One packet, however many are listening
+
+TCP fan-out still costs a copy and a write per subscriber — cheap now that it is
+off the order path, but it grows with the audience. `multicast` sends the same
+events as UDP packets instead: the switch replicates, so a group of ten and a
+group of ten thousand are the same send. Two lines are A and B, identical
+packets on independent paths, so a receiver takes whichever copy of a sequence
+arrives first and a packet lost on one path costs nothing.
+
+The shape is MoldUDP64's, which is what Nasdaq's ITCH rides on: a header naming
+the run and the position, several messages per packet, a sequence checked by
+arithmetic. Ours drops the per-message length prefix because an event is a fixed
+64 bytes — a packet is a header and an array. 21 events per packet, sized so a
+full one plus IP and UDP headers stays inside a 1,500-byte MTU, because a
+fragmented market-data packet turns one lost fragment into a lost packet.
+
+Nothing on this path waits for anyone: no acknowledgement, no flow control, no
+retransmission. A receiver that misses a packet sees the gap and asks the
+recovery service, which is separate precisely so a slow receiver cannot reach
+back into the fast path. The private account channel has no wire name at all, so
+it cannot be broadcast to a group anyone may join.
+
 `load --subscribers 1024 --feed 127.0.0.1:7071` against `bench.conf` reproduces
 both columns; restart the venue between runs, or the second one measures the
 reject path and says so.

@@ -9,6 +9,7 @@
 
 use bx_gateway::feed::Feed;
 use bx_gateway::handoff::Handoff;
+use bx_gateway::multicast::{HEADER_LEN, Header, Multicast};
 use bx_gateway::tcp::Server;
 use bx_journal::MemoryLog;
 use bx_pipeline::instrument::{Instrument, Instruments};
@@ -58,7 +59,8 @@ impl Running {
         }
         let handoff = Handoff::new();
         server.publish_to(handoff.clone());
-        let distributor = Feed::start("127.0.0.1:0", handoff, RETAINED, RETAINED * FRAME).unwrap();
+        let distributor =
+            Feed::start("127.0.0.1:0", handoff, RETAINED, RETAINED * FRAME, None).unwrap();
 
         let orders = server.address().unwrap().to_string();
         let feed = distributor.address().to_string();
@@ -258,4 +260,118 @@ fn the_order_path_keeps_serving_while_the_feed_is_ignored() {
         );
     }
     drop(deadbeat);
+}
+
+#[test]
+fn the_same_events_go_out_as_packets_and_to_tcp_subscribers() {
+    // One drain, two outputs. A venue running both must not have to choose,
+    // and the packet path must carry the same market the socket path does.
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let group = receiver.local_addr().unwrap().to_string();
+
+    let mut instruments = Instruments::new();
+    instruments.insert(Instrument::new(SYMBOL, BTC, USD, 10_000, 1_000_000, 65_536));
+    let mut server = Server::bind(
+        "127.0.0.1:0",
+        MemoryLog::new(),
+        instruments,
+        RETAINED,
+        256,
+        64,
+    )
+    .unwrap();
+    for account in 1..=4 {
+        for asset in [USD, BTC] {
+            server
+                .venue_mut()
+                .deposit(account, asset, u64::MAX / 4)
+                .unwrap();
+        }
+    }
+    let handoff = Handoff::new();
+    server.publish_to(handoff.clone());
+    let sender = Multicast::open(&[group], 0x5151).unwrap();
+    let distributor = Feed::start(
+        "127.0.0.1:0",
+        handoff,
+        RETAINED,
+        RETAINED * FRAME,
+        Some(sender),
+    )
+    .unwrap();
+    let venue = Running {
+        orders: server.address().unwrap().to_string(),
+        feed: distributor.address().to_string(),
+        stop: Arc::new(AtomicBool::new(false)),
+        thread: None,
+        _distributor: distributor,
+    };
+    let stop = Arc::clone(&venue.stop);
+    let running = std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            server.poll().expect("the venue failed to commit");
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    });
+
+    let mut watcher = Running::connect(&venue.feed);
+    send(&mut watcher, &[subscribe(0, SYMBOL, ChannelKind::Trades)]);
+    std::thread::sleep(Duration::from_millis(50));
+    trade(&venue, 1, 2);
+
+    // The socket path.
+    let seen = collect_until(&mut watcher, Duration::from_secs(10), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Trade as u8)
+    });
+    assert!(
+        seen.iter().any(|e| e.kind == EventKind::Trade as u8),
+        "the trade never reached the TCP subscriber: {seen:?}"
+    );
+
+    // The packet path, carrying the same market.
+    let mut buffer = vec![0_u8; 2_048];
+    let mut trades = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while trades == 0 && Instant::now() < deadline {
+        let Ok(read) = receiver.recv(&mut buffer) else {
+            break;
+        };
+        let header = Header::read(&buffer[..read]).expect("a packet arrived with no header");
+        assert_eq!(header.session, 0x5151, "the run identifier was lost");
+        assert_eq!(
+            read,
+            HEADER_LEN + header.count as usize * FRAME,
+            "the packet length disagrees with its own count"
+        );
+        for index in 0..header.count as usize {
+            let at = HEADER_LEN + index * FRAME;
+            let event = Event::read_from_bytes(&buffer[at..at + FRAME]).unwrap();
+            if event.kind == EventKind::Trade as u8 {
+                trades += 1;
+            }
+        }
+    }
+    assert!(trades > 0, "the trade never reached the multicast group");
+
+    venue.stop.store(true, Ordering::Relaxed);
+    let _ = running.join();
+}
+
+#[test]
+fn no_private_event_is_ever_put_on_a_group() {
+    // A multicast group is joinable by anyone who can reach the network. A
+    // private feed on one would not be private, and this is the last place that
+    // can be enforced.
+    for channel in [
+        bx_pipeline::hub::Channel::Account(1),
+        bx_pipeline::hub::Channel::Account(u64::MAX),
+    ] {
+        assert!(
+            bx_gateway::multicast::wire_channel(channel).is_none(),
+            "a private channel was given a wire name, so it could be broadcast"
+        );
+    }
 }

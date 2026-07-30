@@ -37,6 +37,7 @@
 
 use crate::codec::{Decoder, encode};
 use crate::handoff::Handoff;
+use crate::multicast::Multicast;
 use bx_pipeline::fastmap::FastMap;
 use bx_pipeline::hub::{Channel, Hub, Resume};
 use bx_protocol::{Command, CommandKind, Event, Sequence};
@@ -138,6 +139,7 @@ impl Feed {
         handoff: Handoff,
         retained_per_channel: usize,
         max_outbox: usize,
+        multicast: Option<Multicast>,
     ) -> io::Result<Self> {
         let parsed = address
             .parse()
@@ -163,10 +165,13 @@ impl Feed {
                 by_channel: FastMap::default(),
                 touched: Vec::new(),
                 owing: Vec::new(),
+                sent_to: FastMap::default(),
                 batches: Vec::new(),
                 handoff,
                 max_outbox,
                 counts: kept,
+                multicast,
+                outgoing: Vec::with_capacity(1_024),
             };
             while !flag.load(Ordering::Relaxed) {
                 state.pass();
@@ -224,10 +229,21 @@ struct State {
     touched: Vec<Channel>,
     /// Subscribers holding bytes. An idle one is never visited.
     owing: Vec<usize>,
+    /// How far the multicast feed has packetised each channel.
+    sent_to: FastMap<Channel, Sequence>,
     batches: Vec<Vec<Event>>,
     handoff: Handoff,
     max_outbox: usize,
     counts: Arc<Counts>,
+    /// The same events as one packet per group rather than one copy per
+    /// subscriber, when the venue is configured to send them. Driven from this
+    /// thread's single drain, so multicast costs the venue nothing it was not
+    /// already paying.
+    multicast: Option<Multicast>,
+    /// Scratch for reading a channel's new events out of the ring before they
+    /// are packetised. Reused; a send path that allocates is one that pauses
+    /// for the allocator while a market moves.
+    outgoing: Vec<Event>,
 }
 
 impl State {
@@ -397,6 +413,7 @@ impl State {
             }
         }
         self.fan_out(&touched);
+        self.emit(&touched);
         self.touched = touched;
         for batch in batches.drain(..) {
             self.handoff.recycle(batch);
@@ -446,6 +463,46 @@ impl State {
                     listener.owes = true;
                     self.owing.push(index);
                 }
+            }
+        }
+    }
+
+    /// Puts the same events on the wire as packets, once, for everybody.
+    ///
+    /// Read straight out of the rings the TCP path reads, from the position the
+    /// last packet reached: the multicast feed keeps its own cursor per channel
+    /// rather than sharing a subscriber's, because it is not a subscriber -- it
+    /// has no socket to fall behind on and nobody to be shed for.
+    fn emit(&mut self, touched: &[Channel]) {
+        let Some(multicast) = self.multicast.as_mut() else {
+            return;
+        };
+        for channel in touched {
+            if crate::multicast::wire_channel(*channel).is_none() {
+                continue;
+            }
+            let at = self.sent_to.entry(*channel).or_insert(0);
+            self.outgoing.clear();
+            match self.hub.resume(*channel, *at, &mut self.outgoing) {
+                Resume::Delivered { next } => {
+                    multicast.send(*channel, *at, &self.outgoing);
+                    *at = next;
+                }
+                // The ring wrapped past where the feed had reached, which means
+                // this thread fell far enough behind that packets were never
+                // built for events now gone. Receivers see the gap in the
+                // sequence and recover; the cursor moves to what is still
+                // there rather than replaying what is not.
+                Resume::Lagged { oldest } => {
+                    if let Resume::Delivered { next } =
+                        self.hub.resume(*channel, oldest, &mut self.outgoing)
+                    {
+                        multicast.send(*channel, oldest, &self.outgoing);
+                        *at = next;
+                    }
+                }
+                Resume::Ahead { next } => *at = next,
+                Resume::NotSubscribed => {}
             }
         }
     }

@@ -213,6 +213,10 @@ pub struct Config {
     /// keeps the public feeds on the trading sessions, which is fine for a
     /// venue with few subscribers and measurably not fine with many.
     pub feed_listen: Option<String>,
+    /// Multicast groups the public feed is sent to. Two is A and B: identical
+    /// packets on independent paths, so a receiver takes whichever copy of a
+    /// sequence arrives first. Empty sends none.
+    pub multicast: Vec<String>,
     pub max_records_per_session: usize,
     /// Connections held at once. Beyond this the venue refuses rather than
     /// serving everyone slowly.
@@ -290,6 +294,7 @@ impl Config {
         let mut tls_key_file = None;
         let mut metrics_listen = None;
         let mut feed_listen = None;
+        let mut multicast: Vec<String> = Vec::new();
         let mut target_recovery_ms = None;
         let mut replay_rate = None;
         let mut retained = None;
@@ -442,6 +447,7 @@ impl Config {
                 "tls_key_file" => tls_key_file = Some(PathBuf::from(value)),
                 "metrics_listen" => metrics_listen = Some(value.to_string()),
                 "feed_listen" => feed_listen = Some(value.to_string()),
+                "multicast" => multicast.push(value.to_string()),
                 "journal" => journal = Some(PathBuf::from(value)),
                 "snapshot" => snapshot = Some(PathBuf::from(value)),
                 "target_recovery_ms" => target_recovery_ms = Some(number("target_recovery_ms")?),
@@ -661,6 +667,19 @@ impl Config {
             ));
         }
 
+        if !multicast.is_empty() && feed_listen.is_none() {
+            return Err(ConfigError::whole_file(
+                "multicast is listed but feed_listen is not: the packets are \
+                 built by the feed thread, so there is nothing to send them",
+            ));
+        }
+        if multicast.len() > 2 {
+            return Err(ConfigError::whole_file(
+                "multicast takes one group, or two for A and B; more than two \
+                 is bandwidth rather than redundancy",
+            ));
+        }
+
         // A cluster that cannot say which node it is, or where its vote is kept,
         // is one that would either wait forever or forget what it voted.
         if !peers.is_empty() {
@@ -742,6 +761,7 @@ impl Config {
             tls_key_file,
             metrics_listen,
             feed_listen,
+            multicast,
             max_records_per_session: usize::try_from(max_records)
                 .map_err(|_| ConfigError::whole_file("max_records_per_session is too large"))?,
             max_sessions: usize::try_from(max_sessions)

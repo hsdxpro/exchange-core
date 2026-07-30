@@ -22,6 +22,7 @@ use bx_gateway::auth::{self, Credentials, Mode as AuthMode};
 use bx_gateway::config::Config;
 use bx_gateway::expose::Exporter;
 use bx_gateway::feed::Feed;
+use bx_gateway::multicast::Multicast;
 use bx_gateway::tcp::{Server, SnapshotPolicy};
 use bx_journal::{FileLog, JournalError, LogStorage, MemoryLog, ReplicatedLog};
 use bx_pipeline::instrument::{Instrument, Instruments};
@@ -77,6 +78,7 @@ fn measurement_config() -> Config {
         tls_key_file: None,
         metrics_listen: None,
         feed_listen: None,
+        multicast: Vec::new(),
         target_recovery: Duration::from_secs(2),
         replay_rate: 7_600_000,
         retained_per_channel: 1 << 16,
@@ -224,11 +226,27 @@ fn run<S: LogStorage>(
         Some(address) => {
             let handoff = bx_gateway::handoff::Handoff::new();
             server.publish_to(handoff.clone());
+            // The run identifier a receiver uses to tell "sequence 5 again"
+            // from "sequence 5 still" across a promotion, since channel
+            // numbering restarts when a venue does. Derived from the term and
+            // the node, both of which a replaced leader cannot reuse.
+            // Both halves masked to 32 bits rather than shifted and hoped over:
+            // a node id past four billion would otherwise shift its own
+            // identity out of the word and collide with another node's.
+            let session = ((config.node_id & 0xFFFF_FFFF) << 32) | (config.term & 0xFFFF_FFFF);
+            let groups = if config.multicast.is_empty() {
+                None
+            } else {
+                let sender = Multicast::open(&config.multicast, session)?;
+                println!("multicast to {}", config.multicast.join(", "));
+                Some(sender)
+            };
             let feed = Feed::start(
                 address,
                 handoff,
                 config.retained_per_channel,
                 config.retained_per_channel * std::mem::size_of::<bx_protocol::Event>(),
+                groups,
             )?;
             println!("market data on {}, off the trading thread", feed.address());
             Some(feed)

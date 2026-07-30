@@ -13,6 +13,7 @@ pub mod feed;
 pub mod handoff;
 pub mod limit;
 pub mod metrics;
+pub mod multicast;
 pub mod tcp;
 pub mod tls;
 pub mod venue;
