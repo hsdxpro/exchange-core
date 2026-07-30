@@ -71,6 +71,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 struct Session {
     stream: TcpStream,
+    /// Present when this session arrived on the TLS listener. All reads and
+    /// writes go through it; the raw cross-connect path never allocates one.
+    tls: Option<Box<rustls::ServerConnection>>,
     decoder: Decoder,
     /// Bytes framed but not yet accepted by the socket.
     ///
@@ -138,6 +141,9 @@ struct Allowance {
 /// The listener's token. Sessions take `index + 1`, so zero is never a session.
 const LISTENER: Token = Token(0);
 
+/// The TLS listener's token, when one is configured. Sessions start above both.
+const TLS_LISTENER: Token = Token(1);
+
 /// Committed groups between watermarks.
 ///
 /// The interval bounds two things at once: how many private outcomes a recovery
@@ -180,22 +186,24 @@ fn refused_locally(command: &Command, reason: RejectReason) -> Event {
 }
 
 fn session_token(index: usize) -> Token {
-    Token(index + 1)
+    Token(index + 2)
 }
 
 fn session_index(token: Token) -> Option<usize> {
-    (token != LISTENER).then(|| token.0 - 1)
+    (token.0 >= 2).then(|| token.0 - 2)
 }
 
 impl Session {
     fn new(
         stream: TcpStream,
+        tls: Option<Box<rustls::ServerConnection>>,
         max_records: usize,
         max_outbox: usize,
         challenge: Option<[u8; CHALLENGE_LEN]>,
     ) -> Self {
         Self {
             stream,
+            tls,
             decoder: Decoder::new(max_records),
             outbox: Vec::new(),
             max_outbox,
@@ -264,6 +272,9 @@ impl Session {
         if self.decoder.writable().is_empty() {
             return true;
         }
+        if self.tls.is_some() {
+            return self.read_through_tls(out, undecodable);
+        }
         match self.stream.read(self.decoder.writable()) {
             // A read of zero on a stream socket means the peer closed.
             Ok(0) => {
@@ -287,6 +298,57 @@ impl Session {
         }
     }
 
+    /// The TLS half of [`Self::read_into`]: ciphertext off the socket, through
+    /// the record layer, plaintext into the same decoder the raw path fills.
+    ///
+    /// Also what drives the handshake. The client speaks first, so every
+    /// handshake flight arrives here; whatever rustls wants to send back is
+    /// pushed by [`Self::flush`], which the caller owes after any read that
+    /// leaves `wants_write` true.
+    fn read_through_tls(&mut self, out: &mut Vec<Command>, undecodable: &mut u64) -> bool {
+        let tls = self.tls.as_mut().expect("checked by the caller");
+        let keep = match tls.read_tls(&mut self.stream) {
+            Ok(0) => {
+                self.open = false;
+                false
+            }
+            Ok(_) => true,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                false
+            }
+            Err(_) => {
+                self.open = false;
+                false
+            }
+        };
+        let Ok(state) = tls.process_new_packets() else {
+            // Garbage on a TLS port -- plaintext, a scanner, a broken client.
+            // There is no protocol left to answer in.
+            self.open = false;
+            return false;
+        };
+        if state.peer_has_closed() {
+            self.open = false;
+        }
+        let mut pending = state.plaintext_bytes_to_read();
+        while pending > 0 && !self.decoder.writable().is_empty() {
+            let room = self.decoder.writable().len().min(pending);
+            let Ok(bytes) = tls.reader().read(&mut self.decoder.writable()[..room]) else {
+                break;
+            };
+            if bytes == 0 {
+                break;
+            }
+            self.decoder.advance(bytes);
+            self.decoder.drain(out, undecodable);
+            pending -= bytes;
+        }
+        // Leftover plaintext stays buffered in rustls; reporting "keep reading"
+        // brings the pass back for it, the same contract the raw path has with
+        // a short read.
+        keep || pending > 0
+    }
+
     /// True once this session owes more bytes than it is allowed to queue.
     ///
     /// Such a client is already beyond saving: the backlog exceeds a full
@@ -308,6 +370,10 @@ impl Session {
     /// Pushes whatever the socket will take. Anything it will not take stays
     /// queued rather than blocking the venue on one slow client.
     fn flush(&mut self) {
+        if self.tls.is_some() {
+            self.flush_through_tls();
+            return;
+        }
         let mut written = 0;
         while written < self.outbox.len() {
             match self.stream.write(&self.outbox[written..]) {
@@ -322,6 +388,51 @@ impl Session {
             }
         }
         self.outbox.drain(..written);
+    }
+
+    /// The TLS half of [`Self::flush`]: outbox plaintext into the record layer,
+    /// ciphertext onto the socket.
+    ///
+    /// rustls's own buffer is left at its default limit, so a slow client
+    /// pushes back into the outbox and the existing budget -- the thing an
+    /// operator sets and can see -- stays the only measure of how far behind a
+    /// session is. Runs even with an empty outbox, because handshake and alert
+    /// bytes want the wire without any application data owing.
+    fn flush_through_tls(&mut self) {
+        let tls = self.tls.as_mut().expect("checked by the caller");
+        loop {
+            let mut fed = 0;
+            while fed < self.outbox.len() {
+                match tls.writer().write(&self.outbox[fed..]) {
+                    Ok(0) => break,
+                    Ok(bytes) => fed += bytes,
+                    Err(_) => {
+                        self.open = false;
+                        break;
+                    }
+                }
+            }
+            self.outbox.drain(..fed);
+            let mut sent = false;
+            while tls.wants_write() {
+                match tls.write_tls(&mut self.stream) {
+                    Ok(0) => {
+                        self.open = false;
+                        break;
+                    }
+                    Ok(_) => sent = true,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        self.open = false;
+                        break;
+                    }
+                }
+            }
+            if !self.open || self.outbox.is_empty() || (fed == 0 && !sent) {
+                break;
+            }
+        }
     }
 }
 
@@ -386,6 +497,10 @@ pub struct Server<S: LogStorage> {
     poll: Poll,
     events: Events,
     listener: TcpListener,
+    /// Second front door, for sessions that need encryption. `None` on a venue
+    /// serving only the cross-connect.
+    tls_listener: Option<TcpListener>,
+    tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     venue: Venue<S>,
     /// Indexed by token, so a session's identity is stable while its neighbours
     /// come and go. A scanning loop could use a plain `Vec` and compact it;
@@ -512,6 +627,8 @@ impl<S: LogStorage> Server<S> {
             // for the next, which is fair and bounds the work a pass can take.
             events: Events::with_capacity(1_024),
             listener,
+            tls_listener: None,
+            tls_config: None,
             venue,
             sessions: Vec::new(),
             free: Vec::new(),
@@ -667,6 +784,45 @@ impl<S: LogStorage> Server<S> {
         replayed.map_err(|e| io::Error::other(e.to_string()))
     }
 
+    /// Opens the TLS 1.3 listener beside the raw one.
+    ///
+    /// Sessions arriving here are identical to raw ones past the record layer:
+    /// same framing, same logon, same budgets. See the `tls` module for why the
+    /// venue offers both doors.
+    ///
+    /// # Errors
+    /// Fails if the address cannot be bound or the certificate and key do not
+    /// load.
+    pub fn tls_listen(
+        &mut self,
+        address: &str,
+        cert_file: &std::path::Path,
+        key_file: &std::path::Path,
+    ) -> io::Result<()> {
+        let config = crate::tls::server_config(cert_file, key_file)?;
+        let parsed = address
+            .parse()
+            .map_err(|e| io::Error::new(ErrorKind::InvalidInput, format!("{address}: {e}")))?;
+        let mut listener = TcpListener::bind(parsed)?;
+        self.poll
+            .registry()
+            .register(&mut listener, TLS_LISTENER, Interest::READABLE)?;
+        self.tls_listener = Some(listener);
+        self.tls_config = Some(config);
+        Ok(())
+    }
+
+    /// Where the TLS listener ended up, when one is open.
+    ///
+    /// # Errors
+    /// Returns the underlying I/O error if the address cannot be read.
+    pub fn tls_address(&self) -> io::Result<Option<std::net::SocketAddr>> {
+        self.tls_listener
+            .as_ref()
+            .map(|listener| listener.local_addr())
+            .transpose()
+    }
+
     /// One pass: accept, read, apply as a group, commit, write.
     ///
     /// Returns how many commands were applied.
@@ -737,9 +893,17 @@ impl<S: LogStorage> Server<S> {
             if undecodable > 0 {
                 self.metrics.undecodable(undecodable);
             }
+            // A TLS session may owe the wire handshake or alert bytes that no
+            // outbox entry accounts for; the flush list is how bytes reach a
+            // socket, so it goes on the list.
+            let owes_tls = session.tls.as_ref().is_some_and(|tls| tls.wants_write());
             if !session.open {
                 self.closing.push(index);
                 continue;
+            }
+            if owes_tls && !session.owes {
+                session.owes = true;
+                self.owing.push(index);
             }
 
             // Nothing from a session that has not proved who it is reaches the
@@ -1465,8 +1629,25 @@ impl<S: LogStorage> Server<S> {
     }
 
     fn accept_pending(&mut self) {
+        self.accept_from(false);
+        if self.tls_listener.is_some() {
+            self.accept_from(true);
+        }
+    }
+
+    /// Drains one listener. The two doors differ in exactly one thing: a TLS
+    /// session carries a record layer; everything past it is identical.
+    fn accept_from(&mut self, encrypted: bool) {
         loop {
-            match self.listener.accept() {
+            let accepted = if encrypted {
+                self.tls_listener
+                    .as_ref()
+                    .expect("checked by the caller")
+                    .accept()
+            } else {
+                self.listener.accept()
+            };
+            match accepted {
                 Ok((mut stream, _)) => {
                     // Accepted and dropped, so the client learns immediately
                     // rather than waiting on a venue that will not read it.
@@ -1476,6 +1657,15 @@ impl<S: LogStorage> Server<S> {
                         drop(stream);
                         continue;
                     }
+                    let tls = if encrypted {
+                        let config = self.tls_config.as_ref().expect("set with the listener");
+                        match rustls::ServerConnection::new(std::sync::Arc::clone(config)) {
+                            Ok(connection) => Some(Box::new(connection)),
+                            Err(_) => continue,
+                        }
+                    } else {
+                        None
+                    };
                     let index = self.free.pop().unwrap_or(self.sessions.len());
                     if self
                         .poll
@@ -1492,12 +1682,16 @@ impl<S: LogStorage> Server<S> {
                     let challenge = (self.mode == Mode::Required).then(auth::nonce);
                     let mut session = Session::new(
                         stream,
+                        tls,
                         self.max_records_per_session,
                         self.max_outbox,
                         challenge,
                     );
                     // Queued before the client has said anything: it cannot
-                    // prove who it is until it knows what to sign.
+                    // prove who it is until it knows what to sign. Behind TLS
+                    // it waits in the record layer until the handshake ends;
+                    // rustls holds plaintext written this early and sends it
+                    // with the first application flight.
                     if let Some(nonce) = challenge {
                         encode(&Event::challenging(nonce), &mut session.outbox);
                         session.flush();

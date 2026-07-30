@@ -11,6 +11,7 @@ pub mod config;
 pub mod limit;
 pub mod metrics;
 pub mod tcp;
+pub mod tls;
 pub mod venue;
 
 pub use auth::{Credentials, Mode as AuthMode};

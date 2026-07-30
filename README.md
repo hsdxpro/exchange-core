@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-421%20passing-success" alt="421 tests">
+  <img src="https://img.shields.io/badge/tests-426%20passing-success" alt="426 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -29,8 +29,8 @@
 - **6.6M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **0.9 ms** to restart from a snapshot instead of 9.6 ms replaying from zero
-- **421 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
-- Ed25519 logon, a per-symbol kill switch, and an optional venue-signed hash chain a client can check against the stream
+- **426 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
+- Ed25519 logon, TLS 1.3 for internet sessions, a per-symbol kill switch, and an optional venue-signed hash chain a client can check against the stream
 
 Every number measured on the machine this was built on. `cargo x latency` reproduces the
 command-path and durability tables in about seven seconds.
@@ -49,7 +49,7 @@ green locally and green on a runner cannot become two different things.
 cargo x
 ```
 
-Format, `clippy -D warnings`, and all 421 tests.
+Format, `clippy -D warnings`, and all 426 tests.
 
 ```bash
 cargo x latency
@@ -208,6 +208,17 @@ What the pair says:
 
 `load --subscribers N` reproduces the table.
 
+### Two doors
+
+Two listeners, because two kinds of client want opposite things. The colocated cross-connect
+gets raw TCP — fixed 64-byte records, nothing between the client and the book, the same trade
+CME iLink and Nasdaq OUCH make. Internet sessions get **TLS 1.3** (`tls_listen`, rustls,
+1.3 only): the Ed25519 logon proves who a session is, and on a public wire TLS is what extends
+that from the handshake to every byte after it. Past the record layer the two are identical —
+same framing, same budgets, same books — and the e2e suite proves a plaintext probe at the TLS
+door is dropped without disturbing the client behind it. Certificate and key are operator-held
+PEM files; nothing inline, nothing in the repository.
+
 ### Verifiable ordering
 
 **Optional, off by default, +25 ns a command, +17 ns more when signed.** The journal keeps a running SHA-256 over its
@@ -313,7 +324,7 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 ## Testing
 
-421 tests. The ones worth reading:
+426 tests. The ones worth reading:
 
 | Test | What it proves |
 |---|---|
@@ -342,12 +353,6 @@ Scope boundaries, with reasons rather than apologies:
   thread pool. The largest open question here.
 - **`io_uring`.** Linux-only, and untested platform-specific I/O is worse than none.
   Batching writes recovered 8.6× without leaving `std`.
-- **Encryption.** The Ed25519 logon proves who a session is at connect and binds every later
-  command to that account; it does not encrypt or authenticate the bytes after. On a private
-  cross-connect that is the accepted trade — CME iLink and Nasdaq OUCH run unencrypted for
-  the same reason — but it means an attacker who can *write* to the wire can still inject.
-  A TLS listener is the answer for clients that are not on a private link, and it is the
-  largest thing still missing.
 - **Withdrawals and fees.** Venue features, not exchange-core ones. Halts *are* here — a
   symbol has a trading state and an account has a kill switch.
 

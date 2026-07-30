@@ -70,6 +70,9 @@ fn measurement_config() -> Config {
         chain: false,
         chain_interval: 0,
         chain_key_file: None,
+        tls_listen: None,
+        tls_cert_file: None,
+        tls_key_file: None,
         target_recovery: Duration::from_secs(2),
         replay_rate: 7_600_000,
         retained_per_channel: 1 << 16,
@@ -198,6 +201,15 @@ fn run<S: LogStorage>(
                 "chain on, UNSIGNED: heads prove the venue agrees with itself,                  not that its history was never rewritten"
             ),
         }
+    }
+
+    if let (Some(address), Some(cert), Some(key)) = (
+        &config.tls_listen,
+        &config.tls_cert_file,
+        &config.tls_key_file,
+    ) {
+        server.tls_listen(address, cert, key)?;
+        println!("tls 1.3 listening on {address}; the raw listener stays for the cross-connect");
     }
 
     // Recover first, always, and let the recovered state say whether this venue

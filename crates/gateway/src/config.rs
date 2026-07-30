@@ -199,6 +199,13 @@ pub struct Config {
     /// in whatever holds that file -- a repository, an image layer, a backup --
     /// and the public half is the only part that belongs anywhere shareable.
     pub chain_key_file: Option<PathBuf>,
+    /// Second listener, speaking TLS 1.3, for sessions that arrive over the
+    /// internet. The raw listener stays for the colocated cross-connect.
+    pub tls_listen: Option<String>,
+    /// The venue's certificate chain, PEM. A path, like every key here.
+    pub tls_cert_file: Option<PathBuf>,
+    /// The certificate's private key, PEM. Never inline in configuration.
+    pub tls_key_file: Option<PathBuf>,
     pub max_records_per_session: usize,
     /// Connections held at once. Beyond this the venue refuses rather than
     /// serving everyone slowly.
@@ -271,6 +278,9 @@ impl Config {
         let mut chain = None;
         let mut chain_interval = None;
         let mut chain_key_file = None;
+        let mut tls_listen = None;
+        let mut tls_cert_file = None;
+        let mut tls_key_file = None;
         let mut target_recovery_ms = None;
         let mut replay_rate = None;
         let mut retained = None;
@@ -418,6 +428,9 @@ impl Config {
                 }
                 "chain_interval" => chain_interval = Some(number("chain_interval")?),
                 "chain_key_file" => chain_key_file = Some(PathBuf::from(value)),
+                "tls_listen" => tls_listen = Some(value.to_string()),
+                "tls_cert_file" => tls_cert_file = Some(PathBuf::from(value)),
+                "tls_key_file" => tls_key_file = Some(PathBuf::from(value)),
                 "journal" => journal = Some(PathBuf::from(value)),
                 "snapshot" => snapshot = Some(PathBuf::from(value)),
                 "target_recovery_ms" => target_recovery_ms = Some(number("target_recovery_ms")?),
@@ -622,6 +635,20 @@ impl Config {
             ));
         }
 
+        // Half a TLS door is worse than none: a listener with no identity
+        // cannot serve, and a certificate nothing listens with reads as
+        // encryption that is not there.
+        let tls_parts = [
+            tls_listen.is_some(),
+            tls_cert_file.is_some(),
+            tls_key_file.is_some(),
+        ];
+        if tls_parts.iter().any(|p| *p) && !tls_parts.iter().all(|p| *p) {
+            return Err(ConfigError::whole_file(
+                "tls_listen, tls_cert_file and tls_key_file go together: all                  three, or none",
+            ));
+        }
+
         // A cluster that cannot say which node it is, or where its vote is kept,
         // is one that would either wait forever or forget what it voted.
         if !peers.is_empty() {
@@ -698,6 +725,9 @@ impl Config {
             chain: chain.unwrap_or(false),
             chain_interval: chain_interval.unwrap_or(0),
             chain_key_file,
+            tls_listen,
+            tls_cert_file,
+            tls_key_file,
             max_records_per_session: usize::try_from(max_records)
                 .map_err(|_| ConfigError::whole_file("max_records_per_session is too large"))?,
             max_sessions: usize::try_from(max_sessions)
@@ -906,6 +936,39 @@ chain_key_file = venue.key
         assert!(!config.chain, "verifiability turned itself on");
         assert_eq!(config.chain_interval, 0);
         assert!(config.chain_key_file.is_none());
+    }
+
+    #[test]
+    fn half_a_tls_door_is_refused() {
+        for partial in [
+            "tls_listen = 127.0.0.1:7443
+",
+            "tls_cert_file = venue.crt
+",
+            "tls_listen = 127.0.0.1:7443
+tls_cert_file = venue.crt
+",
+            "tls_key_file = venue.tls.key
+",
+        ] {
+            let text = VALID.to_owned() + partial;
+            assert!(
+                refusal(&text).contains("all"),
+                "accepted a partial TLS configuration: {partial}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_whole_tls_door_parses() {
+        let text = VALID.to_owned()
+            + "tls_listen = 127.0.0.1:7443
+tls_cert_file = venue.crt
+tls_key_file = venue.tls.key
+";
+        let config = Config::parse(&text).expect("a complete TLS door is valid");
+        assert_eq!(config.tls_listen.as_deref(), Some("127.0.0.1:7443"));
+        assert!(config.tls_cert_file.is_some() && config.tls_key_file.is_some());
     }
 
     #[test]
