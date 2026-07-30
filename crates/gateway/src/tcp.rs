@@ -1199,7 +1199,11 @@ impl<S: LogStorage> Server<S> {
             match channel {
                 Channel::Book(symbol) => self.send_book_state(index, symbol, from),
                 Channel::Bbo(symbol) => self.send_top_state(index, symbol, from),
-                Channel::Trades(_) | Channel::Account(_) => {}
+                // Neither carries state a subscriber has to be told first: a
+                // print is an event, and a chain head is only meaningful from the
+                // next one onward -- a client cannot verify a head over records it
+                // never saw, so there is nothing useful to restate.
+                Channel::Trades(_) | Channel::Account(_) | Channel::Checkpoint => {}
             }
         } else {
             self.stop_following(index, channel);
@@ -1562,7 +1566,16 @@ impl<S: LogStorage> Server<S> {
                     }
                     self.send_top_state(index, symbol, at);
                 }
-                Channel::Trades(_) => {
+                // A gap in the tape is a gap: there is no state to restate, so
+                // the cursor moves to the front and the client knows it missed
+                // prints.
+                //
+                // The chain heads are the same shape and for a sharper reason. A
+                // head commits to records; one a client did not see cannot be
+                // checked, so replaying it would hand over a commitment the
+                // client has no way to test. Moving the cursor forward tells it
+                // to verify from here on.
+                Channel::Trades(_) | Channel::Checkpoint => {
                     let at = self.venue.hub().next_sequence(channel).unwrap_or_default();
                     if let Some(session) = self.sessions[index].as_mut() {
                         session.reposition(channel, at);

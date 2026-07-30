@@ -282,6 +282,9 @@ pub enum ChannelKind {
     /// client that only needs a price pays for price changes rather than for
     /// every order the venue receives.
     Bbo = 3,
+    /// The venue's chain heads. One feed for the whole venue, not per symbol:
+    /// the chain covers the sequenced stream, which is every symbol at once.
+    Checkpoint = 4,
 }
 
 /// Why an order was refused. Every variant is a distinct, reportable reason; a
@@ -432,6 +435,19 @@ pub enum EventKind {
     /// Published, because a halt a client cannot see is a halt it will keep
     /// sending orders into. `symbol` names the instrument.
     SymbolState = 12,
+    /// The journal's chain head, committing to every record up to
+    /// `cause_sequence`.
+    ///
+    /// The head is 32 bytes, carried in the four fields an event of this kind has
+    /// no other use for -- exactly a full SHA-256 digest, untruncated. See
+    /// [`Event::chain_head`].
+    ///
+    /// Published so a client can check the venue against the stream it saw
+    /// rather than take its word. Unsigned: this says *what* the venue committed
+    /// to, and a client that recomputes a different head knows the two disagree.
+    /// It does not yet let that client prove to a third party which of them was
+    /// right, which is what a venue signature over the head would add.
+    Checkpoint = 14,
     /// An account's ability to open new risk changed. `quantity` is 0 for
     /// stopped and 1 for permitted.
     ///
@@ -499,6 +515,35 @@ const _: () = assert!(size_of::<Event>() == 64);
 impl Event {
     /// Returns `None` if the discriminant is not a value this version defines.
     ///
+    /// The 32-byte chain head in an [`EventKind::Checkpoint`]. Meaningless for
+    /// any other kind: a checkpoint names no order and no price, so it reuses the
+    /// four fields that would carry them.
+    #[must_use]
+    pub fn chain_head(&self) -> [u8; 32] {
+        let mut head = [0_u8; 32];
+        head[..8].copy_from_slice(&self.order_id.to_le_bytes());
+        head[8..16].copy_from_slice(&self.counterparty_order_id.to_le_bytes());
+        head[16..24].copy_from_slice(&self.quantity.to_le_bytes());
+        head[24..].copy_from_slice(&self.price.to_le_bytes());
+        head
+    }
+
+    /// Builds a checkpoint carrying `head`, committing to everything up to
+    /// `sequence`.
+    #[must_use]
+    pub fn checkpoint(sequence: Sequence, head: &[u8; 32]) -> Self {
+        let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("eight bytes"));
+        Self {
+            cause_sequence: sequence,
+            order_id: word(&head[..8]),
+            counterparty_order_id: word(&head[8..16]),
+            quantity: word(&head[16..24]),
+            price: i64::from_le_bytes(head[24..].try_into().expect("eight bytes")),
+            kind: EventKind::Checkpoint as u8,
+            ..Self::default()
+        }
+    }
+
     /// Typed, so a client reporting why it was refused can print the reason's
     /// message rather than a number an operator has to look up in this file.
     #[must_use]
@@ -548,6 +593,7 @@ impl Event {
             11 => Some(EventKind::Bbo),
             12 => Some(EventKind::SymbolState),
             13 => Some(EventKind::AccountTrading),
+            14 => Some(EventKind::Checkpoint),
             _ => None,
         }
     }
@@ -635,6 +681,7 @@ impl Command {
             1 => Some(ChannelKind::Trades),
             2 => Some(ChannelKind::Account),
             3 => Some(ChannelKind::Bbo),
+            4 => Some(ChannelKind::Checkpoint),
             _ => None,
         }
     }
@@ -1031,6 +1078,13 @@ mod tests {
             (0, ChannelKind::Book),
             (1, ChannelKind::Trades),
             (2, ChannelKind::Account),
+            // `Bbo` was added without being listed here, and `Checkpoint` after
+            // it. A channel the decoder does not know is a subscription the
+            // venue accepts and then silently never publishes to -- which is
+            // how the checkpoint feed first appeared to work and delivered
+            // nothing.
+            (3, ChannelKind::Bbo),
+            (4, ChannelKind::Checkpoint),
         ] {
             let command = Command {
                 kind: CommandKind::Subscribe as u8,
@@ -1041,12 +1095,19 @@ mod tests {
             assert!(command.is_session_control());
         }
 
-        let unknown = Command {
-            kind: CommandKind::Subscribe as u8,
-            quantity: 99,
-            ..sample()
-        };
-        assert!(unknown.channel_kind().is_none());
+        // One past the last defined channel, and a far value. When adding a
+        // channel, extend the list above and move this boundary up.
+        for quantity in [5, 99] {
+            let unknown = Command {
+                kind: CommandKind::Subscribe as u8,
+                quantity,
+                ..sample()
+            };
+            assert!(
+                unknown.channel_kind().is_none(),
+                "channel {quantity} decoded to something"
+            );
+        }
 
         // An order is not session control, whatever its quantity.
         assert!(!sample().is_session_control());
@@ -1129,6 +1190,7 @@ mod tests {
             (11, EventKind::Bbo),
             (12, EventKind::SymbolState),
             (13, EventKind::AccountTrading),
+            (14, EventKind::Checkpoint),
         ] {
             let event = Event {
                 kind: byte,
@@ -1138,7 +1200,7 @@ mod tests {
         }
         assert!(
             Event {
-                kind: 14,
+                kind: 15,
                 ..Event::default()
             }
             .kind()

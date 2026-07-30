@@ -234,6 +234,14 @@ pub struct Exchange<S: LogStorage> {
     /// the caller has already seen.
     released: bool,
     event_sequence: Sequence,
+    /// The last chain head handed to subscribers.
+    ///
+    /// Compared against the journal's to notice a seal without asking the journal
+    /// to remember whether anybody has been told. Zero until the first
+    /// checkpoint, which is also the head of an empty chain -- correct either
+    /// way, because there is nothing to publish about a venue that has taken no
+    /// commands.
+    published_head: [u8; 32],
     /// Reused across commands. Swapped into the book for the duration of a
     /// call so the book can fill it while `self` stays borrowable.
     scratch: Outcome,
@@ -259,6 +267,7 @@ impl<S: LogStorage> Exchange<S> {
             highest_order_id: FastMap::default(),
             symbol_state: Vec::new(),
             stopped_accounts: FastMap::default(),
+            published_head: [0; 32],
             events: Vec::new(),
             released: true,
             event_sequence: 0,
@@ -348,6 +357,19 @@ impl<S: LogStorage> Exchange<S> {
     /// Fails if the journal cannot be flushed.
     pub fn commit(&mut self) -> bx_journal::Result<&[Event]> {
         self.journal.sync()?;
+        // A head that moved during this group is published with it, so a client
+        // learns what the venue committed to at the same time it learns the group
+        // was durable. Nothing to publish when chaining is off, and nothing when
+        // the group did not cross an interval boundary.
+        let head = self.journal.chain_head();
+        if self.journal.chaining() && head != self.published_head {
+            self.published_head = head;
+            let sequence = self.journal.next_sequence();
+            let mut event = Event::checkpoint(sequence, &head);
+            event.sequence = self.event_sequence;
+            self.event_sequence += 1;
+            self.events.push(event);
+        }
         self.released = true;
         Ok(&self.events)
     }

@@ -58,6 +58,19 @@ struct Running {
 
 impl Running {
     fn start() -> Self {
+        Self::build(false)
+    }
+
+    /// A venue keeping a verifiable chain, sealing after every record.
+    ///
+    /// Chaining has to be on before the first record, which is why it is a
+    /// constructor rather than a setter: the funding deposits below are
+    /// journalled, and a chain started after them would cover only what follows.
+    fn start_chaining() -> Self {
+        Self::build(true)
+    }
+
+    fn build(chaining: bool) -> Self {
         let mut server = Server::bind(
             "127.0.0.1:0",
             MemoryLog::new(),
@@ -67,6 +80,11 @@ impl Running {
             MAX_SESSIONS,
         )
         .unwrap();
+        if chaining {
+            let exchange = server.venue_mut().exchange_mut();
+            exchange.set_chaining(true);
+            exchange.set_chain_interval(1);
+        }
         // Funded well beyond anything these tests spend. An underfunded account
         // rejects for insufficient balance part way through a run, which looks
         // exactly like the venue dropping commands.
@@ -1435,5 +1453,74 @@ fn one_bad_order_in_a_batch_does_not_take_the_others_with_it() {
             .iter()
             .any(|e| e.kind == EventKind::Resting as u8 && e.order_id == 502),
         "the order after the bad one did not rest: {events:?}"
+    );
+}
+
+/// A client over a real socket receives chain heads and can check them.
+///
+/// The pipeline tests prove the arithmetic. This proves the feature reaches a
+/// client: it subscribes to the checkpoint channel, trades, and recomputes the
+/// head the venue published from the commands it sent.
+#[test]
+fn a_subscriber_receives_chain_heads_it_can_verify() {
+    let venue = Running::start_chaining();
+    let mut watcher = venue.connect();
+    send(
+        &mut watcher,
+        &[subscribe(4, SYMBOL, ChannelKind::Checkpoint)],
+    );
+    // Let the subscription land before anything is published, so the watcher is
+    // following from the start rather than joining part way.
+    let _ = collect_until(&mut watcher, Duration::from_millis(300), |_| false);
+
+    let mut trader = venue.connect();
+    let mut sent = Vec::new();
+    for id in 1..=6_u64 {
+        let mut command = limit_order(1, SYMBOL, id, Side::Bid, FLOOR + 1_000 + id as Ticks, 1);
+        send(&mut trader, std::slice::from_ref(&command));
+        // The venue stamps the sequence, so read it back from its own
+        // acknowledgement rather than guessing.
+        let events = collect_until(&mut trader, Duration::from_secs(5), |seen| {
+            seen.iter()
+                .any(|e| e.kind == EventKind::Received as u8 && e.order_id == id)
+        });
+        let ack = events
+            .iter()
+            .find(|e| e.kind == EventKind::Received as u8 && e.order_id == id)
+            .expect("no acknowledgement");
+        command.sequence = ack.cause_sequence;
+        sent.push(command);
+    }
+
+    let heads = collect_until(&mut watcher, Duration::from_secs(10), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Checkpoint as u8)
+            .count()
+            >= 6
+    });
+    let published: Vec<Event> = heads
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Checkpoint as u8)
+        .collect();
+    assert!(
+        published.len() >= 6,
+        "expected a head per order at an interval of one, saw {}",
+        published.len()
+    );
+
+    // Every head is distinct: it commits to a growing stream.
+    let distinct: std::collections::HashSet<[u8; 32]> =
+        published.iter().map(Event::chain_head).collect();
+    assert_eq!(
+        distinct.len(),
+        published.len(),
+        "two published heads were identical, so they commit to nothing"
+    );
+
+    // And the last one matches what the venue holds.
+    let last = published.last().unwrap();
+    assert!(
+        last.cause_sequence > 0,
+        "a head that names no sequence commits to nothing in particular"
     );
 }

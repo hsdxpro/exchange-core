@@ -127,9 +127,15 @@ that overhead every time.
   venue and every client would disagree for a reason neither could see. It is refused after
   the first append.
 
-**Not yet on the wire.** The head is state and API; publishing it to clients as a signed
-checkpoint event is the remaining step, and until that exists no client can actually check
-anything.
+**On the wire.** `checkpoint` is a fourth public channel, venue-wide rather than per symbol
+because the chain covers the sequenced stream and that is every symbol at once. A head is
+published with the group that sealed it, so a client learns what the venue committed to at
+the same moment it learns the group was durable. The 32 bytes ride in the four fields a
+checkpoint has no other use for — a full digest, untruncated.
+
+**Unsigned, and that is a real limit.** A client that recomputes a different head knows the
+two disagree. It cannot yet prove to a third party which of them was right, which is what a
+venue signature over the head would add.
 
 **Snapshot cadence is derived, not picked.** Choose a target recovery time, measure replay
 throughput, snapshot often enough that replay never exceeds it. If replay runs at 5M
@@ -253,6 +259,7 @@ version byte in the header, zero-copy decode. No serialization framework on the 
 book.{symbol}      depth deltas, and a snapshot on subscribe
 trades.{symbol}    executions
 account            private: this session's own order lifecycle and fills
+checkpoint         venue-wide: chain heads, when chaining is on
 ```
 
 Three channels rather than the six an earlier draft listed. The private ones collapsed

@@ -15,7 +15,7 @@ mod common;
 use bx_journal::{CHAIN_LEN, EMPTY_CHAIN, MemoryLog, chain_next};
 use bx_pipeline::snapshot::Snapshot;
 use bx_pipeline::{Exchange, limit_order};
-use bx_protocol::{Command, Side};
+use bx_protocol::{Command, EventKind, Side};
 use common::{SYMBOL, funded, instruments};
 use zerocopy::IntoBytes;
 
@@ -299,4 +299,114 @@ fn a_head_is_a_full_digest() {
         head.iter().any(|byte| *byte != 0),
         "a head of zeroes is not a digest"
     );
+}
+
+// ----------------------------------------------------- publishing the head
+
+/// The head reaches clients, not just the venue's own API.
+///
+/// A chain nobody is told about proves nothing. This is the difference between
+/// having the property and shipping it.
+#[test]
+fn a_checkpoint_is_published_when_the_head_seals() {
+    let mut exchange = chaining_with_interval(4);
+    let mut published = Vec::new();
+
+    for id in 1..=16_u64 {
+        let mut command = limit_order(1, SYMBOL, id, Side::Bid, 10_050, 1);
+        let events = exchange.submit(&mut command).unwrap();
+        for event in events {
+            if event.kind == EventKind::Checkpoint as u8 {
+                published.push(*event);
+            }
+        }
+    }
+
+    assert!(
+        !published.is_empty(),
+        "the head sealed but no checkpoint was published"
+    );
+    // The last one carries the head the venue now holds.
+    let last = published.last().unwrap();
+    assert_eq!(
+        last.chain_head(),
+        exchange.chain_head(),
+        "the published head is not the venue's"
+    );
+    assert!(
+        last.cause_sequence > 0,
+        "a checkpoint that names no sequence commits to nothing in particular"
+    );
+}
+
+/// Nothing is published when chaining is off.
+#[test]
+fn no_checkpoints_without_chaining() {
+    let mut exchange = funded();
+    for id in 1..=8_u64 {
+        let mut command = limit_order(1, SYMBOL, id, Side::Bid, 10_050, 1);
+        let events = exchange.submit(&mut command).unwrap();
+        assert!(
+            !events.iter().any(|e| e.kind == EventKind::Checkpoint as u8),
+            "a venue with chaining off published a checkpoint"
+        );
+    }
+}
+
+/// A checkpoint carries a full digest through the record and back.
+#[test]
+fn a_checkpoint_round_trips_its_head() {
+    let mut head = [0_u8; 32];
+    for (index, byte) in head.iter_mut().enumerate() {
+        *byte = u8::try_from(index).expect("32 fits") ^ 0x5a;
+    }
+    let event = bx_protocol::Event::checkpoint(4_096, &head);
+    assert_eq!(event.kind(), Some(EventKind::Checkpoint));
+    assert_eq!(event.cause_sequence, 4_096);
+    assert_eq!(
+        event.chain_head(),
+        head,
+        "the head did not survive the record"
+    );
+}
+
+/// The published head is the one a client recomputes from the stream.
+///
+/// End to end for the property: the venue publishes, the client recalculates
+/// from the commands it saw, and the two agree.
+#[test]
+fn a_client_can_check_a_published_checkpoint_against_the_stream() {
+    const INTERVAL: u64 = 4;
+    let mut exchange = chaining_with_interval(INTERVAL);
+    let mut recomputed = exchange.chain_head();
+    let mut latest = None;
+
+    // A verifier has to fold a whole interval's records into one digest, the way
+    // the venue does. Calling the extend function per record instead finalises
+    // per record, which is a *different* chain -- correct arithmetic over the
+    // wrong boundaries, and it disagrees with the venue for a reason that looks
+    // like a bug in the venue. Hence submitting an interval at a time here.
+    for round in 0..2_u64 {
+        let mut batch: Vec<Command> = (0..INTERVAL)
+            .map(|i| {
+                let id = round * INTERVAL + i + 1;
+                limit_order(1, SYMBOL, id, Side::Bid, 10_050 + id as i64, 1)
+            })
+            .collect();
+        let events = exchange.submit_batch(&mut batch).unwrap().to_vec();
+        recomputed = chain_next(&recomputed, batch.iter().map(IntoBytes::as_bytes));
+        for event in &events {
+            if event.kind == EventKind::Checkpoint as u8 {
+                latest = Some(*event);
+            }
+        }
+    }
+
+    let checkpoint = latest.expect("no checkpoint was published");
+    assert_eq!(
+        checkpoint.chain_head(),
+        recomputed,
+        "the venue published a head the stream does not produce"
+    );
+    assert_eq!(checkpoint.chain_head(), exchange.chain_head());
 }

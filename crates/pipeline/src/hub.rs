@@ -37,6 +37,9 @@ pub enum Channel {
     Bbo(SymbolId),
     /// One account's own order lifecycle. Private to that account.
     Account(AccountId),
+    /// The venue's chain heads. Public, and venue-wide rather than per symbol:
+    /// the chain covers the sequenced stream, which is every symbol at once.
+    Checkpoint,
 }
 
 impl Channel {
@@ -56,6 +59,9 @@ impl Channel {
             ChannelKind::Trades => Self::Trades(symbol),
             ChannelKind::Bbo => Self::Bbo(symbol),
             ChannelKind::Account => Self::Account(session_account),
+            // Venue-wide: the chain covers the sequenced stream, which is every
+            // symbol at once, so the symbol a client happened to name is ignored.
+            ChannelKind::Checkpoint => Self::Checkpoint,
         }
     }
 
@@ -82,6 +88,7 @@ impl Channel {
             // rides the book channel rather than one of its own, because a
             // client that cares about a symbol's state is already following it.
             EventKind::SymbolState => Self::Book(event.symbol),
+            EventKind::Checkpoint => Self::Checkpoint,
             // Being stopped is private to the account it happened to.
             EventKind::AccountTrading => Self::Account(event.account),
         })
