@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-414%20passing-success" alt="414 tests">
+  <img src="https://img.shields.io/badge/tests-421%20passing-success" alt="421 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -29,7 +29,7 @@
 - **6.6M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **0.9 ms** to restart from a snapshot instead of 9.6 ms replaying from zero
-- **414 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
+- **421 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
 - Ed25519 logon, a per-symbol kill switch, and an optional venue-signed hash chain a client can check against the stream
 
 Every number measured on the machine this was built on. `cargo x latency` reproduces the
@@ -49,7 +49,7 @@ green locally and green on a runner cannot become two different things.
 cargo x
 ```
 
-Format, `clippy -D warnings`, and all 414 tests.
+Format, `clippy -D warnings`, and all 421 tests.
 
 ```bash
 cargo x latency
@@ -250,6 +250,13 @@ Gap-filling across a promotion would mean retaining a ring for every channel and
 into all of them during replay, which costs the whole feed budget on a venue with no
 subscribers. The price of not paying it is one snapshot per client per promotion.
 
+The one thing a restatement cannot carry is an outcome the dead leader never published — an
+order acked but never reported resting or filled. The venue journals a **watermark** every 64
+groups meaning "everything before me was handed to the feed"; recovery regenerates the private
+outcomes past the last marker, and the first session to act for each account is handed them on
+reconnect, sequence zero. Told, not queried. Never accepted from the wire, and never the ack
+itself — durable is what the ack means.
+
 ### Restart
 
 | | |
@@ -306,7 +313,7 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 ## Testing
 
-414 tests. The ones worth reading:
+421 tests. The ones worth reading:
 
 | Test | What it proves |
 |---|---|

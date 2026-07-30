@@ -138,6 +138,14 @@ struct Allowance {
 /// The listener's token. Sessions take `index + 1`, so zero is never a session.
 const LISTENER: Token = Token(0);
 
+/// Committed groups between watermarks.
+///
+/// The interval bounds two things at once: how many private outcomes a recovery
+/// may have to redeliver, and how much of the journal a promotion replays into
+/// the redelivery buffer. At 64 the overhead is one 64-byte record per 64
+/// groups -- invisible -- and the buffer stays a few thousand events at worst.
+const WATERMARK_EVERY: usize = 64;
+
 /// Nanoseconds since the Unix epoch.
 ///
 /// A wall clock rather than a monotonic one, deliberately: this number leaves
@@ -389,6 +397,8 @@ pub struct Server<S: LogStorage> {
     /// Edge-triggered readiness will not mention them again, so the loop
     /// remembers them itself.
     still_readable: Vec<usize>,
+    /// Committed groups since the venue last journalled a watermark.
+    groups_since_watermark: usize,
     /// Sessions that closed this pass, collected as they are noticed rather than
     /// found by sweeping every slot afterwards.
     closing: Vec<usize>,
@@ -507,6 +517,7 @@ impl<S: LogStorage> Server<S> {
             free: Vec::new(),
             live: 0,
             still_readable: Vec::new(),
+            groups_since_watermark: 0,
             closing: Vec::new(),
             inbound: Vec::new(),
             max_records_per_session,
@@ -743,6 +754,11 @@ impl<S: LogStorage> Server<S> {
                 }
             } else if session.account.is_none()
                 && let Some(command) = self.inbound.get(start)
+                // A command the venue itself owns cannot claim who a session
+                // is: a wire watermark carries account zero, and letting it
+                // attach would bind the session to nobody and refuse every
+                // real command after it. It is answered below, unattached.
+                && command.kind() != Some(CommandKind::Watermark)
             {
                 // Attribute each session's account from its *own* first command.
                 // Reading everyone into one buffer first and then handing
@@ -757,6 +773,7 @@ impl<S: LogStorage> Server<S> {
                 let from = self.venue.subscribe(channel);
                 self.follow(index, channel, from);
                 self.claim_allowance(account, now);
+                self.deliver_recovered_outcomes(index, account);
             }
 
             // Discarded here, before sequencing, so a flood never reaches the
@@ -777,7 +794,15 @@ impl<S: LogStorage> Server<S> {
             let mut kept = start;
             for cursor in start..end {
                 let command = self.inbound[cursor];
-                if command.kind() == Some(CommandKind::RevokeKey) {
+                if command.kind() == Some(CommandKind::Watermark) {
+                    // The venue's own marker. A client that could inject one
+                    // would move the redelivery boundary and silence outcomes
+                    // another account is owed.
+                    let refusal = refused_locally(&command, RejectReason::NotPermitted);
+                    let session = self.session_at(index);
+                    encode(&refusal, &mut session.outbox);
+                    self.owes_bytes(index);
+                } else if command.kind() == Some(CommandKind::RevokeKey) {
                     self.revoke_key(index, &command, account);
                 } else if command.is_session_control() {
                     self.apply_control(index, &command, account);
@@ -813,6 +838,14 @@ impl<S: LogStorage> Server<S> {
             self.inbound.truncate(kept);
         }
 
+        // The watermark rides an ordinary group. Injected before commit, so it
+        // sequences after everything whose outcomes have already been handed to
+        // the feed -- which is exactly the claim it journals. One 64-byte record
+        // per interval; nothing on the path when the venue is idle.
+        if self.groups_since_watermark >= WATERMARK_EVERY && !self.inbound.is_empty() {
+            self.groups_since_watermark = 0;
+            self.inbound.push(Command::watermark());
+        }
         let applied = self.inbound.len();
         if applied > 0 {
             if self.timestamps {
@@ -829,6 +862,7 @@ impl<S: LogStorage> Server<S> {
                 self.metrics.commit_took(started.elapsed());
             }
             result?;
+            self.groups_since_watermark += 1;
         }
 
         self.push_updates(applied > 0);
@@ -1009,6 +1043,7 @@ impl<S: LogStorage> Server<S> {
             let from = self.venue.subscribe(channel);
             self.follow(index, channel, from);
             self.claim_allowance(account, Some(Instant::now()));
+            self.deliver_recovered_outcomes(index, account);
         }
         self.inbound.truncate(kept);
     }
@@ -1295,6 +1330,24 @@ impl<S: LogStorage> Server<S> {
                 self.resynchronise(&[(index, channel)]);
             }
         }
+    }
+
+    /// Hands an account the outcomes a replay regenerated for it.
+    ///
+    /// Non-empty only after a recovery, and only for commands past the last
+    /// watermark: the ones whose outcome events died with the previous run.
+    /// Delivered once, to the first session that proves the account -- the
+    /// events carry sequence zero, marking them as redelivery rather than a
+    /// position in the account channel, which restarted.
+    fn deliver_recovered_outcomes(&mut self, index: usize, account: AccountId) {
+        let Some(outcomes) = self.venue.exchange_mut().take_pending_outcomes(account) else {
+            return;
+        };
+        let session = self.session_at(index);
+        for outcome in &outcomes {
+            encode(outcome, &mut session.outbox);
+        }
+        self.owes_bytes(index);
     }
 
     /// Tells one session what it still has working on a symbol.

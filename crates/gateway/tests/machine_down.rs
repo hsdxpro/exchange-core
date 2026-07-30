@@ -617,3 +617,103 @@ fn a_corrupt_journal_stops_the_venue_before_it_serves() {
         "the venue listened before noticing its journal is corrupt"
     );
 }
+
+/// A client whose outcome events died with the venue is told them on
+/// reconnect, without asking.
+///
+/// The ack means "received and durable" and the outcome follows as its own
+/// event, so a venue that dies in between leaves a client holding an ack it
+/// used to only be able to resolve by querying. The watermark closes that: the
+/// venue journals "everything before me was handed to the feed", recovery
+/// regenerates the outcomes past the last marker, and the first session to act
+/// for the account is handed them, sequence zero, before anything else.
+#[test]
+fn a_reconnecting_client_is_told_the_outcomes_that_died_with_the_venue() {
+    const ORDERS: u64 = 100;
+    let scratch = Scratch::new("watermark");
+    let journal = scratch.file("venue.log");
+    let config = standalone_config(&scratch.file("venue.conf"), &journal);
+
+    let mut venue = Process::start(
+        env!("CARGO_BIN_EXE_venue"),
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:7504",
+        ],
+    );
+    assert!(
+        venue.wait_for("listening", Duration::from_secs(60)),
+        "the venue never came up"
+    );
+    let mut client = connect("127.0.0.1:7504");
+    let acknowledged = trade_from(&mut client, 1, ORDERS);
+    assert_eq!(acknowledged, ORDERS, "not every order was acknowledged");
+    drop(client);
+    venue.kill();
+
+    let restarted = Process::start(
+        env!("CARGO_BIN_EXE_venue"),
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:7504",
+        ],
+    );
+    assert!(
+        restarted.wait_for("listening", Duration::from_secs(60)),
+        "the restarted venue never started serving"
+    );
+
+    // Same account reconnects and sends one fresh order -- its first command,
+    // which is what attaches the account. It must be handed the recovered
+    // outcomes it was never told, marked as redelivery by sequence zero. It
+    // never sends QueryOpenOrders.
+    let mut client = connect("127.0.0.1:7504");
+    let mut bytes = Vec::new();
+    encode(
+        &limit_order(1, 1, 500_000, Side::Bid, 10_000, 1),
+        &mut bytes,
+    );
+    client.write_all(&bytes).unwrap();
+
+    let mut scratch_buf = vec![0_u8; FRAME_LEN * 512];
+    let mut held = 0;
+    let mut redelivered = 0_u64;
+    let mut fresh_acknowledged = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !(redelivered > 0 && fresh_acknowledged) {
+        let Ok(read) = client.read(&mut scratch_buf[held..]) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        let filled = held + read;
+        let whole = filled / FRAME_LEN;
+        for index in 0..whole {
+            let start = index * FRAME_LEN;
+            if let Ok(event) = Event::read_from_bytes(&scratch_buf[start..start + FRAME_LEN]) {
+                if event.kind == EventKind::Resting as u8
+                    && event.sequence == 0
+                    && event.order_id <= ORDERS
+                {
+                    redelivered += 1;
+                }
+                if event.kind == EventKind::Received as u8 && event.order_id == 500_000 {
+                    fresh_acknowledged = true;
+                }
+            }
+        }
+        scratch_buf.copy_within(whole * FRAME_LEN..filled, 0);
+        held = filled - whole * FRAME_LEN;
+    }
+    assert!(
+        redelivered > 0,
+        "the reconnecting client was told nothing it was owed; \
+         it would have had to query for outcomes the venue acknowledged"
+    );
+    assert!(fresh_acknowledged, "the venue stopped serving new orders");
+}

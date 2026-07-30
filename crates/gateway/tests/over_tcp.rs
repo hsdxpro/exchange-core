@@ -15,7 +15,7 @@ use bx_pipeline::{
     cancel_on_disconnect, cancel_order, limit_order, market_order, query_open_orders, subscribe,
     unsubscribe,
 };
-use bx_protocol::{ChannelKind, Command, Event, EventKind, Side, Ticks};
+use bx_protocol::{ChannelKind, Command, Event, EventKind, RejectReason, Side, Ticks};
 use socket2::SockRef;
 use std::io::Write;
 use std::net::TcpStream;
@@ -1959,4 +1959,36 @@ fn no_channels_repair_discards_another_channels_queued_events() {
             "repairing {kind:?} discarded the private feed's queued events: got {states:?}"
         );
     }
+}
+
+/// A client cannot journal the venue's own watermark.
+///
+/// The marker moves the redelivery boundary: everything before it is treated as
+/// already told. A client that could inject one would silence the outcomes
+/// another account is owed after the next promotion.
+#[test]
+fn a_watermark_from_the_wire_is_refused() {
+    let venue = Running::start();
+    let mut client = venue.connect();
+    send(&mut client, &[Command::watermark()]);
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::Rejected)
+    });
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8
+            && e.reject_reason == RejectReason::NotPermitted as u8),
+        "a wire watermark was not refused as NotPermitted: {events:?}"
+    );
+    // And the session survives to trade.
+    send(
+        &mut client,
+        &[limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1)],
+    );
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::Resting)
+    });
+    assert!(
+        has_kind(&events, EventKind::Resting),
+        "the refusal took the session with it: {events:?}"
+    );
 }

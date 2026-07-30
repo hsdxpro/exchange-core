@@ -239,6 +239,20 @@ pub enum CommandKind {
     /// one this channel has not reached -- which is what a cursor from a previous
     /// leader looks like, since channel numbering starts over when a venue does.
     Resume = 15,
+    /// A marker the venue itself journals: every outcome for the commands
+    /// before it has been handed to the feed.
+    ///
+    /// This is what bounds the ack-outcome gap across a promotion. Without it,
+    /// a leader that dies between acknowledging a command and publishing its
+    /// outcome leaves the client holding an ack it can only resolve by asking.
+    /// With it, a recovering venue replays the tail past the last watermark,
+    /// keeps the private outcomes it regenerates, and hands them to each
+    /// account when it reconnects -- told, not queried.
+    ///
+    /// Never accepted from the wire: a client that could inject one would move
+    /// the redelivery boundary. The gateway refuses it like any other command
+    /// that is the venue's own business.
+    Watermark = 16,
     /// Drops an account's key, so it can no longer authenticate.
     ///
     /// Handled in the gateway and deliberately *not* journalled, for the same
@@ -943,6 +957,25 @@ impl Command {
         self
     }
 
+    /// The venue's own watermark record. See [`CommandKind::Watermark`].
+    #[must_use]
+    pub const fn watermark() -> Self {
+        Self {
+            sequence: 0,
+            ingress_ns: 0,
+            account: 0,
+            order_id: 0,
+            replacement_id: 0,
+            quantity: 0,
+            price: 0,
+            symbol: 0,
+            kind: CommandKind::Watermark as u8,
+            side: 0,
+            time_in_force: 0,
+            order_type: 0,
+        }
+    }
+
     /// Returns `None` if a discriminant is not a value this version defines,
     /// which is what a corrupt or newer-version record looks like.
     #[must_use]
@@ -964,6 +997,7 @@ impl Command {
             13 => Some(CommandKind::AuthenticateContinued),
             14 => Some(CommandKind::RevokeKey),
             15 => Some(CommandKind::Resume),
+            16 => Some(CommandKind::Watermark),
             _ => None,
         }
     }
@@ -1191,6 +1225,7 @@ mod tests {
             (13, CommandKind::AuthenticateContinued),
             (14, CommandKind::RevokeKey),
             (15, CommandKind::Resume),
+            (16, CommandKind::Watermark),
         ] {
             let mut command = sample();
             command.kind = byte;
@@ -1198,7 +1233,7 @@ mod tests {
             assert!(command.is_well_formed());
         }
         let mut unknown = sample();
-        unknown.kind = 16;
+        unknown.kind = 17;
         assert!(unknown.kind().is_none());
     }
 
