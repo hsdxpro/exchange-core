@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-426%20passing-success" alt="426 tests">
+  <img src="https://img.shields.io/badge/tests-431%20passing-success" alt="431 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -29,7 +29,7 @@
 - **6.6M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **0.9 ms** to restart from a snapshot instead of 9.6 ms replaying from zero
-- **426 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
+- **431 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
 - Ed25519 logon, TLS 1.3 for internet sessions, a per-symbol kill switch, and an optional venue-signed hash chain a client can check against the stream
 
 Every number measured on the machine this was built on. `cargo x latency` reproduces the
@@ -49,7 +49,7 @@ green locally and green on a runner cannot become two different things.
 cargo x
 ```
 
-Format, `clippy -D warnings`, and all 426 tests.
+Format, `clippy -D warnings`, and all 431 tests.
 
 ```bash
 cargo x latency
@@ -219,6 +219,15 @@ same framing, same budgets, same books — and the e2e suite proves a plaintext 
 door is dropped without disturbing the client behind it. Certificate and key are operator-held
 PEM files; nothing inline, nothing in the repository.
 
+### Operating it
+
+Counters are kept off the hot path already -- sampled every 64th pass, no clock read in front
+of an order -- and `metrics_listen` now serves them in Prometheus exposition format so a
+monitoring system can page on a degraded majority or a rising shed count while the venue keeps
+serving. The text is published on the cadence the venue already logs at, never built per
+request: an endpoint that did work when asked would let whoever scrapes decide how much work
+the venue does. HTTP is thirty lines by hand rather than a framework and an async runtime.
+
 ### Verifiable ordering
 
 **Optional, off by default, +25 ns a command, +17 ns more when signed.** The journal keeps a running SHA-256 over its
@@ -324,7 +333,7 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 ## Testing
 
-426 tests. The ones worth reading:
+431 tests. The ones worth reading:
 
 | Test | What it proves |
 |---|---|

@@ -213,12 +213,6 @@ impl Metrics {
         self.records_undecodable += records;
     }
 
-    /// Whole records discarded because they did not decode.
-    #[must_use]
-    pub const fn records_undecodable(&self) -> u64 {
-        self.records_undecodable
-    }
-
     #[must_use]
     pub const fn commands(&self) -> u64 {
         self.commands
@@ -240,23 +234,8 @@ impl Metrics {
     }
 
     #[must_use]
-    pub const fn commit_ns(&self) -> &Histogram {
-        &self.commit_ns
-    }
-
-    #[must_use]
-    pub const fn pass_ns(&self) -> &Histogram {
-        &self.pass_ns
-    }
-
-    #[must_use]
     pub const fn sessions_accepted(&self) -> u64 {
         self.sessions_accepted
-    }
-
-    #[must_use]
-    pub const fn sessions_refused(&self) -> u64 {
-        self.sessions_refused
     }
 
     #[must_use]
@@ -306,11 +285,181 @@ impl Metrics {
         );
         out
     }
+
+    /// The same numbers in Prometheus exposition format, for a scraper.
+    ///
+    /// A sibling of [`Self::report`] rather than a replacement: one is read by a
+    /// person in a log, the other by a monitoring system that has to page
+    /// somebody at three in the morning. Neither derives from the other, and the
+    /// fields are the single source both read.
+    ///
+    /// Latency is exported as summary quantiles rather than native histogram
+    /// buckets. The internal histogram has 64 buckets per octave, so exporting
+    /// it whole would put thousands of series on the wire per scrape to answer
+    /// a question every operator asks as "what is p99".
+    #[must_use]
+    pub fn prometheus(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(2_048);
+        let counter = |out: &mut String, name: &str, help: &str, value: u64| {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} counter");
+            let _ = writeln!(out, "{name} {value}");
+        };
+        counter(
+            &mut out,
+            "bx_commands_total",
+            "Commands applied by the venue.",
+            self.commands,
+        );
+        counter(
+            &mut out,
+            "bx_groups_total",
+            "Groups committed: one journal write, one sync, one quorum round each.",
+            self.groups,
+        );
+        counter(
+            &mut out,
+            "bx_passes_total",
+            "Passes of the trading loop, committing or idle.",
+            self.passes,
+        );
+        counter(
+            &mut out,
+            "bx_sessions_accepted_total",
+            "Connections admitted.",
+            self.sessions_accepted,
+        );
+        counter(
+            &mut out,
+            "bx_sessions_refused_total",
+            "Connections refused because the venue was already full.",
+            self.sessions_refused,
+        );
+        counter(
+            &mut out,
+            "bx_sessions_shed_total",
+            "Sessions dropped for owing more bytes than their budget allows.",
+            self.sessions_shed,
+        );
+        counter(
+            &mut out,
+            "bx_subscriptions_restated_total",
+            "Feeds restated because a client fell outside the retention window.",
+            self.subscriptions_restated,
+        );
+        counter(
+            &mut out,
+            "bx_records_undecodable_total",
+            "Whole records discarded because they did not decode.",
+            self.records_undecodable,
+        );
+
+        for (name, help, held) in [
+            (
+                "bx_commit_nanoseconds",
+                "Time to commit a group: journal, sync and quorum.",
+                &self.commit_ns,
+            ),
+            (
+                "bx_pass_nanoseconds",
+                "Time for one whole pass of the trading loop.",
+                &self.pass_ns,
+            ),
+            (
+                "bx_group_size_commands",
+                "Commands in a committed group.",
+                &self.group_size,
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} summary");
+            for (quantile, fraction) in [("0.5", 0.5), ("0.99", 0.99), ("0.999", 0.999)] {
+                let _ = writeln!(
+                    out,
+                    "{name}{{quantile=\"{quantile}\"}} {}",
+                    held.percentile(fraction)
+                );
+            }
+            // Sampled, so the count is passes measured rather than passes taken;
+            // an operator reading a rate off it should know which.
+            let _ = writeln!(out, "{name}_count {}", held.count());
+        }
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_exposition_names_every_counter_and_parses_as_prometheus_does() {
+        let mut metrics = Metrics::default();
+        metrics.pass(3);
+        metrics.commit_took(Duration::from_nanos(400));
+        metrics.pass_took(Duration::from_nanos(900));
+        metrics.accepted();
+        metrics.refused();
+        metrics.shed();
+        metrics.restated();
+        metrics.undecodable(2);
+        let text = metrics.prometheus();
+
+        // Every counter reaches the wire. A counter that exists and is never
+        // exported is one nobody can alert on, which is the same as not having
+        // it.
+        for name in [
+            "bx_commands_total",
+            "bx_groups_total",
+            "bx_passes_total",
+            "bx_sessions_accepted_total",
+            "bx_sessions_refused_total",
+            "bx_sessions_shed_total",
+            "bx_subscriptions_restated_total",
+            "bx_records_undecodable_total",
+            "bx_commit_nanoseconds",
+            "bx_pass_nanoseconds",
+            "bx_group_size_commands",
+        ] {
+            assert!(
+                text.contains(name),
+                "{name} is not exported:
+{text}"
+            );
+        }
+        assert!(text.contains("bx_commands_total 3"), "{text}");
+        assert!(text.contains("bx_records_undecodable_total 2"), "{text}");
+
+        // Shape, the way a scraper reads it: every sample line is a name and a
+        // value, every metric is declared before it is used, and nothing is
+        // left half-written.
+        let mut declared: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                declared.push(rest.split(' ').next().unwrap());
+                continue;
+            }
+            if line.starts_with("# HELP ") {
+                continue;
+            }
+            let (name, value) = line
+                .rsplit_once(' ')
+                .unwrap_or_else(|| panic!("not a sample line: {line}"));
+            value
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("value is not a number: {line}"));
+            let base = name
+                .split_once('{')
+                .map_or(name, |(base, _)| base)
+                .trim_end_matches("_count");
+            assert!(
+                declared.contains(&base),
+                "{base} has samples but no TYPE line:
+{text}"
+            );
+        }
+    }
 
     #[test]
     fn small_values_land_in_their_own_buckets() {

@@ -20,6 +20,7 @@
 use bx_election::Leadership;
 use bx_gateway::auth::{self, Credentials, Mode as AuthMode};
 use bx_gateway::config::Config;
+use bx_gateway::expose::Exporter;
 use bx_gateway::tcp::{Server, SnapshotPolicy};
 use bx_journal::{FileLog, JournalError, LogStorage, MemoryLog, ReplicatedLog};
 use bx_pipeline::instrument::{Instrument, Instruments};
@@ -73,6 +74,7 @@ fn measurement_config() -> Config {
         tls_listen: None,
         tls_cert_file: None,
         tls_key_file: None,
+        metrics_listen: None,
         target_recovery: Duration::from_secs(2),
         replay_rate: 7_600_000,
         retained_per_channel: 1 << 16,
@@ -212,6 +214,16 @@ fn run<S: LogStorage>(
         println!("tls 1.3 listening on {address}; the raw listener stays for the cross-connect");
     }
 
+    // Held for the life of the venue: dropping it stops the serving thread.
+    let exporter = match &config.metrics_listen {
+        Some(address) => {
+            let exporter = Exporter::start(address)?;
+            println!("metrics on http://{}", exporter.address());
+            Some(exporter)
+        }
+        None => None,
+    };
+
     // Recover first, always, and let the recovered state say whether this venue
     // has a history rather than asking whether a file happened to exist.
     //
@@ -290,6 +302,11 @@ fn run<S: LogStorage>(
         if commands >= reported_at + REPORT_EVERY {
             reported_at = commands;
             println!("{}", server.metrics().report());
+            // Published on the cadence the venue already reports on, so the
+            // scrape endpoint costs no clock read and no work per request.
+            if let Some(exporter) = &exporter {
+                exporter.publish(server.metrics().prometheus());
+            }
             let refused = server.venue().exchange().rejects_by_reason();
             if !refused.is_empty() {
                 let named: Vec<String> = refused

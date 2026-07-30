@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod codec;
 pub mod config;
+pub mod expose;
 pub mod limit;
 pub mod metrics;
 pub mod tcp;

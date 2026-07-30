@@ -206,6 +206,9 @@ pub struct Config {
     pub tls_cert_file: Option<PathBuf>,
     /// The certificate's private key, PEM. Never inline in configuration.
     pub tls_key_file: Option<PathBuf>,
+    /// Where to serve counters for a monitoring system to scrape. Absent means
+    /// the venue reports to its log and nowhere else.
+    pub metrics_listen: Option<String>,
     pub max_records_per_session: usize,
     /// Connections held at once. Beyond this the venue refuses rather than
     /// serving everyone slowly.
@@ -281,6 +284,7 @@ impl Config {
         let mut tls_listen = None;
         let mut tls_cert_file = None;
         let mut tls_key_file = None;
+        let mut metrics_listen = None;
         let mut target_recovery_ms = None;
         let mut replay_rate = None;
         let mut retained = None;
@@ -431,6 +435,7 @@ impl Config {
                 "tls_listen" => tls_listen = Some(value.to_string()),
                 "tls_cert_file" => tls_cert_file = Some(PathBuf::from(value)),
                 "tls_key_file" => tls_key_file = Some(PathBuf::from(value)),
+                "metrics_listen" => metrics_listen = Some(value.to_string()),
                 "journal" => journal = Some(PathBuf::from(value)),
                 "snapshot" => snapshot = Some(PathBuf::from(value)),
                 "target_recovery_ms" => target_recovery_ms = Some(number("target_recovery_ms")?),
@@ -728,6 +733,7 @@ impl Config {
             tls_listen,
             tls_cert_file,
             tls_key_file,
+            metrics_listen,
             max_records_per_session: usize::try_from(max_records)
                 .map_err(|_| ConfigError::whole_file("max_records_per_session is too large"))?,
             max_sessions: usize::try_from(max_sessions)
