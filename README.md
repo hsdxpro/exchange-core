@@ -201,16 +201,24 @@ subscribers, the only difference being which port they watch:
 | 128 senders, 200,000 orders, 1,024 subscribers | On the trading port | On the feed port |
 |---|---:|---:|
 | Round trip, min | 511.8 µs | **19.5 µs** |
-| Round trip, p50 | 28.1 ms | **30.5 µs** |
-| Pipelined throughput | 31,054/sec | **1,967,675/sec** |
+| Round trip, p50 | 28.1 ms | **23.3 µs** |
+| Pipelined throughput | 31,054/sec | **2,531,928/sec** |
 | Orders acknowledged | 200,000 of 200,000 | **200,000 of 200,000** |
 
-**922× on p50, 63× on throughput**, and the order path is back to roughly what it
+**1,207× on p50, 81× on throughput**, and the order path is back to roughly what it
 costs with nobody watching at all. This is the OUCH/ITCH split every venue
 converges on, and the reason is this table rather than tradition. The private
 account feed stays on the trading session — that is the trader's own reply path
 — and the feed port serves the public channels only, which is why it can ask for
 no credentials.
+
+The feed thread earns a fifth of that on its own. Its first version walked every
+subscriber for every channel that moved and fanned out once per group; indexing
+subscribers by channel, accumulating the channels across every group waiting and
+walking the audience once, and visiting only the sessions holding bytes took p50
+from 30.5 to 23.3 µs and throughput from 1.97M to 2.53M. The same three
+mechanisms the venue's own loop uses, which is where they should have been
+copied from in the first place.
 
 `load --subscribers 1024 --feed 127.0.0.1:7071` against `bench.conf` reproduces
 both columns; restart the venue between runs, or the second one measures the

@@ -37,6 +37,7 @@
 
 use crate::codec::{Decoder, encode};
 use crate::handoff::Handoff;
+use bx_pipeline::fastmap::FastMap;
 use bx_pipeline::hub::{Channel, Hub, Resume};
 use bx_protocol::{Command, CommandKind, Event, Sequence};
 use mio::net::{TcpListener, TcpStream};
@@ -68,6 +69,8 @@ struct Listener {
     outbox: Vec<u8>,
     /// Channels followed, and where each has been read to.
     cursors: Vec<(Channel, Sequence)>,
+    /// On the owing list. The list is a hint; this is the truth.
+    owes: bool,
     open: bool,
 }
 
@@ -78,6 +81,7 @@ impl Listener {
             decoder: Decoder::new(MOST_REQUESTS),
             outbox: Vec::new(),
             cursors: Vec::new(),
+            owes: false,
             open: true,
         }
     }
@@ -156,6 +160,9 @@ impl Feed {
                 hub: Hub::new(retained_per_channel),
                 listeners: Vec::new(),
                 free: Vec::new(),
+                by_channel: FastMap::default(),
+                touched: Vec::new(),
+                owing: Vec::new(),
                 batches: Vec::new(),
                 handoff,
                 max_outbox,
@@ -204,6 +211,19 @@ struct State {
     hub: Hub,
     listeners: Vec<Option<Listener>>,
     free: Vec<usize>,
+    /// Who follows what. Without it a pass asks every subscriber about every
+    /// channel that moved, which is the cost the venue removed from its own
+    /// loop and which this reintroduced by not copying it: at a thousand
+    /// subscribers a one-symbol group walked a thousand sessions to find the
+    /// handful that cared.
+    by_channel: FastMap<Channel, Vec<usize>>,
+    /// Channels that moved this pass, accumulated across every batch drained,
+    /// so subscribers are walked once however many groups arrived at once.
+    /// Reused rather than rebuilt, because a per-pass allocation on a feed is a
+    /// per-pass allocation.
+    touched: Vec<Channel>,
+    /// Subscribers holding bytes. An idle one is never visited.
+    owing: Vec<usize>,
     batches: Vec<Vec<Event>>,
     handoff: Handoff,
     max_outbox: usize,
@@ -311,11 +331,15 @@ impl State {
                 };
                 if !listener.cursors.iter().any(|(held, _)| *held == channel) {
                     listener.cursors.push((channel, from));
+                    self.by_channel.entry(channel).or_default().push(index);
                 }
             }
             Some(CommandKind::Unsubscribe) => {
                 if let Some(listener) = self.listeners.get_mut(index).and_then(Option::as_mut) {
                     listener.cursors.retain(|(held, _)| *held != channel);
+                }
+                if let Some(following) = self.by_channel.get_mut(&channel) {
+                    following.retain(|held| *held != index);
                 }
             }
             Some(CommandKind::Resume) => {
@@ -340,24 +364,40 @@ impl State {
     }
 
     /// Takes what the venue published and copies it to whoever is following.
+    ///
+    /// Every batch waiting is published first and the audience walked once
+    /// afterwards, rather than once per batch. The rings hold the whole pass,
+    /// and a cursor read after the last publish delivers everything since the
+    /// subscriber's position in one copy -- so arriving behind by ten groups
+    /// costs one walk rather than ten. Retention is the only bound on that, and
+    /// a subscriber whose channel wrapped is repositioned exactly as it would
+    /// have been either way.
     fn distribute(&mut self) {
         self.batches.clear();
-        self.handoff.take(&mut self.batches);
-        if self.batches.is_empty() {
+        let mut batches = std::mem::take(&mut self.batches);
+        self.handoff.take(&mut batches);
+        if batches.is_empty() {
+            self.batches = batches;
             return;
         }
-        let mut batches = std::mem::take(&mut self.batches);
+        let mut touched = std::mem::take(&mut self.touched);
+        touched.clear();
         for batch in &batches {
             self.counts
                 .events
                 .fetch_add(batch.len() as u64, Ordering::Relaxed);
             self.counts.batches.fetch_add(1, Ordering::Relaxed);
             self.hub.publish(batch);
-            // Written per batch rather than per pass: a batch is one of the
-            // venue's groups, and its subscribers must see it whole before the
-            // next one overwrites the ring behind them.
-            self.fan_out();
+            for channel in self.hub.touched() {
+                // Small by construction -- the channels one group moved -- so a
+                // scan beats hashing, and it allocates nothing.
+                if !touched.contains(channel) {
+                    touched.push(*channel);
+                }
+            }
         }
+        self.fan_out(&touched);
+        self.touched = touched;
         for batch in batches.drain(..) {
             self.handoff.recycle(batch);
         }
@@ -365,24 +405,31 @@ impl State {
     }
 
     /// The copy that used to happen on the trading thread.
-    fn fan_out(&mut self) {
-        let touched: Vec<Channel> = self.hub.touched().to_vec();
+    ///
+    /// Visits the subscribers of a moved channel, not every subscriber. The
+    /// difference is the whole cost of an audience: with a thousand watching one
+    /// symbol, the index turns a thousand-session walk per group into a walk of
+    /// the sessions that asked.
+    fn fan_out(&mut self, touched: &[Channel]) {
         for channel in touched {
-            for index in 0..self.listeners.len() {
-                let Some(listener) = self.listeners[index].as_mut() else {
+            let Some(following) = self.by_channel.get(channel) else {
+                continue;
+            };
+            for index in following.clone() {
+                let Some(listener) = self.listeners.get_mut(index).and_then(Option::as_mut) else {
                     continue;
                 };
                 let Some(cursor) = listener
                     .cursors
                     .iter_mut()
-                    .find(|(held, _)| *held == channel)
+                    .find(|(held, _)| held == channel)
                     .map(|(_, cursor)| cursor)
                 else {
                     continue;
                 };
                 match self
                     .hub
-                    .resume_bytes(channel, *cursor, &mut listener.outbox)
+                    .resume_bytes(*channel, *cursor, &mut listener.outbox)
                 {
                     Resume::Delivered { next } => *cursor = next,
                     // Behind the window, or holding a position this run never
@@ -391,22 +438,36 @@ impl State {
                     // sequence numbers tells it to reconcile against a
                     // snapshot.
                     Resume::Lagged { .. } | Resume::Ahead { .. } => {
-                        *cursor = self.hub.next_sequence(channel).unwrap_or_default();
+                        *cursor = self.hub.next_sequence(*channel).unwrap_or_default();
                     }
                     Resume::NotSubscribed => {}
+                }
+                if !listener.outbox.is_empty() && !listener.owes {
+                    listener.owes = true;
+                    self.owing.push(index);
                 }
             }
         }
     }
 
+    /// Writes to the subscribers holding bytes, and to nobody else.
+    ///
+    /// An idle audience member costs nothing per pass: it is not on the list.
+    /// The flag rather than the list is the truth, because a slot freed this
+    /// pass can be taken by a new subscriber on the next while the list still
+    /// names it.
     fn write_and_shed(&mut self) {
-        for index in 0..self.listeners.len() {
-            let Some(listener) = self.listeners[index].as_mut() else {
+        let mut owing = std::mem::take(&mut self.owing);
+        let mut kept = 0;
+        for at in 0..owing.len() {
+            let index = owing[at];
+            let Some(listener) = self.listeners.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
-            if !listener.outbox.is_empty() {
-                listener.flush();
+            if !listener.owes {
+                continue;
             }
+            listener.flush();
             // The venue neither slows down for a subscriber nor accumulates for
             // one. Past its budget it is gone, and it reconnects.
             let shed = listener.outbox.len() > self.max_outbox;
@@ -414,13 +475,46 @@ impl State {
                 self.counts.shed.fetch_add(1, Ordering::Relaxed);
             }
             if !listener.open || shed {
-                if let Some(mut gone) = self.listeners[index].take() {
-                    let _ = self.poll.registry().deregister(&mut gone.stream);
-                }
-                self.free.push(index);
-                self.counts.subscribers.fetch_sub(1, Ordering::Relaxed);
+                self.drop_listener(index);
+                continue;
+            }
+            if listener.outbox.is_empty() {
+                listener.owes = false;
+            } else {
+                owing[kept] = index;
+                kept += 1;
             }
         }
+        owing.truncate(kept);
+        self.owing = owing;
+        // Subscribers that closed without owing anything are noticed here,
+        // which is the only pass that looks at them at all.
+        for index in 0..self.listeners.len() {
+            if self.listeners[index]
+                .as_ref()
+                .is_some_and(|listener| !listener.open)
+            {
+                self.drop_listener(index);
+            }
+        }
+    }
+
+    /// Forgets a subscriber, and unhooks it from every channel index.
+    ///
+    /// Leaving a stale index behind would be worse than a leak: the slot is
+    /// reused, so the next subscriber would inherit a feed it never asked for.
+    fn drop_listener(&mut self, index: usize) {
+        let Some(mut gone) = self.listeners[index].take() else {
+            return;
+        };
+        let _ = self.poll.registry().deregister(&mut gone.stream);
+        for (channel, _) in &gone.cursors {
+            if let Some(following) = self.by_channel.get_mut(channel) {
+                following.retain(|held| *held != index);
+            }
+        }
+        self.free.push(index);
+        self.counts.subscribers.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
