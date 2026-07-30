@@ -99,7 +99,6 @@ fn a_client_can_recompute_the_head_from_the_commands_it_saw() {
     }
 }
 
-/// One group of many records: the head covers all of them, in order.
 /// A whole interval's records are covered by the head sealed at its end.
 #[test]
 fn an_interval_is_covered_by_one_head_over_its_records_in_order() {
@@ -146,7 +145,8 @@ fn the_head_holds_still_inside_an_interval_and_moves_at_the_boundary() {
     for sequence in &moved_at {
         assert!(
             (sequence + 1).is_multiple_of(4),
-            "the head advanced at sequence {sequence}, which is not an interval              boundary"
+            "the head advanced at sequence {sequence}, which is not an interval \
+             boundary"
         );
     }
 }
@@ -407,6 +407,101 @@ fn a_client_can_check_a_published_checkpoint_against_the_stream() {
         checkpoint.chain_head(),
         recomputed,
         "the venue published a head the stream does not produce"
+    );
+    assert_eq!(checkpoint.chain_head(), exchange.chain_head());
+}
+
+/// A snapshot taken between two boundaries still recovers to the right head.
+///
+/// The case the other recovery test missed, because at an interval of one every
+/// record is a boundary and the two coincide. With a wider interval a snapshot
+/// lands mid-interval: its head covers only up to the previous boundary, and the
+/// records after that were folded into a digest nothing persists. Replaying from
+/// the snapshot alone leaves them out of the chain for good, and the venue then
+/// publishes a head no client can reproduce — silent divergence in the one
+/// feature whose whole point is not needing to be trusted.
+#[test]
+fn a_snapshot_taken_mid_interval_recovers_to_the_same_head() {
+    const INTERVAL: u64 = 8;
+    let mut exchange = chaining_with_interval(INTERVAL);
+
+    // Enough to sit part way through an interval rather than on a boundary.
+    for id in 1..=13_u64 {
+        let mut command = limit_order(1, SYMBOL, id, Side::Bid, 10_050, 1);
+        exchange.submit(&mut command).unwrap();
+    }
+    let snapshot = exchange.snapshot();
+    assert!(
+        snapshot.chain_sealed_at < snapshot.sequence,
+        "this test needs a snapshot taken between boundaries, but it landed on \
+         one: sealed at {} of {}",
+        snapshot.chain_sealed_at,
+        snapshot.sequence
+    );
+
+    // Carry on past the next boundary, so a head that lost records diverges.
+    for id in 14..=30_u64 {
+        let mut command = limit_order(1, SYMBOL, id, Side::Bid, 10_050, 1);
+        exchange.submit(&mut command).unwrap();
+    }
+    let live = exchange.chain_head();
+    let live_at = exchange.chain_sealed_at();
+
+    // Recover from the mid-interval snapshot, then apply the same tail.
+    let storage = exchange.into_storage();
+    let mut restored = Exchange::new(storage, instruments()).unwrap();
+    restored.set_chaining(true);
+    restored.set_chain_interval(INTERVAL);
+    restored.recover_from(&snapshot).unwrap();
+
+    assert_eq!(
+        restored.chain_head(),
+        live,
+        "a mid-interval snapshot recovered to a head the venue never had"
+    );
+    assert_eq!(restored.chain_sealed_at(), live_at);
+}
+
+/// A published head names what it covers, not the venue's newest sequence.
+///
+/// Between boundaries the two differ. Naming the newest would claim coverage of
+/// records the head does not commit to, and a client folding those would
+/// disagree with a venue that had done nothing wrong.
+#[test]
+fn a_checkpoint_names_only_what_its_head_covers() {
+    const INTERVAL: u64 = 4;
+    let mut exchange = chaining_with_interval(INTERVAL);
+    let mut latest = None;
+
+    for id in 1..=20_u64 {
+        let mut command = limit_order(1, SYMBOL, id, Side::Bid, 10_050, 1);
+        let events = exchange.submit(&mut command).unwrap().to_vec();
+        for event in &events {
+            if event.kind == EventKind::Checkpoint as u8 {
+                latest = Some(*event);
+            }
+        }
+        // Whatever the venue has published, it never claims more than it covers.
+        if let Some(checkpoint) = latest {
+            assert!(
+                checkpoint.cause_sequence <= exchange.chain_sealed_at(),
+                "a checkpoint claimed coverage to {} while the head covers {}",
+                checkpoint.cause_sequence,
+                exchange.chain_sealed_at()
+            );
+            assert!(
+                checkpoint.cause_sequence.is_multiple_of(INTERVAL),
+                "a head was sealed off a boundary, at {}",
+                checkpoint.cause_sequence
+            );
+        }
+    }
+
+    let checkpoint = latest.expect("nothing was published");
+    assert_eq!(
+        checkpoint.cause_sequence,
+        exchange.chain_sealed_at(),
+        "the newest checkpoint disagrees with the head it was published for"
     );
     assert_eq!(checkpoint.chain_head(), exchange.chain_head());
 }

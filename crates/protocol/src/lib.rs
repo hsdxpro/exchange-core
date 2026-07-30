@@ -450,8 +450,14 @@ pub enum EventKind {
     /// Published, because a halt a client cannot see is a halt it will keep
     /// sending orders into. `symbol` names the instrument.
     SymbolState = 12,
-    /// The journal's chain head, committing to every record up to
-    /// `cause_sequence`.
+    /// The journal's chain head. `cause_sequence` is the first sequence it does
+    /// **not** cover, the same exclusive convention a snapshot uses.
+    ///
+    /// It is not the venue's newest sequence. The head advances only on an
+    /// interval boundary, so between boundaries there are accepted records the
+    /// head does not yet commit to. Naming the newest sequence here would
+    /// over-claim, and a client folding those uncommitted records would disagree
+    /// with a venue that had done nothing wrong.
     ///
     /// The head is 32 bytes, carried in the four fields an event of this kind has
     /// no other use for -- exactly a full SHA-256 digest, untruncated. See
@@ -927,13 +933,13 @@ impl Command {
 /// Printable ASCII on purpose: a magic carrying raw control bytes makes the
 /// source file read as binary to tools that diff and search it, and is easy for
 /// an editor to mangle silently.
-/// `v4` adds the journal chain head; `v3` added symbol trading states and
+/// `v5` adds what the chain head covers; `v4` added the head itself; `v3` added symbol trading states and
 /// stopped accounts; `v2` added the
 /// per-account highest order ID. A `v1` file is refused rather
 /// than read: the journal is always authoritative, so rejecting an old snapshot
 /// costs replay time, while reading one would restore a venue with no record of
 /// which IDs had been used and quietly accept a replayed order.
-pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAPv4";
+pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAPv5";
 
 /// Header of a snapshot: what it contains and where in the journal it applies.
 #[derive(
@@ -961,6 +967,12 @@ pub struct SnapshotHeader {
     /// than the whole of it, and every client checking it would disagree with the
     /// venue for reasons neither could see.
     pub chain_head: [u8; 32],
+    /// The first sequence `chain_head` does not cover.
+    ///
+    /// At or before `sequence`: the head advances only on an interval boundary, so
+    /// a snapshot taken between two carries a head covering less than the state
+    /// beside it. Recovery reads from here and applies from `sequence`.
+    pub chain_sealed_at: Sequence,
     /// Padding, and load-bearing.
     ///
     /// The records after this header are read straight out of the file with no
@@ -970,12 +982,12 @@ pub struct SnapshotHeader {
     /// header's own size decides whether that read is possible at all. At 40
     /// bytes it was not, and the zero-copy read failed in a way that reported
     /// itself as a truncated file.
-    pub _pad: [u8; 8],
+    pub _pad: [u8; 16],
 }
 
 /// A multiple of 16, so every section that follows stays aligned. Asserted
 /// rather than left to whoever edits the struct next.
-const _: () = assert!(size_of::<SnapshotHeader>() == 96);
+const _: () = assert!(size_of::<SnapshotHeader>() == 112);
 const _: () = assert!(size_of::<SnapshotHeader>().is_multiple_of(align_of::<SnapshotBalance>()));
 const _: () = assert!(size_of::<SnapshotOrder>().is_multiple_of(align_of::<SnapshotBalance>()));
 
@@ -1342,7 +1354,8 @@ mod tests {
             symbol_states: 5,
             stopped_accounts: 6,
             chain_head: [7; 32],
-            _pad: [0; 8],
+            chain_sealed_at: 8,
+            _pad: [0; 16],
         };
         assert_eq!(
             SnapshotHeader::read_from_bytes(header.as_bytes()),

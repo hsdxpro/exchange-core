@@ -342,7 +342,9 @@ impl Config {
                     "secret" => {
                         return Err(ConfigError::at(
                             line,
-                            "credentials take `public_key` now, not `secret`: the venue                              verifies an Ed25519 signature and holds no secret of yours",
+                            "credentials take `public_key` now, not `secret`: the venue \
+                             verifies an Ed25519 signature and holds no secret \
+                             of yours",
                         ));
                     }
                     _ => {}
@@ -406,7 +408,8 @@ impl Config {
                     let Some((id, address)) = value.split_once('@') else {
                         return Err(ConfigError::at(
                             line,
-                            "a peer is `id@address`, so a majority is counted over \n                             identities rather than over whoever happens to answer",
+                            "a peer is `id@address`, so a majority is counted over \
+                             identities rather than over whoever happens to answer",
                         ));
                     };
                     let id = id.trim().parse::<u64>().map_err(|_| {

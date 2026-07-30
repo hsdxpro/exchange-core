@@ -66,7 +66,8 @@ pub const REJECT_REASONS: usize = RejectReason::COUNT;
 
 const _: () = assert!(
     REASONS.len() == REJECT_REASONS,
-    "a reason was added to the protocol but not to REASONS, so its count would      never be reported"
+    "a reason was added to the protocol but not to REASONS, so its count \
+     would never be reported"
 );
 
 /// The books, in a table indexed by symbol.
@@ -364,8 +365,11 @@ impl<S: LogStorage> Exchange<S> {
         let head = self.journal.chain_head();
         if self.journal.chaining() && head != self.published_head {
             self.published_head = head;
-            let sequence = self.journal.next_sequence();
-            let mut event = Event::checkpoint(sequence, &head);
+            // What the head covers, not where the log has reached. Between
+            // boundaries those differ, and publishing the latter would claim
+            // coverage of records the head does not commit to.
+            let covered = self.journal.chain_sealed_at();
+            let mut event = Event::checkpoint(covered, &head);
             event.sequence = self.event_sequence;
             self.event_sequence += 1;
             self.events.push(event);
@@ -417,7 +421,29 @@ impl<S: LogStorage> Exchange<S> {
     /// Fails if the journal is unreadable, corrupt, or has a gap.
     pub fn recover_from(&mut self, snapshot: &Snapshot) -> bx_journal::Result<u64> {
         self.restore(snapshot);
-        self.replay_from(snapshot.sequence)
+        // State resumes at the snapshot's sequence. The *chain* has to resume
+        // wherever its head was last sealed, which is at or before that: a
+        // snapshot taken mid-interval carries a head covering only up to the
+        // previous boundary, and the records between the two were folded into a
+        // digest nothing persisted. Replaying from the snapshot alone would leave
+        // them out of the chain for good, so the venue would publish a head no
+        // client could reproduce -- silent divergence, in the one feature whose
+        // whole purpose is not needing to be trusted.
+        //
+        // So the read starts at the boundary and the *application* starts at the
+        // snapshot. At most one interval of records is read twice and applied
+        // once, which is a thousand records on a recovery.
+        //
+        // Only when chaining is on. Without it there is no head to keep
+        // consistent and `chain_sealed_at` is zero, so taking the minimum would
+        // rewind every recovery to the start of the journal and throw away the
+        // snapshot's entire purpose.
+        let read_from = if self.journal.chaining() {
+            snapshot.sequence.min(self.journal.chain_sealed_at())
+        } else {
+            snapshot.sequence
+        };
+        self.replay_from_folding(read_from, snapshot.sequence)
     }
 
     /// Replays from `start` in fixed-size chunks.
@@ -432,12 +458,25 @@ impl<S: LogStorage> Exchange<S> {
     /// Re-seeking each chunk is free: [`Replay::from_sequence`] is arithmetic on
     /// a fixed record width, not a scan.
     fn replay_from(&mut self, start: Sequence) -> bx_journal::Result<u64> {
+        self.replay_from_folding(start, start)
+    }
+
+    /// Replays from `read_from`, applying only what is at or after `apply_from`.
+    ///
+    /// The two differ only when recovering from a snapshot taken between chain
+    /// boundaries: everything from the last boundary has to reach the chain, while
+    /// only what the snapshot does not already contain may reach the books.
+    fn replay_from_folding(
+        &mut self,
+        read_from: Sequence,
+        apply_from: Sequence,
+    ) -> bx_journal::Result<u64> {
         /// 256 KiB of commands. Large enough that the per-chunk seek disappears
         /// against the work, small enough to stay a rounding error in RSS.
         const CHUNK: usize = 4_096;
 
         let mut buffer: Vec<Command> = Vec::with_capacity(CHUNK);
-        let mut next = start;
+        let mut next = read_from;
         let mut count = 0_u64;
 
         loop {
@@ -455,12 +494,20 @@ impl<S: LogStorage> Exchange<S> {
                 break;
             }
             next += buffer.len() as Sequence;
-            count += buffer.len() as u64;
             for command in buffer.drain(..) {
                 // Folded before applying, so the chain covers the record as
-                // journalled rather than whatever the command becomes.
+                // journalled rather than whatever the command becomes -- and
+                // folded even for records the snapshot already accounts for,
+                // because the chain needs the whole interval and the books do not.
                 self.journal
                     .fold_replayed(command.as_bytes(), command.sequence);
+                if command.sequence < apply_from {
+                    continue;
+                }
+                // Counted where it is applied, not where it is read: the records
+                // re-read to rebuild the chain were already in the snapshot, and
+                // reporting them as replayed would overstate the work.
+                count += 1;
                 self.events.clear();
                 self.apply(command);
             }
@@ -543,6 +590,7 @@ impl<S: LogStorage> Exchange<S> {
             symbol_states,
             stopped_accounts,
             chain_head: self.journal.chain_head(),
+            chain_sealed_at: self.journal.chain_sealed_at(),
         }
     }
 
@@ -572,7 +620,8 @@ impl<S: LogStorage> Exchange<S> {
         // Replay carries on from this head, so snapshot-plus-replay reaches the
         // same one a full replay would. Without it the head would commit to a
         // suffix of the stream and every client checking it would disagree.
-        self.journal.restore_chain(snapshot.chain_head);
+        self.journal
+            .restore_chain(snapshot.chain_head, snapshot.chain_sealed_at);
         for record in &snapshot.balances {
             self.accounts
                 .restore(record.account, record.asset, balance_of(record));
@@ -657,12 +706,25 @@ impl<S: LogStorage> Exchange<S> {
         }
     }
 
-    /// The journal's verifiable chain head, sealed at the last group.
+    /// The journal's verifiable chain head, sealed at the last interval boundary.
     ///
-    /// Zero when the venue runs without chaining.
+    /// Zero when the venue runs without chaining. What it covers is
+    /// [`Self::chain_sealed_at`].
     #[must_use]
     pub const fn chain_head(&self) -> [u8; 32] {
         self.journal.chain_head()
+    }
+
+    /// The first sequence [`Self::chain_head`] does not cover.
+    #[must_use]
+    pub const fn chain_sealed_at(&self) -> Sequence {
+        self.journal.chain_sealed_at()
+    }
+
+    /// Every symbol this venue lists, ascending.
+    #[must_use]
+    pub fn listed_symbols(&self) -> Vec<SymbolId> {
+        self.instruments.iter().map(|i| i.symbol).collect()
     }
 
     /// Turns the verifiable chain on or off. Off by default; see the journal for

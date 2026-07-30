@@ -830,7 +830,8 @@ fn a_client_shed_for_being_slow_can_reconnect_and_rebuild_the_book() {
         .count();
     assert!(
         levels > 100,
-        "a reconnecting client got {levels} levels of book state, so it cannot          rebuild what it missed"
+        "a reconnecting client got {levels} levels of book state, so it \
+         cannot rebuild what it missed"
     );
     assert!(
         events
@@ -1729,5 +1730,61 @@ fn resuming_from_zero_restates_a_state_channel() {
     assert!(
         has_kind(&events, EventKind::BookSnapshot),
         "resuming from zero gave a book channel with no book: {events:?}"
+    );
+}
+
+/// Resuming a private feed from an impossible cursor answers, and does not drop
+/// the client.
+///
+/// The private channel cannot be restated the way a book can — there is no
+/// snapshot of "your orders since sequence N" — and the passive lag path drops
+/// the session for exactly that reason. Doing the same in reply to an explicit
+/// `RESUME` would leave a client reconnecting and asking again identically,
+/// forever. It is placed at the end of its own feed and told what it holds.
+#[test]
+fn resuming_a_private_feed_from_an_impossible_cursor_keeps_the_session() {
+    let venue = Running::start();
+    let mut client = venue.connect();
+
+    // Something of its own to be told about.
+    send(
+        &mut client,
+        &[limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1)],
+    );
+    let _ = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::Resting)
+    });
+
+    send(
+        &mut client,
+        &[Command::resuming(
+            1,
+            SYMBOL,
+            ChannelKind::Account,
+            5_000_001,
+        )],
+    );
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::OrderState)
+    });
+    assert!(
+        has_kind(&events, EventKind::OrderState),
+        "a private resume was answered with silence: {events:?}"
+    );
+
+    // And the session is still usable, which is the half that matters.
+    send(
+        &mut client,
+        &[limit_order(1, SYMBOL, 2, Side::Bid, 10_060, 1)],
+    );
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|e| e.kind == EventKind::Received as u8 && e.order_id == 2)
+    });
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::Received as u8 && e.order_id == 2),
+        "the session was dropped by a resume it had asked for: {events:?}"
     );
 }

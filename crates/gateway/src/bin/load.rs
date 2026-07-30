@@ -440,7 +440,9 @@ fn main() -> std::io::Result<()> {
         );
         if counts.first().is_some_and(|&least| least == 0) {
             eprintln!(
-                "WARNING: at least one subscriber received nothing. Either the                  run produced no top-of-book changes, or the venue shed it --                  the venue's own counters say which."
+                "WARNING: at least one subscriber received nothing. Either the run \
+                 produced no top-of-book changes, or the venue shed it -- the \
+                 venue's own counters say which."
             );
         }
     }

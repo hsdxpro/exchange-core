@@ -1257,11 +1257,30 @@ impl<S: LogStorage> Server<S> {
                 self.session_at(index).reposition(channel, next);
                 self.owes_bytes(index);
             }
-            // Too far behind, or holding a cursor this run never issued. Same
-            // repair either way: drop what is queued and restate.
+            // Too far behind, or holding a cursor this run never issued.
             Resume::Lagged { .. } | Resume::Ahead { .. } => {
                 self.metrics.restated();
-                self.resynchronise(&[(index, channel)]);
+                if let Channel::Account(account) = channel {
+                    // A private feed cannot be restated the way a book can --
+                    // there is no snapshot of "your orders since sequence N".
+                    // The passive path drops the session for exactly that
+                    // reason, and dropping it here would be wrong: the client
+                    // *asked*, and answering a request with a disconnect leaves
+                    // it to reconnect and ask again identically, forever.
+                    //
+                    // So it is placed at the current end of its own feed and
+                    // told what it holds right now, which is the same answer a
+                    // client gets from `QueryOpenOrders` and the only thing that
+                    // makes the position it has been given meaningful.
+                    let at = self.venue.hub().next_sequence(channel).unwrap_or_default();
+                    self.session_at(index).reposition(channel, at);
+                    for symbol in self.venue.exchange().listed_symbols() {
+                        self.answer_open_orders(index, symbol, account);
+                    }
+                    self.owes_bytes(index);
+                } else {
+                    self.resynchronise(&[(index, channel)]);
+                }
             }
             // `subscribe` above created the ring, so this cannot happen. Restated
             // rather than ignored: if it ever does, the client is following a

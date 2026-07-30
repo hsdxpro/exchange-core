@@ -378,13 +378,6 @@ pub const EMPTY_CHAIN: [u8; CHAIN_LEN] = [0; CHAIN_LEN];
 /// millisecond.
 pub const CHAIN_INTERVAL: u64 = 1_024;
 
-/// Smallest interval that means anything: every record.
-///
-/// Allowed, and expensive -- it is the per-record digest the interval exists to
-/// avoid. Useful to a venue that wants a checkable head behind every single
-/// command and is willing to pay 45 to 60 ns for it.
-pub const MIN_CHAIN_INTERVAL: u64 = 1;
-
 /// A digest primed with a chain head, ready for the records that follow it.
 fn seeded(head: &[u8; CHAIN_LEN]) -> Sha256 {
     let mut hasher = Sha256::new();
@@ -465,6 +458,16 @@ pub struct Journal<S: LogStorage> {
     /// Records folded into `pending` since the last sync, so a sync with nothing
     /// to commit leaves the head alone rather than hashing it again.
     pending_records: usize,
+    /// The first sequence `chain` does **not** cover.
+    ///
+    /// Tracked because the head lags the log: it advances only on an interval
+    /// boundary, so between boundaries the newest records are folded in but not
+    /// yet committed to. Publishing the log's own next sequence alongside the head
+    /// would over-claim -- a client folding those uncommitted records and comparing
+    /// would disagree, and the disagreement would look like the venue lying.
+    ///
+    /// Same convention as a snapshot's `sequence`: exclusive.
+    chain_sealed_at: Sequence,
     /// Whether to maintain the chain at all.
     ///
     /// Off by default, because it is not free and the cost falls entirely on the
@@ -514,6 +517,7 @@ impl<S: LogStorage> Journal<S> {
             chain: EMPTY_CHAIN,
             pending: seeded(&EMPTY_CHAIN),
             pending_records: 0,
+            chain_sealed_at: 0,
             chaining: false,
             appended: 0,
             chain_interval: CHAIN_INTERVAL,
@@ -546,7 +550,7 @@ impl<S: LogStorage> Journal<S> {
                 .wrapping_add(1)
                 .is_multiple_of(self.chain_interval)
             {
-                self.seal();
+                self.seal(self.next_sequence + 1);
             }
         }
         self.next_sequence += 1;
@@ -554,12 +558,20 @@ impl<S: LogStorage> Journal<S> {
         Ok(command.sequence)
     }
 
-    /// The chain over everything appended so far, sealed at the last group.
+    /// The chain over everything appended so far, sealed at the last boundary.
     ///
-    /// [`EMPTY_CHAIN`] when chaining is off.
+    /// [`EMPTY_CHAIN`] when chaining is off. What it covers is
+    /// [`Self::chain_sealed_at`], which lags [`Self::next_sequence`] between
+    /// boundaries.
     #[must_use]
     pub const fn chain_head(&self) -> [u8; CHAIN_LEN] {
         self.chain
+    }
+
+    /// The first sequence [`Self::chain_head`] does not cover.
+    #[must_use]
+    pub const fn chain_sealed_at(&self) -> Sequence {
+        self.chain_sealed_at
     }
 
     /// Whether this journal maintains a verifiable chain over its records.
@@ -581,8 +593,11 @@ impl<S: LogStorage> Journal<S> {
     /// that never advanced.
     pub fn set_chain_interval(&mut self, interval: u64) {
         assert!(
-            interval >= MIN_CHAIN_INTERVAL,
-            "a chain interval of zero has no boundary, so the head would never advance"
+            interval > 0,
+            "a chain interval of zero has no boundary, so the head would never \
+             advance. One is allowed and means a head behind every record, which \
+             is the per-record digest the interval exists to avoid -- 45 to 60 ns \
+             against about 200 on the order path."
         );
         self.chain_interval = interval;
     }
@@ -610,7 +625,9 @@ impl<S: LogStorage> Journal<S> {
     pub fn set_chaining(&mut self, on: bool) {
         assert!(
             self.appended == 0,
-            "chaining has to be set before appending: {} records have gone in              already, and a chain started here would cover only what follows              while a replay would cover everything",
+            "chaining has to be set before appending: {} records have gone in \
+             already, and a chain started here would cover only what follows \
+             while a replay would cover everything",
             self.appended
         );
         self.chaining = on;
@@ -630,7 +647,7 @@ impl<S: LogStorage> Journal<S> {
         self.pending.update(record);
         self.pending_records += 1;
         if sequence.wrapping_add(1).is_multiple_of(self.chain_interval) {
-            self.seal();
+            self.seal(sequence + 1);
         }
     }
 
@@ -639,8 +656,9 @@ impl<S: LogStorage> Journal<S> {
     /// Replay carries on from here, so a snapshot-based recovery reaches the same
     /// head a full replay would -- which is the property that makes the chain
     /// worth publishing at all.
-    pub fn restore_chain(&mut self, head: [u8; CHAIN_LEN]) {
+    pub fn restore_chain(&mut self, head: [u8; CHAIN_LEN], sealed_at: Sequence) {
         self.chain = head;
+        self.chain_sealed_at = sealed_at;
         self.pending = seeded(&head);
         self.pending_records = 0;
     }
@@ -654,12 +672,14 @@ impl<S: LogStorage> Journal<S> {
 
     /// Finalises the digest over the records folded in since the last seal.
     ///
-    /// Called on every [`CHAIN_INTERVAL`] boundary, from appends and from replay
-    /// alike, which is what makes the two agree.
-    pub fn seal(&mut self) {
+    /// Called on every interval boundary, from appends and from replay alike,
+    /// which is what makes the two agree. Private: a seal taken anywhere else
+    /// would put a boundary in a place no replay could find.
+    fn seal(&mut self, through: Sequence) {
         if self.pending_records == 0 {
             return;
         }
+        self.chain_sealed_at = through;
         self.chain = std::mem::replace(&mut self.pending, Sha256::new())
             .finalize()
             .into();
