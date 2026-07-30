@@ -200,6 +200,21 @@ pub enum CommandKind {
     /// the attempt: a signature assembled from two records that arrived either
     /// side of other traffic is a signature nobody can reason about.
     AuthenticateContinued = 13,
+    /// Resumes a feed from where the client left it, rather than from now.
+    ///
+    /// Layout: `symbol` names the instrument, `quantity` the channel via
+    /// [`Command::channel_kind`], and `order_id` the next sequence wanted --
+    /// one past the last the client processed.
+    ///
+    /// Session control, like a subscription, and it implies one: a client that
+    /// resumes is followed from that point without a separate subscribe.
+    ///
+    /// The answer is one of three things, and never silence. The missing events,
+    /// if the channel still holds them. A fresh snapshot, if the client fell
+    /// outside the retention window. Or a fresh snapshot again if the sequence is
+    /// one this channel has not reached -- which is what a cursor from a previous
+    /// leader looks like, since channel numbering starts over when a venue does.
+    Resume = 15,
     /// Drops an account's key, so it can no longer authenticate.
     ///
     /// Handled in the gateway and deliberately *not* journalled, for the same
@@ -701,6 +716,7 @@ impl Command {
             || self.kind == CommandKind::Authenticate as u8
             || self.kind == CommandKind::AuthenticateContinued as u8
             || self.kind == CommandKind::RevokeKey as u8
+            || self.kind == CommandKind::Resume as u8
     }
 
     /// Whether this command may only come from the venue's admin account.
@@ -767,6 +783,33 @@ impl Command {
                 &signature[32..],
             ),
         ]
+    }
+
+    /// Asks to be followed on `channel` from `from` onward.
+    ///
+    /// `from` is the next sequence wanted: one past the last the client
+    /// processed, so a client that has seen nothing asks for zero.
+    #[must_use]
+    pub fn resuming(
+        account: AccountId,
+        symbol: SymbolId,
+        channel: ChannelKind,
+        from: Sequence,
+    ) -> Self {
+        Self {
+            sequence: 0,
+            ingress_ns: 0,
+            account,
+            order_id: from,
+            replacement_id: 0,
+            quantity: channel as u64,
+            price: 0,
+            symbol,
+            kind: CommandKind::Resume as u8,
+            side: 0,
+            time_in_force: 0,
+            order_type: 0,
+        }
     }
 
     /// Asks the venue to drop an account's key. Admin only.
@@ -841,6 +884,7 @@ impl Command {
             12 => Some(CommandKind::CancelAll),
             13 => Some(CommandKind::AuthenticateContinued),
             14 => Some(CommandKind::RevokeKey),
+            15 => Some(CommandKind::Resume),
             _ => None,
         }
     }
@@ -1061,6 +1105,7 @@ mod tests {
             (12, CommandKind::CancelAll),
             (13, CommandKind::AuthenticateContinued),
             (14, CommandKind::RevokeKey),
+            (15, CommandKind::Resume),
         ] {
             let mut command = sample();
             command.kind = byte;
@@ -1068,7 +1113,7 @@ mod tests {
             assert!(command.is_well_formed());
         }
         let mut unknown = sample();
-        unknown.kind = 15;
+        unknown.kind = 16;
         assert!(unknown.kind().is_none());
     }
 

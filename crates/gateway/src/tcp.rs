@@ -1190,6 +1190,10 @@ impl<S: LogStorage> Server<S> {
             return;
         };
         let channel = Channel::requested(kind, command.symbol, account);
+        if command.kind() == Some(CommandKind::Resume) {
+            self.resume_from(index, channel, command.order_id);
+            return;
+        }
         if command.kind() == Some(CommandKind::Subscribe) {
             let from = self.venue.subscribe(channel);
             self.follow(index, channel, from);
@@ -1207,6 +1211,65 @@ impl<S: LogStorage> Server<S> {
             }
         } else {
             self.stop_following(index, channel);
+        }
+    }
+
+    /// Follows a channel from where the client left it, rather than from now.
+    ///
+    /// Answers one of three things and never silence, which is the whole point of
+    /// the message: the events it missed, or a fresh restatement if it cannot have
+    /// them. A client told nothing has no way to tell a gap from a quiet market.
+    ///
+    /// A resume implies a subscription, so a client reconnecting sends one message
+    /// rather than two and cannot end up followed from the wrong place in between.
+    ///
+    /// Across a promotion this lands on `Ahead` and restates. Channel numbering
+    /// starts over when a venue does -- a new leader replays the journal to rebuild
+    /// state but does not republish -- so a cursor from the previous leader names a
+    /// sequence this channel has never reached. Gap-filling across a promotion
+    /// would mean retaining rings for every channel and republishing during
+    /// replay, which costs the whole feed budget on a venue with no subscribers at
+    /// all. Restating is correct and cheap; the cost is one snapshot per client per
+    /// promotion.
+    fn resume_from(&mut self, index: usize, channel: Channel, from: Sequence) {
+        // Retained from here on whatever happens next, so a client that is told
+        // to restate is already being followed when it does.
+        let now = self.venue.subscribe(channel);
+        self.follow(index, channel, from.min(now));
+
+        // A resume from zero says "I hold nothing", and on a channel that carries
+        // state that means a restatement rather than a replay. Serving it as an
+        // ordinary resume would answer `Delivered` over an empty window and hand
+        // the client a book channel with no book -- silence that looks like a
+        // quiet market.
+        if from == 0 {
+            self.metrics.restated();
+            self.resynchronise(&[(index, channel)]);
+            return;
+        }
+
+        let mut bytes = std::mem::take(&mut self.session_at(index).outbox);
+        let outcome = self.venue.resume_bytes(channel, from, &mut bytes);
+        self.session_at(index).outbox = bytes;
+
+        match outcome {
+            Resume::Delivered { next } => {
+                self.session_at(index).reposition(channel, next);
+                self.owes_bytes(index);
+            }
+            // Too far behind, or holding a cursor this run never issued. Same
+            // repair either way: drop what is queued and restate.
+            Resume::Lagged { .. } | Resume::Ahead { .. } => {
+                self.metrics.restated();
+                self.resynchronise(&[(index, channel)]);
+            }
+            // `subscribe` above created the ring, so this cannot happen. Restated
+            // rather than ignored: if it ever does, the client is following a
+            // channel nothing retains and would otherwise sit silent.
+            Resume::NotSubscribed => {
+                self.metrics.restated();
+                self.resynchronise(&[(index, channel)]);
+            }
         }
     }
 

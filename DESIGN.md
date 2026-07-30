@@ -280,18 +280,28 @@ current sequence, with a snapshot first on the two channels that carry state. Th
 fixed size, holding a few seconds of peak rate, and a subscriber that falls out of it is
 restated the same way.
 
-**What is not:** a client cannot name where to resume from. `RESUME {channel, last_seq}` —
-the MoldUDP64/ITCH pattern, where a client that missed a few seconds is sent just the gap —
-is designed and not implemented. Until it is, every reconnect costs a snapshot rather than
-a delta, and this section previously claimed otherwise.
+**`RESUME {channel, last_seq}` is built.** A client names the next sequence it wants and gets
+one of three answers, never silence: the events it missed, or a restatement if it cannot have
+them — because it fell outside the window, or because it named a sequence the channel never
+reached. It implies a subscription, so a reconnecting client sends one message rather than
+two and cannot end up followed from the wrong place in between. `last_seq` of zero means "I
+hold nothing", which on a channel carrying state is a restatement rather than a replay of an
+empty window.
 
-Sequence numbering is per channel and starts at zero when the channel is first followed. It
-is therefore **not** continuous across a restart or a promotion: a new leader replays the
-journal to rebuild state but does not re-publish, so its channels begin again. That is
-survivable only because clients do not carry cursors across — and it is the reason a cursor
-past a channel's end is refused rather than treated as current. Adding `RESUME` requires
-making the numbering continuous first, by carrying the cursors in the snapshot or by
-deriving them from the journal sequence.
+This is the MoldUDP64/ITCH pattern and it makes a brief disconnect cheap: a client away for a
+second is sent the handful of deltas it missed instead of a whole book.
+
+**Across a promotion it restates, and that is the deliberate limit.** Channel numbering is
+per channel and starts at zero when a channel is first followed, so it is not continuous
+across a restart: a new leader replays the journal to rebuild state but does not re-publish.
+A cursor from the previous leader therefore names a sequence the new one has never reached,
+which is refused and answered with a restatement — correct, and the reason that refusal
+exists at all.
+
+Making a promotion gap-fillable would mean retaining a ring for every channel and
+republishing into them during replay, which costs the entire feed budget on a venue with no
+subscribers at all. The price of not paying it is one snapshot per client per promotion,
+which happens once per failure.
 
 The publisher and the connection fanout start as one process. They separate when connection
 count actually forces it, not before.

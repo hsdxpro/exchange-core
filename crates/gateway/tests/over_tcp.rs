@@ -1524,3 +1524,210 @@ fn a_subscriber_receives_chain_heads_it_can_verify() {
         "a head that names no sequence commits to nothing in particular"
     );
 }
+
+// ------------------------------------------------------------------- resume
+
+/// A client that dropped briefly gets the events it missed, not a snapshot.
+///
+/// This is what `RESUME` is for. Reconnecting and subscribing afresh is always
+/// available and always correct, and it costs a full book restatement every
+/// time — which on a busy symbol is far more than the handful of deltas a client
+/// away for a second actually missed.
+#[test]
+fn a_client_that_reconnects_can_resume_from_where_it_stopped() {
+    let venue = Running::start();
+    let mut trader = venue.connect();
+    let mut watcher = venue.connect();
+    send(&mut watcher, &[subscribe(4, SYMBOL, ChannelKind::Trades)]);
+    let _ = collect_until(&mut watcher, Duration::from_millis(300), |_| false);
+
+    // Something to trade against, then two trades the watcher sees.
+    send(
+        &mut trader,
+        &[limit_order(1, SYMBOL, 1, Side::Ask, 10_100, 10)],
+    );
+    let mut taker = venue.connect();
+    for id in [2_u64, 3] {
+        send(&mut taker, &[market_order(2, SYMBOL, id, Side::Bid, 1)]);
+    }
+    let seen = collect_until(&mut watcher, Duration::from_secs(10), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Trade as u8)
+            .count()
+            >= 2
+    });
+    let trades: Vec<&Event> = seen
+        .iter()
+        .filter(|e| e.kind == EventKind::Trade as u8)
+        .collect();
+    assert!(trades.len() >= 2, "the watcher missed the setup trades");
+    let last_seen = trades[0].sequence;
+
+    // It goes away. More trades happen while it is gone.
+    drop(watcher);
+    for id in [4_u64, 5] {
+        send(&mut taker, &[market_order(2, SYMBOL, id, Side::Bid, 1)]);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Back, asking to carry on from just after the first trade it processed.
+    let mut returning = venue.connect();
+    send(
+        &mut returning,
+        &[Command::resuming(
+            4,
+            SYMBOL,
+            ChannelKind::Trades,
+            last_seen + 1,
+        )],
+    );
+    let replayed = collect_until(&mut returning, Duration::from_secs(10), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Trade as u8)
+            .count()
+            >= 3
+    });
+    let replayed_trades: Vec<&Event> = replayed
+        .iter()
+        .filter(|e| e.kind == EventKind::Trade as u8)
+        .collect();
+
+    assert!(
+        replayed_trades.len() >= 3,
+        "resume delivered {} trades, so the gap was not filled: {replayed:?}",
+        replayed_trades.len()
+    );
+    // Contiguous from where it asked, which is the property: no gap, no repeat.
+    assert_eq!(
+        replayed_trades[0].sequence,
+        last_seen + 1,
+        "resume started somewhere other than where the client asked"
+    );
+    for pair in replayed_trades.windows(2) {
+        assert_eq!(
+            pair[1].sequence,
+            pair[0].sequence + 1,
+            "resume delivered a gap inside what it sent"
+        );
+    }
+}
+
+/// A cursor the channel never reached gets a restatement, not silence.
+///
+/// This is what a cursor from a previous leader looks like, since channel
+/// numbering starts over when a venue does. Answering "you are up to date" would
+/// leave the client believing a position the venue never issued — which is the
+/// bug the `Ahead` refusal exists to prevent, reached here through the wire.
+#[test]
+fn resuming_from_a_sequence_the_venue_never_issued_restates() {
+    let venue = Running::start();
+    let mut trader = venue.connect();
+    send(
+        &mut trader,
+        &[limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1)],
+    );
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut client = venue.connect();
+    send(
+        &mut client,
+        &[Command::resuming(4, SYMBOL, ChannelKind::Book, 5_000_001)],
+    );
+    let events = collect_until(&mut client, Duration::from_secs(10), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::BookSnapshot as u8)
+    });
+    assert!(
+        has_kind(&events, EventKind::BookSnapshot),
+        "a client resuming from an impossible sequence was told nothing: {events:?}"
+    );
+}
+
+/// Resuming from zero on a busy channel restates rather than replaying forever.
+#[test]
+fn resuming_from_beyond_the_window_restates() {
+    let venue = Running::start();
+
+    // Subscribed first, so the channel is retaining before the flood: a resume
+    // is only interesting against a window that actually filled and wrapped.
+    let mut watcher = venue.connect();
+    send(&mut watcher, &[subscribe(4, SYMBOL, ChannelKind::Book)]);
+    let _ = collect_until(&mut watcher, Duration::from_millis(300), |_| false);
+
+    // The generator drains its own acknowledgements. Without that it becomes the
+    // slow client and the venue sheds it, which arrives as a broken pipe on the
+    // next write and reads as a venue fault.
+    let mut trader = venue.connect();
+    let mut acks = trader.try_clone().unwrap();
+    let sending = Arc::new(AtomicBool::new(true));
+    let still_sending = Arc::clone(&sending);
+    let drain = std::thread::spawn(move || {
+        let mut scratch = Vec::new();
+        while still_sending.load(Ordering::Relaxed) {
+            scratch.clear();
+            if read_events(&mut acks, 1, &mut scratch).is_err() || scratch.is_empty() {
+                break;
+            }
+        }
+    });
+
+    // Past the 32,768-event window, and no further: the point is that it wrapped.
+    for round in 0..60_u64 {
+        let commands: Vec<Command> = (0..1_000)
+            .map(|i| {
+                let id = round * 1_000 + i + 1;
+                limit_order(
+                    1,
+                    SYMBOL,
+                    id,
+                    Side::Bid,
+                    FLOOR + 1_000 + (id % 4_000) as Ticks,
+                    1,
+                )
+            })
+            .collect();
+        send(&mut trader, &commands);
+    }
+    sending.store(false, Ordering::Relaxed);
+    let _ = drain.join();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Sequence one is long gone from the window.
+    let mut returning = venue.connect();
+    send(
+        &mut returning,
+        &[Command::resuming(4, SYMBOL, ChannelKind::Book, 1)],
+    );
+    let events = collect_until(&mut returning, Duration::from_secs(10), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::BookSnapshot as u8)
+    });
+    assert!(
+        has_kind(&events, EventKind::BookSnapshot),
+        "a client that fell outside the window was not restated: {events:?}"
+    );
+}
+
+/// Resuming from zero on a state channel restates, rather than answering with an
+/// empty window.
+#[test]
+fn resuming_from_zero_restates_a_state_channel() {
+    let venue = Running::start();
+    let mut trader = venue.connect();
+    send(
+        &mut trader,
+        &[limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1)],
+    );
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut client = venue.connect();
+    send(
+        &mut client,
+        &[Command::resuming(4, SYMBOL, ChannelKind::Book, 0)],
+    );
+    let events = collect_until(&mut client, Duration::from_secs(10), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::BookSnapshot as u8)
+    });
+    assert!(
+        has_kind(&events, EventKind::BookSnapshot),
+        "resuming from zero gave a book channel with no book: {events:?}"
+    );
+}

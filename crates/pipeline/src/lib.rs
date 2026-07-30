@@ -625,7 +625,8 @@ impl<S: LogStorage> Exchange<S> {
             // Revoking a key is gateway business: keys are not deterministic
             // venue state, and a replay that reapplied a revocation would need
             // the key material in the log.
-            | CommandKind::RevokeKey => {
+            | CommandKind::RevokeKey
+            | CommandKind::Resume => {
                 self.reject(&command, RejectReason::UnsupportedTimeInForce);
             }
             // Authentication happens in the gateway, before sequencing, and a
