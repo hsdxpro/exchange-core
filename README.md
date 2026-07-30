@@ -190,6 +190,32 @@ Heavier crowds hold the same shape: 512 senders with 512 subscribers moved
 518M events (33 GB) at a 1.10 GiB peak; 1,024 senders alone peaked at
 1.03 GiB with a 17.1 µs p50.
 
+### The audience, moved off the order path
+
+Those figures are what an audience costs when it is served *by the thread that
+sequences orders*. `feed_listen` gives public market data its own thread and its
+own port, and the venue's share of distribution becomes one copy of each group
+into a bounded handoff, whatever the audience size. Same run, same 1,024
+subscribers, the only difference being which port they watch:
+
+| 128 senders, 200,000 orders, 1,024 subscribers | On the trading port | On the feed port |
+|---|---:|---:|
+| Round trip, min | 511.8 µs | **19.5 µs** |
+| Round trip, p50 | 28.1 ms | **30.5 µs** |
+| Pipelined throughput | 31,054/sec | **1,967,675/sec** |
+| Orders acknowledged | 200,000 of 200,000 | **200,000 of 200,000** |
+
+**922× on p50, 63× on throughput**, and the order path is back to roughly what it
+costs with nobody watching at all. This is the OUCH/ITCH split every venue
+converges on, and the reason is this table rather than tradition. The private
+account feed stays on the trading session — that is the trader's own reply path
+— and the feed port serves the public channels only, which is why it can ask for
+no credentials.
+
+`load --subscribers 1024 --feed 127.0.0.1:7071` against `bench.conf` reproduces
+both columns; restart the venue between runs, or the second one measures the
+reject path and says so.
+
 What the pair says:
 
 - **The audience taxes latency, never correctness or memory.** Every order is

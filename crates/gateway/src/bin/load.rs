@@ -370,7 +370,20 @@ fn main() -> std::io::Result<()> {
     let clients = number("--clients", 32);
     let audience = number("--subscribers", 0);
 
-    let (watchers, feeds) = subscribers(&address, audience)?;
+    // Where the audience watches from. Defaulting to the order port keeps the
+    // old measurement reproducible; pointing it at a venue's `feed_listen`
+    // measures the same audience served by a thread that is not the venue's,
+    // which is the comparison the split exists to be judged on.
+    let watching = args
+        .iter()
+        .position(|a| a == "--feed")
+        .and_then(|at| args.get(at + 1))
+        .cloned()
+        .unwrap_or_else(|| address.clone());
+    if watching != address {
+        println!("audience watching {watching}, orders to {address}");
+    }
+    let (watchers, feeds) = subscribers(&watching, audience)?;
 
     println!("\nClient-observed latency against {address}");
     println!("{}", "-".repeat(72));
