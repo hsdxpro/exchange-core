@@ -640,14 +640,14 @@ fn a_reconnecting_client_is_told_the_outcomes_that_died_with_the_venue() {
             "--config",
             config.to_str().unwrap(),
             "--listen",
-            "127.0.0.1:7504",
+            "127.0.0.1:7507",
         ],
     );
     assert!(
         venue.wait_for("listening", Duration::from_secs(60)),
         "the venue never came up"
     );
-    let mut client = connect("127.0.0.1:7504");
+    let mut client = connect("127.0.0.1:7507");
     let acknowledged = trade_from(&mut client, 1, ORDERS);
     assert_eq!(acknowledged, ORDERS, "not every order was acknowledged");
     drop(client);
@@ -659,7 +659,7 @@ fn a_reconnecting_client_is_told_the_outcomes_that_died_with_the_venue() {
             "--config",
             config.to_str().unwrap(),
             "--listen",
-            "127.0.0.1:7504",
+            "127.0.0.1:7507",
         ],
     );
     assert!(
@@ -671,7 +671,7 @@ fn a_reconnecting_client_is_told_the_outcomes_that_died_with_the_venue() {
     // which is what attaches the account. It must be handed the recovered
     // outcomes it was never told, marked as redelivery by sequence zero. It
     // never sends QueryOpenOrders.
-    let mut client = connect("127.0.0.1:7504");
+    let mut client = connect("127.0.0.1:7507");
     let mut bytes = Vec::new();
     encode(
         &limit_order(1, 1, 500_000, Side::Bid, 10_000, 1),
