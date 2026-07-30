@@ -200,7 +200,8 @@ fn run<S: LogStorage>(
                 println!("chain on, signing as {}", hex(&public));
             }
             None => println!(
-                "chain on, UNSIGNED: heads prove the venue agrees with itself,                  not that its history was never rewritten"
+                "chain on, UNSIGNED: heads prove the venue agrees with itself, \
+                 not that its history was never rewritten"
             ),
         }
     }

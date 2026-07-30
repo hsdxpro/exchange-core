@@ -650,7 +650,8 @@ impl Config {
         ];
         if tls_parts.iter().any(|p| *p) && !tls_parts.iter().all(|p| *p) {
             return Err(ConfigError::whole_file(
-                "tls_listen, tls_cert_file and tls_key_file go together: all                  three, or none",
+                "tls_listen, tls_cert_file and tls_key_file go together: all \
+                 three, or none",
             ));
         }
 

@@ -1425,7 +1425,8 @@ mod tests {
         );
         assert!(
             !command.is_administrative(),
-            "revocation is checked against the administrator by the gateway, not              by the journalled-admin path"
+            "revocation is checked against the administrator by the gateway, not \
+             by the journalled-admin path"
         );
     }
 
@@ -1539,7 +1540,8 @@ mod tests {
         assert_eq!(
             RejectReason::COUNT,
             ALL_REASONS.len(),
-            "RejectReason::COUNT is behind the enum, so a table sized from it              will be indexed out of bounds by the newest reason"
+            "RejectReason::COUNT is behind the enum, so a table sized from it \
+             will be indexed out of bounds by the newest reason"
         );
     }
 }

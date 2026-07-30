@@ -94,3 +94,84 @@ fn main() -> ExitCode {
         ExitCode::FAILURE
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    /// Run of spaces that separates a mangled literal from a deliberate one.
+    ///
+    /// Aligned output uses a few spaces on purpose -- the metrics report lines
+    /// up columns with two to six. A joined line carries the indentation of the
+    /// continuation as well, which is a dozen or more. Ten sits in the gap.
+    const MANGLED: usize = 10;
+
+    fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// No string literal carries a run of spaces where a line continuation was
+    /// meant.
+    ///
+    /// Writing Rust through a shell heredoc turns `\` at end of line into a
+    /// literal escape, and the joined string keeps the indentation of the line
+    /// below as run-on spaces. It is invisible to the compiler, invisible to
+    /// the formatter, and perfectly visible to whoever reads the message --
+    /// which twice was an operator, in a venue's startup output and in a
+    /// configuration refusal. It happened five times before this test existed.
+    #[test]
+    fn no_string_literal_has_a_line_continuation_flattened_into_spaces() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits inside the workspace")
+            .to_path_buf();
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "found no sources to check under {root:?}"
+        );
+
+        let run = " ".repeat(MANGLED);
+        let mut found = Vec::new();
+        for path in &files {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for (number, line) in text.lines().enumerate() {
+                // Only inside a literal: indentation is spaces too, and every
+                // line of a continued string starts with plenty of it.
+                let Some(opened) = line.find('"') else {
+                    continue;
+                };
+                if line[opened..].contains(&run) {
+                    found.push(format!(
+                        "{}:{}: {}",
+                        path.display(),
+                        number + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "string literals with {MANGLED}+ spaces inside them, which is a \
+             line continuation that was eaten rather than text anybody wrote:\n{}",
+            found.join("\n")
+        );
+    }
+}
