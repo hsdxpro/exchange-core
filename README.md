@@ -90,7 +90,7 @@ cargo run --release -p bx-gateway --bin replica -- 127.0.0.1:7201
 | Crossing order, one fill | **255 ns** |
 | Cancel by order ID | **118 ns** |
 | Mixed stream | **186 ns** |
-| Market order sweeping 2,000 levels | 172 ns/level |
+| Market order sweeping 2,000 levels | 60 ns/level |
 | Three market-data subscribers attached | +19 ns |
 | Verifiable chain, when enabled | +25 ns |
 | Chain signed by the venue | +17 ns more |

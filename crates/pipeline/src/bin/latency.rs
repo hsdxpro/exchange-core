@@ -97,7 +97,12 @@ fn sweeping_orders(sink: &mut u64) -> Vec<f64> {
     for _ in 0..REPS {
         let mut exchange = venue();
         let mut next_id = 1_u64;
-        let started = Instant::now();
+        // Only the taker is timed. This used to start the clock before building
+        // the wall, so the figure was two thousand passive inserts plus one
+        // sweep, divided by the levels -- mostly the cost of resting makers,
+        // published as the cost of sweeping them. The engine's own sweep
+        // benchmark times only the aggressive order, and so does this now.
+        let mut swept = 0.0_f64;
         for _ in 0..SWEEPS {
             // A fresh wall of asks, one order at each of many prices.
             for level in 0..LEVELS {
@@ -112,15 +117,20 @@ fn sweeping_orders(sink: &mut u64) -> Vec<f64> {
                 next_id += 1;
                 exchange.submit(&mut maker).unwrap();
             }
-            // And one order that takes the lot, crossing every level.
+            // One order takes the lot, crossing every level: the measured part.
             let mut taker = market_order(2, SYMBOL, next_id, Side::Bid, LEVELS);
             next_id += 1;
+            let started = Instant::now();
             let events = exchange.submit(&mut taker).unwrap();
+            swept += started.elapsed().as_secs_f64();
+            // Every level filled, or this is measuring something cheaper and
+            // calling it a sweep.
+            assert!(events.len() as u64 > LEVELS, "the sweep did not fill");
             *sink = sink.wrapping_add(events.len() as u64);
         }
         // Divided by the levels swept, not by the orders sent, so the figure is
         // per unit of work and comparable across depths.
-        samples.push(started.elapsed().as_secs_f64() * 1e9 / (SWEEPS * LEVELS) as f64);
+        samples.push(swept * 1e9 / (SWEEPS * LEVELS) as f64);
         assert_eq!(
             exchange.open_orders(),
             0,
