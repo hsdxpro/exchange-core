@@ -17,14 +17,18 @@ use std::time::{Duration, Instant};
 /// than a venue.
 /// How long an election may take before the test gives up.
 ///
-/// Sixty seconds is absurd for a Raft election, which settles in about a second
-/// on an idle machine. It is not absurd on a shared runner, or on a desk running
-/// two other test suites: the node has to miss heartbeats, time out, campaign and
-/// win, and every one of those steps is a timer competing for a core. This ran
-/// out at twenty while the machine was busy, reporting a working election as a
-/// broken one. A generous limit costs nothing when the code is right and seconds
-/// when it is wrong.
-const SETTLE: Duration = Duration::from_secs(60);
+/// Generous for something that settles in about a second on an idle machine: on a
+/// shared runner the node has to miss heartbeats, time out, campaign and win, and
+/// every one of those is a timer competing for a core.
+///
+/// It was raised from twenty to sixty once on the theory that a busy machine
+/// needed longer, and then ran out at sixty as well -- which was the clue. The
+/// time was not going into the election at all. `Leadership` held its tokio
+/// runtime by value, dropping a runtime waits for every task with no limit, and
+/// killing the leader below therefore spent the whole budget inside `drop`
+/// before the wait for a replacement had even begun. The node now leaves on a
+/// bound, and this timeout is back to covering only what it names.
+const SETTLE: Duration = Duration::from_secs(30);
 
 struct Scratch(PathBuf);
 
@@ -145,10 +149,17 @@ fn killing_the_leader_elects_another_with_a_higher_term() {
     let first = settled(&nodes, SETTLE).expect("the cluster never settled on a leader");
     let first_term = nodes[first].term();
 
-    // Kill it, as a machine failure would. Dropping stops its Raft node, so it
-    // stops answering heartbeats and stops standing for election.
+    // Kill it, as a machine failure would. Dropping asks Raft to stop and then
+    // gives the runtime a deadline, so the node stops answering heartbeats and
+    // standing for election -- and the drop itself cannot outlast its bound.
     let dead = nodes.remove(first);
+    let leaving = Instant::now();
     drop(dead);
+    assert!(
+        leaving.elapsed() < Duration::from_secs(10),
+        "dropping a node took {:?}, so a venue's shutdown is unbounded",
+        leaving.elapsed()
+    );
 
     let second = settled(&nodes, SETTLE).expect("no replacement was elected after the leader died");
     let second_term = nodes[second].term();

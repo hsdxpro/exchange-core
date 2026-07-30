@@ -396,6 +396,7 @@ custom transport becomes the bottleneck.
 | Gateway dies | clients reconnect elsewhere, resume from `last_seq` |
 | Leader dies | The cluster elects a replacement in about a second. The journal is already on a majority so no acknowledged order is lost, the new leader catches up to the longest log a majority holds before serving, and term fencing stops the old one writing if it returns |
 | One journal node dies | majority continues; degraded and alarmed |
+| A node leaves the cluster | It asks Raft to stop, so it stops answering heartbeats and standing for election, then gives its runtime a deadline. Both halves matter: without the first, the remaining nodes wait out an election timeout against a peer that is nominally still there; without the second, the wait is unbounded, because dropping a tokio runtime waits for every task with no limit. A venue whose shutdown can hang is a venue that cannot be restarted |
 | A partition panics | deliberate abort with a state dump, restart from snapshot + replay. The other partitions are untouched, which is the point of them being processes |
 | Subscriber falls behind | ring overwrites, subscriber sees the gap and re-snapshots |
 | Client floods | A token bucket per account at the gateway, before sequencing, so a discarded command is never journalled. Separately, the per-session outbox budget sheds a client the venue cannot write *to*, which is the opposite failure |

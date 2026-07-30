@@ -70,6 +70,13 @@ const HEARTBEAT_MS: u64 = 250;
 const ELECTION_MIN_MS: u64 = 1_000;
 const ELECTION_MAX_MS: u64 = 2_000;
 
+/// How long a node may take to leave before it is abandoned.
+///
+/// Generous for something that normally takes milliseconds, and bounded because
+/// the alternative -- the unbounded wait a bare `Runtime` drop performs -- means
+/// one stuck task hangs a venue's shutdown.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// What the venue reads. Written by the Raft runtime, read by the venue's loop.
 #[derive(Debug, Default)]
 struct Shared {
@@ -85,7 +92,14 @@ pub struct Leadership {
     id: NodeId,
     shared: Arc<Shared>,
     /// Kept alive so the runtime and its tasks outlive this handle.
-    runtime: tokio::runtime::Runtime,
+    ///
+    /// In an `Option` so [`Drop`] can take it out and shut it down on a bound.
+    /// Dropping a `Runtime` where it sits waits for every task to wind up, with
+    /// no limit -- so a node that would not stop took the venue's shutdown with
+    /// it. Not hypothetical: a test that killed a leader and then waited for a
+    /// replacement spent its whole timeout inside the drop and reported the
+    /// election as broken.
+    runtime: Option<tokio::runtime::Runtime>,
     raft: Raft<Types>,
 }
 
@@ -197,7 +211,7 @@ impl Leadership {
         Ok(Self {
             id,
             shared,
-            runtime,
+            runtime: Some(runtime),
             raft,
         })
     }
@@ -256,9 +270,38 @@ impl Leadership {
     pub fn announce(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let raft = self.raft.clone();
         let id = self.id;
-        self.runtime
+        self.runtime()
             .block_on(async move { raft.client_write(types::Announce { leader: id }).await })
             .map(|_| ())
             .map_err(Into::into)
+    }
+
+    /// The runtime, which exists for as long as this handle does.
+    fn runtime(&self) -> &tokio::runtime::Runtime {
+        self.runtime
+            .as_ref()
+            .expect("the runtime is taken only by Drop, after which nothing runs")
+    }
+}
+
+/// Leaves the cluster on the way out, on a bound.
+///
+/// Two steps, and the order matters. Raft is asked to stop first, so the node
+/// stops answering heartbeats and standing for election -- which is what lets the
+/// remaining nodes elect a replacement promptly rather than waiting out an
+/// election timeout against a peer that is still nominally there. Then the
+/// runtime is given a deadline to wind up, so a task that will not finish costs
+/// seconds instead of the process.
+impl Drop for Leadership {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let raft = self.raft.clone();
+        // Bounded: `shutdown` waits for the node's own task, and a node wedged
+        // for any reason must not be able to hold this.
+        let _ = runtime
+            .block_on(async move { tokio::time::timeout(SHUTDOWN_GRACE, raft.shutdown()).await });
+        runtime.shutdown_timeout(SHUTDOWN_GRACE);
     }
 }
