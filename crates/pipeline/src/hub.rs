@@ -88,7 +88,12 @@ impl Channel {
             // rides the book channel rather than one of its own, because a
             // client that cares about a symbol's state is already following it.
             EventKind::SymbolState => Self::Book(event.symbol),
-            EventKind::Checkpoint => Self::Checkpoint,
+            // A signature and the head it covers travel together or neither is
+            // worth anything: the head is what a client folds towards and the
+            // signature is what stops a rewritten stream carrying its own head.
+            EventKind::Checkpoint
+            | EventKind::CheckpointSignature
+            | EventKind::CheckpointSignatureContinued => Self::Checkpoint,
             // Being stopped is private to the account it happened to.
             EventKind::AccountTrading => Self::Account(event.account),
         })

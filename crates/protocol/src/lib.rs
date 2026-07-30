@@ -66,6 +66,30 @@ pub const PUBLIC_KEY_LEN: usize = 32;
 /// cannot be confused with this one.
 pub const AUTH_DOMAIN: &[u8] = b"bx-venue-auth-v1";
 
+/// Prefix over what a checkpoint signature covers.
+///
+/// Separate from [`AUTH_DOMAIN`] for the same reason that exists at all: one key
+/// must never produce a signature that is valid in two places. A venue signing
+/// a chain head must not, by picking the head's bytes, be made to produce
+/// something that verifies as a logon -- and a client's logon signature must
+/// never pass as a venue's commitment to the stream.
+pub const CHECKPOINT_DOMAIN: &[u8] = b"bx-venue-chain-v1";
+
+/// The bytes a venue signs to commit to a chain head.
+///
+/// The sequence is in the message, not merely alongside it. A head signed on its
+/// own is a valid signature over that head at *any* position, so a venue could be
+/// shown its own past commitment as though it described the present -- the head
+/// and the extent it covers only mean something together.
+#[must_use]
+pub fn checkpoint_message(sealed_at: Sequence, head: &[u8; 32]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(CHECKPOINT_DOMAIN.len() + 8 + head.len());
+    message.extend_from_slice(CHECKPOINT_DOMAIN);
+    message.extend_from_slice(&sealed_at.to_le_bytes());
+    message.extend_from_slice(head);
+    message
+}
+
 // ---------------------------------------------------------------- enums
 
 /// `u8` discriminants so the wire representation is stable regardless of what
@@ -469,6 +493,20 @@ pub enum EventKind {
     /// It does not yet let that client prove to a third party which of them was
     /// right, which is what a venue signature over the head would add.
     Checkpoint = 14,
+    /// First 32 bytes of the venue's signature over the checkpoint before it.
+    ///
+    /// A signature is 64 bytes and an event is 64 bytes in total, so it arrives
+    /// as two records -- the same shape the two-record logon uses, and for the
+    /// same reason: growing the event past a cache line would cost every
+    /// subscriber on every message to carry a field almost none of them read.
+    ///
+    /// Unsigned, the chain proves only that a venue is consistent with itself. A
+    /// venue that rewrote its own history could publish a new head over the new
+    /// stream and nothing would contradict it. The signature is what makes the
+    /// head evidence rather than an assertion.
+    CheckpointSignature = 15,
+    /// Last 32 bytes. Always the record immediately after its first half.
+    CheckpointSignatureContinued = 16,
     /// An account's ability to open new risk changed. `quantity` is 0 for
     /// stopped and 1 for permitted.
     ///
@@ -534,11 +572,12 @@ pub struct Event {
 const _: () = assert!(size_of::<Event>() == 64);
 
 impl Event {
-    /// Returns `None` if the discriminant is not a value this version defines.
+    /// The 32 bytes an [`EventKind::Checkpoint`] or a signature half carries.
     ///
-    /// The 32-byte chain head in an [`EventKind::Checkpoint`]. Meaningless for
-    /// any other kind: a checkpoint names no order and no price, so it reuses the
-    /// four fields that would carry them.
+    /// Meaningless for any other kind: none of those records names an order or a
+    /// price, so all three reuse the four fields that would carry them, packed
+    /// the same way and read back by this one function. A client reassembles a
+    /// signature by concatenating the two halves in arrival order.
     #[must_use]
     pub fn chain_head(&self) -> [u8; 32] {
         let mut head = [0_u8; 32];
@@ -563,6 +602,38 @@ impl Event {
             kind: EventKind::Checkpoint as u8,
             ..Self::default()
         }
+    }
+
+    /// The venue's signature over the checkpoint, as the two records it takes.
+    ///
+    /// `sequence` is left for the publisher to stamp, exactly as
+    /// [`Self::checkpoint`] leaves it: these are ordinary events on the
+    /// checkpoint channel and are numbered with everything else, so a resuming
+    /// client gets them from the ring like any other record.
+    #[must_use]
+    pub fn checkpoint_signature(sequence: Sequence, signature: &[u8; SIGNATURE_LEN]) -> [Self; 2] {
+        let half = |kind: EventKind, from: usize| {
+            let word = |at: usize| {
+                u64::from_le_bytes(signature[at..at + 8].try_into().expect("eight bytes"))
+            };
+            Self {
+                cause_sequence: sequence,
+                order_id: word(from),
+                counterparty_order_id: word(from + 8),
+                quantity: word(from + 16),
+                price: i64::from_le_bytes(
+                    signature[from + 24..from + 32]
+                        .try_into()
+                        .expect("eight bytes"),
+                ),
+                kind: kind as u8,
+                ..Self::default()
+            }
+        };
+        [
+            half(EventKind::CheckpointSignature, 0),
+            half(EventKind::CheckpointSignatureContinued, 32),
+        ]
     }
 
     /// Typed, so a client reporting why it was refused can print the reason's
@@ -615,6 +686,8 @@ impl Event {
             12 => Some(EventKind::SymbolState),
             13 => Some(EventKind::AccountTrading),
             14 => Some(EventKind::Checkpoint),
+            15 => Some(EventKind::CheckpointSignature),
+            16 => Some(EventKind::CheckpointSignatureContinued),
             _ => None,
         }
     }
@@ -1248,6 +1321,8 @@ mod tests {
             (12, EventKind::SymbolState),
             (13, EventKind::AccountTrading),
             (14, EventKind::Checkpoint),
+            (15, EventKind::CheckpointSignature),
+            (16, EventKind::CheckpointSignatureContinued),
         ] {
             let event = Event {
                 kind: byte,
@@ -1257,7 +1332,7 @@ mod tests {
         }
         assert!(
             Event {
-                kind: 15,
+                kind: 17,
                 ..Event::default()
             }
             .kind()

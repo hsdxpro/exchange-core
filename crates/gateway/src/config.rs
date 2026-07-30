@@ -189,6 +189,16 @@ pub struct Config {
     /// reachable because a line was forgotten reads exactly like one that was
     /// meant to be there.
     pub admin_account: Option<AccountId>,
+    /// Whether to publish a verifiable chain over the sequenced stream.
+    pub chain: bool,
+    /// Records per seal. Zero means the journal's default.
+    pub chain_interval: u64,
+    /// File holding the venue's chain signing key, as 64 hex characters.
+    ///
+    /// A path, never the key itself. A secret in a configuration file is a secret
+    /// in whatever holds that file -- a repository, an image layer, a backup --
+    /// and the public half is the only part that belongs anywhere shareable.
+    pub chain_key_file: Option<PathBuf>,
     pub max_records_per_session: usize,
     /// Connections held at once. Beyond this the venue refuses rather than
     /// serving everyone slowly.
@@ -258,6 +268,9 @@ impl Config {
         let mut journal = None;
         let mut snapshot = None;
         let mut admin_account = None;
+        let mut chain = None;
+        let mut chain_interval = None;
+        let mut chain_key_file = None;
         let mut target_recovery_ms = None;
         let mut replay_rate = None;
         let mut retained = None;
@@ -334,7 +347,7 @@ impl Config {
                     // logons and the operator should be told.
                     "public_key" => {
                         draft.secret = Some(
-                            auth::public_key_from_hex(value)
+                            auth::key_bytes_from_hex(value)
                                 .map_err(|why| ConfigError::at(line, why))?,
                         );
                         continue;
@@ -391,6 +404,20 @@ impl Config {
 
             match key {
                 "listen" => listen = Some(value.to_string()),
+                "chain" => {
+                    chain = Some(match value {
+                        "on" => true,
+                        "off" => false,
+                        other => {
+                            return Err(ConfigError::at(
+                                line,
+                                format!("chain is `on` or `off`, not `{other}`"),
+                            ));
+                        }
+                    });
+                }
+                "chain_interval" => chain_interval = Some(number("chain_interval")?),
+                "chain_key_file" => chain_key_file = Some(PathBuf::from(value)),
                 "journal" => journal = Some(PathBuf::from(value)),
                 "snapshot" => snapshot = Some(PathBuf::from(value)),
                 "target_recovery_ms" => target_recovery_ms = Some(number("target_recovery_ms")?),
@@ -571,6 +598,30 @@ impl Config {
             }
         }
 
+        // A key with no chain to sign, or an interval nothing seals: both read as
+        // though verifiability is on when it is not, which is the failure mode
+        // this file exists to refuse.
+        if !chain.unwrap_or(false) {
+            if chain_key_file.is_some() {
+                return Err(ConfigError::whole_file(
+                    "chain_key_file is set but chain is off, so nothing would be \
+                     signed",
+                ));
+            }
+            if chain_interval.is_some() {
+                return Err(ConfigError::whole_file(
+                    "chain_interval is set but chain is off, so nothing would be \
+                     sealed",
+                ));
+            }
+        }
+        if chain_interval == Some(0) {
+            return Err(ConfigError::whole_file(
+                "chain_interval of zero would seal nothing; leave it unset for the \
+                 default",
+            ));
+        }
+
         // A cluster that cannot say which node it is, or where its vote is kept,
         // is one that would either wait forever or forget what it voted.
         if !peers.is_empty() {
@@ -644,6 +695,9 @@ impl Config {
             replay_rate,
             retained_per_channel: retained,
             admin_account,
+            chain: chain.unwrap_or(false),
+            chain_interval: chain_interval.unwrap_or(0),
+            chain_key_file,
             max_records_per_session: usize::try_from(max_records)
                 .map_err(|_| ConfigError::whole_file("max_records_per_session is too large"))?,
             max_sessions: usize::try_from(max_sessions)
@@ -798,6 +852,60 @@ max_open_orders = 1000000
         let text = VALID.to_owned() + "admin_account = 1\n";
         let settings = Config::parse(&text).expect("a keyed administrator is valid");
         assert_eq!(settings.admin_account, Some(1));
+    }
+
+    #[test]
+    fn a_chain_key_with_no_chain_to_sign_is_refused() {
+        let text = VALID.to_owned()
+            + "chain_key_file = venue.key
+";
+        assert!(refusal(&text).contains("nothing would be signed"));
+    }
+
+    #[test]
+    fn a_chain_interval_with_no_chain_is_refused() {
+        let text = VALID.to_owned()
+            + "chain_interval = 1024
+";
+        assert!(refusal(&text).contains("nothing would be sealed"));
+    }
+
+    #[test]
+    fn a_chain_interval_of_zero_is_refused() {
+        let text = VALID.to_owned()
+            + "chain = on
+chain_interval = 0
+";
+        assert!(refusal(&text).contains("seal nothing"));
+    }
+
+    #[test]
+    fn a_chain_that_is_neither_on_nor_off_is_refused() {
+        let text = VALID.to_owned()
+            + "chain = yes
+";
+        assert!(refusal(&text).contains("`on` or `off`"));
+    }
+
+    #[test]
+    fn a_signed_chain_parses() {
+        let text = VALID.to_owned()
+            + "chain = on
+chain_interval = 4096
+chain_key_file = venue.key
+";
+        let config = Config::parse(&text).expect("a signed chain is valid configuration");
+        assert!(config.chain);
+        assert_eq!(config.chain_interval, 4_096);
+        assert_eq!(config.chain_key_file, Some(PathBuf::from("venue.key")));
+    }
+
+    #[test]
+    fn a_chain_defaults_to_off() {
+        let config = Config::parse(VALID).unwrap();
+        assert!(!config.chain, "verifiability turned itself on");
+        assert_eq!(config.chain_interval, 0);
+        assert!(config.chain_key_file.is_none());
     }
 
     #[test]

@@ -15,8 +15,9 @@ mod common;
 use bx_journal::{CHAIN_LEN, EMPTY_CHAIN, MemoryLog, chain_next};
 use bx_pipeline::snapshot::Snapshot;
 use bx_pipeline::{Exchange, limit_order};
-use bx_protocol::{Command, EventKind, Side};
+use bx_protocol::{Command, EventKind, Side, checkpoint_message};
 use common::{SYMBOL, funded, instruments};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use zerocopy::IntoBytes;
 
 /// A chaining venue that seals after every record.
@@ -555,4 +556,188 @@ fn a_chain_enabled_before_a_replay_is_fine() {
     // And it may append afterwards.
     let mut more = limit_order(1, SYMBOL, 11, Side::Bid, 10_050, 1);
     restored.submit(&mut more).unwrap();
+}
+
+// ------------------------------------------------ the venue's own signature
+
+/// A key whose private half exists only here. Signing keys never live in the
+/// repository; this is a test fixture, and a venue's real one is loaded from a
+/// file the operator holds.
+fn venue_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x5a; 32])
+}
+
+fn signed_chaining() -> Exchange<MemoryLog> {
+    let mut exchange = chaining();
+    exchange.set_chain_key(venue_key());
+    exchange
+}
+
+/// Reassembles the signature a checkpoint was published with, the way a client
+/// reading the channel must: two halves, in arrival order, after the head.
+fn published_signature(events: &[bx_protocol::Event]) -> Option<(u64, [u8; 32], [u8; 64])> {
+    let head_at = events
+        .iter()
+        .position(|e| e.kind == EventKind::Checkpoint as u8)?;
+    let first = events
+        .iter()
+        .position(|e| e.kind == EventKind::CheckpointSignature as u8)?;
+    let second = events
+        .iter()
+        .position(|e| e.kind == EventKind::CheckpointSignatureContinued as u8)?;
+    let mut signature = [0_u8; 64];
+    signature[..32].copy_from_slice(&events[first].chain_head());
+    signature[32..].copy_from_slice(&events[second].chain_head());
+    Some((
+        events[head_at].cause_sequence,
+        events[head_at].chain_head(),
+        signature,
+    ))
+}
+
+/// What the gateway's logon asks a client to sign, spelled out rather than
+/// imported: this crate must not depend on the gateway to make a point about
+/// domain separation.
+fn logon_message(nonce: &[u8; 32]) -> Vec<u8> {
+    let mut message = Vec::new();
+    message.extend_from_slice(bx_protocol::AUTH_DOMAIN);
+    message.extend_from_slice(nonce);
+    message
+}
+
+#[test]
+fn a_client_can_verify_the_venue_signed_the_head_it_published() {
+    let mut exchange = signed_chaining();
+    let mut command = limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1);
+    let events = exchange.submit(&mut command).unwrap().to_vec();
+
+    let (sealed_at, head, signature) =
+        published_signature(&events).expect("no signature was published with the head");
+    // Only the public half, which is all a client is ever given.
+    let verifying = VerifyingKey::from_bytes(&venue_key().verifying_key().to_bytes()).unwrap();
+    verifying
+        .verify_strict(
+            &checkpoint_message(sealed_at, &head),
+            &Signature::from_bytes(&signature),
+        )
+        .expect("the venue's signature over its own head did not verify");
+    assert_eq!(
+        exchange.chain_public_key(),
+        Some(verifying.to_bytes()),
+        "the venue reports a public key other than the one it signed with"
+    );
+}
+
+#[test]
+fn the_signature_arrives_as_two_records_directly_after_the_head() {
+    let mut exchange = signed_chaining();
+    let mut command = limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1);
+    let events = exchange.submit(&mut command).unwrap();
+
+    let checkpoint: Vec<&bx_protocol::Event> = events
+        .iter()
+        .filter(|e| e.kind >= EventKind::Checkpoint as u8)
+        .collect();
+    let kinds: Vec<u8> = checkpoint.iter().map(|e| e.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            EventKind::Checkpoint as u8,
+            EventKind::CheckpointSignature as u8,
+            EventKind::CheckpointSignatureContinued as u8,
+        ],
+        "a client reassembling halves in arrival order would build the wrong signature"
+    );
+    // Contiguous channel sequences, so a subscriber cannot mistake the pair for
+    // a gap and ask for a resume it does not need.
+    for pair in checkpoint.windows(2) {
+        assert_eq!(
+            pair[1].sequence,
+            pair[0].sequence + 1,
+            "the checkpoint channel numbered its own records with a hole"
+        );
+    }
+}
+
+#[test]
+fn a_signature_does_not_verify_against_a_head_it_did_not_cover() {
+    let mut exchange = signed_chaining();
+    let mut first = limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1);
+    let early = exchange.submit(&mut first).unwrap().to_vec();
+    let mut second = limit_order(1, SYMBOL, 2, Side::Bid, 10_060, 1);
+    let later = exchange.submit(&mut second).unwrap().to_vec();
+
+    let (_, _, early_signature) = published_signature(&early).unwrap();
+    let (later_at, later_head, _) = published_signature(&later).unwrap();
+    // The venue's own earlier signature, replayed against a later head. Refused
+    // because the sequence is inside the signed message, not merely beside it.
+    assert!(
+        venue_key()
+            .verifying_key()
+            .verify_strict(
+                &checkpoint_message(later_at, &later_head),
+                &Signature::from_bytes(&early_signature),
+            )
+            .is_err(),
+        "a past commitment verified as a description of the present"
+    );
+}
+
+#[test]
+fn a_logon_signature_is_not_a_commitment_to_the_stream() {
+    // The domains are separate so one key cannot produce a signature valid in
+    // both places. Signing a logon challenge whose bytes are chosen to look like
+    // a checkpoint must not yield a usable commitment.
+    let key = venue_key();
+    let mut exchange = signed_chaining();
+    let mut command = limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1);
+    let events = exchange.submit(&mut command).unwrap().to_vec();
+    let (sealed_at, head, _) = published_signature(&events).unwrap();
+
+    let as_logon = key.sign(&logon_message(&head));
+    assert!(
+        key.verifying_key()
+            .verify_strict(&checkpoint_message(sealed_at, &head), &as_logon)
+            .is_err(),
+        "a logon signature verified as a chain commitment"
+    );
+}
+
+#[test]
+fn a_venue_holding_no_key_still_publishes_a_head() {
+    // The chain is worth folding without a signature; it just cannot survive a
+    // venue that rewrites its own history. Losing the head too would be strictly
+    // worse.
+    let mut exchange = chaining();
+    let mut command = limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1);
+    let events = exchange.submit(&mut command).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Checkpoint as u8),
+        "an unsigned venue stopped publishing heads"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.kind == EventKind::CheckpointSignature as u8),
+        "a venue with no key published a signature anyway"
+    );
+    assert_eq!(exchange.chain_public_key(), None);
+}
+
+#[test]
+fn a_replay_on_a_node_holding_the_same_key_reproduces_the_signature() {
+    // Ed25519 is deterministic, which is what lets the signature live in the
+    // event stream at all: a promoted node replaying the journal has to produce
+    // the same records, or recovery would not be a function of the log.
+    let mut exchange = signed_chaining();
+    let mut command = limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1);
+    let events = exchange.submit(&mut command).unwrap().to_vec();
+    let (sealed_at, head, signature) = published_signature(&events).unwrap();
+
+    let again = venue_key().sign(&checkpoint_message(sealed_at, &head));
+    assert_eq!(
+        again.to_bytes(),
+        signature,
+        "the same key over the same head produced two different signatures"
+    );
 }

@@ -183,15 +183,20 @@ pub fn nonce() -> [u8; CHALLENGE_LEN] {
     bytes
 }
 
-/// Parses a 32-byte public key written as 64 hex characters.
+/// Parses 32 key bytes written as 64 hex characters.
+///
+/// Used for both halves of a keypair -- an account's public key from the
+/// configuration file, and the venue's own signing seed from the file that holds
+/// it. Named for the bytes rather than for either role, because the parsing is
+/// the same and having two of these would mean the next fix landed in one.
 ///
 /// # Errors
 /// Returns a description of what is wrong with the text.
-pub fn public_key_from_hex(text: &str) -> Result<[u8; PUBLIC_KEY_LEN], String> {
+pub fn key_bytes_from_hex(text: &str) -> Result<[u8; PUBLIC_KEY_LEN], String> {
     let text = text.trim();
     if text.len() != PUBLIC_KEY_LEN * 2 {
         return Err(format!(
-            "a public key is {} hex characters, not {}",
+            "a key is {} hex characters, not {}",
             PUBLIC_KEY_LEN * 2,
             text.len()
         ));
@@ -380,14 +385,14 @@ mod tests {
         let key = keypair(7);
         let bytes = key.verifying_key().to_bytes();
         let text: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(public_key_from_hex(&text).unwrap(), bytes);
+        assert_eq!(key_bytes_from_hex(&text).unwrap(), bytes);
     }
 
     #[test]
     fn hex_of_the_wrong_length_or_with_junk_is_refused() {
-        assert!(public_key_from_hex("00").is_err());
-        assert!(public_key_from_hex(&"z".repeat(64)).is_err());
-        assert!(public_key_from_hex(&"0".repeat(63)).is_err());
+        assert!(key_bytes_from_hex("00").is_err());
+        assert!(key_bytes_from_hex(&"z".repeat(64)).is_err());
+        assert!(key_bytes_from_hex(&"0".repeat(63)).is_err());
     }
 
     /// Two nonces in a row must differ. A counter or a clock here would let an

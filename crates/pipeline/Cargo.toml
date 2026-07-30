@@ -12,6 +12,12 @@ bx-protocol = { path = "../protocol" }
 bx-journal = { path = "../journal" }
 bx-engine = { path = "../engine" }
 zerocopy = { version = "0.8", features = ["derive"] }
+# Signing what the venue commits to. Already in the tree for the gateway's
+# logon, so this adds no new external dependency.
+ed25519-dalek = "3"
+
+[dev-dependencies]
+ed25519-dalek = "3"
 
 [lints]
 workspace = true

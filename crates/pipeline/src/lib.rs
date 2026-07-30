@@ -20,7 +20,9 @@ use bx_protocol::{
     AccountId, ChannelKind, Command, CommandKind, Event, EventKind, OrderId, Quantity,
     RejectReason, Sequence, Side, SnapshotBalance, SnapshotOrder, SnapshotOrderIdMark,
     SnapshotStoppedAccount, SnapshotSymbolState, SymbolId, Ticks, TimeInForce, TradingState,
+    checkpoint_message,
 };
+use ed25519_dalek::{Signer, SigningKey};
 use fastmap::FastMap;
 use instrument::{Instrument, Instruments};
 use snapshot::{Snapshot, balance_of};
@@ -243,6 +245,17 @@ pub struct Exchange<S: LogStorage> {
     /// way, because there is nothing to publish about a venue that has taken no
     /// commands.
     published_head: [u8; 32],
+    /// The venue's identity, for signing what it commits to.
+    ///
+    /// Absent by default, and the chain still works without it -- a client can
+    /// still fold the stream and catch a venue that contradicts itself. What the
+    /// key adds is the case a self-consistent chain cannot cover: a venue that
+    /// rewrites its history and republishes a head over the rewritten stream.
+    ///
+    /// Held here rather than in the gateway because the signature is emitted as
+    /// part of the event stream, and everything in that stream has to come from
+    /// the deterministic core.
+    chain_key: Option<SigningKey>,
     /// Reused across commands. Swapped into the book for the duration of a
     /// call so the book can fill it while `self` stays borrowable.
     scratch: Outcome,
@@ -269,6 +282,7 @@ impl<S: LogStorage> Exchange<S> {
             symbol_state: Vec::new(),
             stopped_accounts: FastMap::default(),
             published_head: [0; 32],
+            chain_key: None,
             events: Vec::new(),
             released: true,
             event_sequence: 0,
@@ -373,6 +387,25 @@ impl<S: LogStorage> Exchange<S> {
             event.sequence = self.event_sequence;
             self.event_sequence += 1;
             self.events.push(event);
+
+            // The venue's own signature over that commitment, when it holds a
+            // key. Without one the chain shows only that the venue agrees with
+            // itself: a venue that rewrote its history could publish a head over
+            // the rewritten stream and nothing would contradict it.
+            //
+            // Signed here rather than at the publisher so the signature is an
+            // ordinary event on the checkpoint channel -- numbered with
+            // everything else, retained in the same ring, and served to a
+            // resuming client by the same path. Ed25519 is deterministic, so a
+            // replay on a node holding the same key reproduces it exactly.
+            if let Some(key) = &self.chain_key {
+                let signature = key.sign(&checkpoint_message(covered, &head)).to_bytes();
+                for mut half in Event::checkpoint_signature(covered, &signature) {
+                    half.sequence = self.event_sequence;
+                    self.event_sequence += 1;
+                    self.events.push(half);
+                }
+            }
         }
         self.released = true;
         Ok(&self.events)
@@ -723,6 +756,24 @@ impl<S: LogStorage> Exchange<S> {
     #[must_use]
     pub const fn chain_sealed_at(&self) -> Sequence {
         self.journal.chain_sealed_at()
+    }
+
+    /// Gives the venue the key it signs checkpoints with.
+    ///
+    /// Separate from turning the chain on, because they are separate decisions:
+    /// a venue can publish a chain nobody can forge only if it holds a key, and
+    /// one that holds no key still publishes a chain worth folding.
+    pub fn set_chain_key(&mut self, key: SigningKey) {
+        self.chain_key = Some(key);
+    }
+
+    /// The public half of the signing key, for a client to check against the one
+    /// it was given out of band.
+    #[must_use]
+    pub fn chain_public_key(&self) -> Option<[u8; 32]> {
+        self.chain_key
+            .as_ref()
+            .map(|key| key.verifying_key().to_bytes())
     }
 
     /// Turns the verifiable chain on or off. Off by default; see the journal for

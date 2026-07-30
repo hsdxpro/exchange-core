@@ -17,6 +17,7 @@ use bx_pipeline::hub::{Channel, Hub};
 use bx_pipeline::instrument::{AssetId, Instrument, Instruments};
 use bx_pipeline::{Exchange, limit_order, market_order};
 use bx_protocol::{Command, CommandKind, Side, Ticks, TimeInForce};
+use ed25519_dalek::SigningKey;
 use std::hint::black_box;
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
@@ -45,11 +46,20 @@ fn venue() -> Exchange<MemoryLog> {
         MAX_OPEN_ORDERS,
     ));
     let mut exchange = Exchange::new(MemoryLog::new(), instruments).unwrap();
+    fund(&mut exchange);
+    exchange
+}
+
+/// Deposits into the sixteen accounts the scenarios trade with.
+///
+/// Split out because a chained venue has to switch the chain on before anything
+/// is journalled -- the deposits included -- and a chain that starts partway
+/// through a log is refused rather than published.
+fn fund(exchange: &mut Exchange<MemoryLog>) {
     for account in 1..=16 {
         exchange.deposit(account, USD, u64::MAX).unwrap();
         exchange.deposit(account, BTC, u64::MAX).unwrap();
     }
-    exchange
 }
 
 fn report(name: &str, per_op_ns: &mut [f64], unit: &str) {
@@ -182,6 +192,60 @@ fn across_symbols(symbols: u32, sink: &mut u64) -> Vec<f64> {
             COUNT as usize,
             "orders went missing, so this is measuring the reject path"
         );
+        black_box(&exchange);
+    }
+    samples
+}
+
+/// The resting path with the verifiable chain on, optionally signed.
+///
+/// Both are published claims and neither had a benchmark behind it, which is how
+/// a number nobody can regenerate ends up in a README. The chain folds every
+/// record into a running SHA-256; signing adds one Ed25519 signature per seal,
+/// so its cost per command is divided by the interval and the interval left at
+/// the venue's default is the only honest way to measure it.
+fn chained_orders(signed: bool, sink: &mut u64) -> Vec<f64> {
+    const COUNT: u64 = 100_000;
+    let mut samples = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        // Chain on before the first record, which is what a real venue does and
+        // what the journal now insists on.
+        let mut instruments = Instruments::new();
+        instruments.insert(Instrument::new(
+            SYMBOL,
+            BTC,
+            USD,
+            FLOOR,
+            1_000_000_000,
+            MAX_OPEN_ORDERS,
+        ));
+        let mut exchange = Exchange::new(MemoryLog::new(), instruments).unwrap();
+        exchange.set_chaining(true);
+        if signed {
+            // A fixture, not a deployment key: nothing here is ever written out.
+            exchange.set_chain_key(SigningKey::from_bytes(&[0x5a; 32]));
+        }
+        fund(&mut exchange);
+        let commands: Vec<Command> = (0..COUNT)
+            .map(|i| {
+                let price = FLOOR + 1_000 + (i % 4_000) as Ticks;
+                limit_order(1 + i % 16, SYMBOL, i + 1, Side::Bid, price, 1)
+            })
+            .collect();
+
+        let started = Instant::now();
+        for mut command in commands {
+            let events = exchange.submit(&mut command).unwrap();
+            *sink = sink.wrapping_add(events.len() as u64);
+        }
+        samples.push(started.elapsed().as_secs_f64() * 1e9 / COUNT as f64);
+
+        assert_ne!(
+            exchange.chain_head(),
+            bx_journal::EMPTY_CHAIN,
+            "the chain was on but sealed nothing, so this measures the plain path"
+        );
+        assert_eq!(exchange.chain_public_key().is_some(), signed);
         black_box(&exchange);
     }
     samples
@@ -748,6 +812,16 @@ fn main() {
         "market order sweeping 2000 levels",
         &mut sweeping_orders(&mut sink),
         "per level",
+    );
+    report(
+        "passive, verifiable chain on",
+        &mut chained_orders(false, &mut sink),
+        "per order",
+    );
+    report(
+        "passive, chain signed by the venue",
+        &mut chained_orders(true, &mut sink),
+        "per order",
     );
     report("cancel by order id", &mut cancels(&mut sink), "per cancel");
     report("mixed stream", &mut mixed_stream(&mut sink), "per command");

@@ -18,11 +18,12 @@
 //! measures the venue, a real file measures the disk.
 
 use bx_election::Leadership;
-use bx_gateway::auth::{Credentials, Mode as AuthMode};
+use bx_gateway::auth::{self, Credentials, Mode as AuthMode};
 use bx_gateway::config::Config;
 use bx_gateway::tcp::{Server, SnapshotPolicy};
 use bx_journal::{FileLog, JournalError, LogStorage, MemoryLog, ReplicatedLog};
 use bx_pipeline::instrument::{Instrument, Instruments};
+use ed25519_dalek::SigningKey;
 use std::path::Path;
 use std::time::Duration;
 
@@ -66,6 +67,9 @@ fn measurement_config() -> Config {
         journal: None,
         snapshot: None,
         admin_account: None,
+        chain: false,
+        chain_interval: 0,
+        chain_key_file: None,
         target_recovery: Duration::from_secs(2),
         replay_rate: 7_600_000,
         retained_per_channel: 1 << 16,
@@ -98,6 +102,32 @@ fn listed(config: &Config) -> Instruments {
         instruments.insert(*instrument);
     }
     instruments
+}
+
+/// Loads the venue's chain signing key from the file that holds it.
+///
+/// A file rather than a configuration value, and read at startup rather than
+/// embedded: a signing key in a config file is a signing key in the repository,
+/// the image layer, and every backup of either. Nothing prints it -- the public
+/// half is what an operator hands out, and it is derived here.
+fn read_chain_key(path: &Path) -> std::io::Result<SigningKey> {
+    let text = std::fs::read_to_string(path)?;
+    let seed = auth::key_bytes_from_hex(&text).map_err(|why| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: {why}", path.display()),
+        )
+    })?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+/// The public half, for an operator to hand to clients.
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
 }
 
 fn run<S: LogStorage>(
@@ -142,6 +172,32 @@ fn run<S: LogStorage>(
             limit.per_second(),
             limit.burst()
         );
+    }
+
+    // Before recovering, because a chain has to cover the replay too: switched on
+    // afterwards it would hold a head that accounts for nothing before it, which
+    // the journal now refuses outright rather than publishing.
+    if config.chain {
+        server.venue_mut().exchange_mut().set_chaining(true);
+        if config.chain_interval > 0 {
+            server
+                .venue_mut()
+                .exchange_mut()
+                .set_chain_interval(config.chain_interval);
+        }
+        match &config.chain_key_file {
+            Some(path) => {
+                let key = read_chain_key(path)?;
+                let public = key.verifying_key().to_bytes();
+                server.venue_mut().exchange_mut().set_chain_key(key);
+                // The public half, so an operator can hand clients the value they
+                // check against without going near the file.
+                println!("chain on, signing as {}", hex(&public));
+            }
+            None => println!(
+                "chain on, UNSIGNED: heads prove the venue agrees with itself,                  not that its history was never rewritten"
+            ),
+        }
     }
 
     // Recover first, always, and let the recovered state say whether this venue

@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-402%20passing-success" alt="402 tests">
+  <img src="https://img.shields.io/badge/tests-414%20passing-success" alt="414 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -29,8 +29,8 @@
 - **6.6M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **0.9 ms** to restart from a snapshot instead of 9.6 ms replaying from zero
-- **402 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
-- Ed25519 logon, a per-symbol kill switch, and an optional hash chain a client can check against the stream
+- **414 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
+- Ed25519 logon, a per-symbol kill switch, and an optional venue-signed hash chain a client can check against the stream
 
 Every number measured on the machine this was built on. `cargo x latency` reproduces the
 command-path and durability tables in about seven seconds.
@@ -49,7 +49,7 @@ green locally and green on a runner cannot become two different things.
 cargo x
 ```
 
-Format, `clippy -D warnings`, and all 402 tests.
+Format, `clippy -D warnings`, and all 414 tests.
 
 ```bash
 cargo x latency
@@ -92,7 +92,8 @@ cargo run --release -p bx-gateway --bin replica -- 127.0.0.1:7201
 | Mixed stream | **186 ns** |
 | Market order sweeping 2,000 levels | 172 ns/level |
 | Three market-data subscribers attached | +19 ns |
-| Verifiable chain, when enabled | +20 ns |
+| Verifiable chain, when enabled | +25 ns |
+| Chain signed by the venue | +17 ns more |
 
 Best of three runs, each already a minimum of five. Some of these are a few nanoseconds
 slower than earlier revisions: order IDs are now checked for monotonicity and every command
@@ -209,7 +210,7 @@ What the pair says:
 
 ### Verifiable ordering
 
-**Optional, off by default, +20 ns a command.** The journal keeps a running SHA-256 over its
+**Optional, off by default, +25 ns a command, +17 ns more when signed.** The journal keeps a running SHA-256 over its
 records, sealed every 1,024 of them and published on a `checkpoint` channel. Each head names
 the first sequence it does **not** cover, because it lags the log between boundaries — naming
 the newest sequence instead would claim coverage of records the head has not committed to,
@@ -221,10 +222,22 @@ front-run me* is otherwise a question a venue can only answer by asserting an an
 the Certificate Transparency shape pointed at a matching engine's sequencer, and it is cheap
 here because the sequencer is a single writer over fixed-width records.
 
-Two things it is not. It is **unsigned** — a client recomputing a different head knows the two
-disagree but cannot prove to a third party which was right. And it **cannot be retrofitted**:
-switching it on over a journal that already holds records commits to a suffix while a replay
-commits to everything, so it is refused after the first append.
+Each head is followed by the venue's Ed25519 signature over it, as two records because a
+signature is 64 bytes and an event is 64 bytes in total. The sealed sequence is inside the
+signed message rather than beside it, so a past commitment cannot be replayed as a description
+of the present, and the domain string differs from the logon's so one key cannot produce a
+signature valid in both places. Unsigned, a chain shows only that the venue agrees with itself:
+a venue that rewrote its history could publish a head over the rewritten stream and nothing
+would contradict it. Signing is what makes the head evidence rather than an assertion.
+
+The key is loaded from a file the operator holds — `chain_key_file`, never the key itself in
+the configuration — and only the public half is ever printed. Ed25519 is deterministic, so a
+promoted node replaying the journal reproduces the same signatures, which is what allows them
+to live in the event stream at all.
+
+One thing it is not: it **cannot be retrofitted**. Switching it on over a journal that already
+holds records commits to a suffix while a replay commits to everything, so it is refused at the
+first append rather than publishing a head that overstates what it covers.
 
 ### Reconnecting
 
@@ -293,7 +306,7 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 ## Testing
 
-402 tests. The ones worth reading:
+414 tests. The ones worth reading:
 
 | Test | What it proves |
 |---|---|
@@ -328,9 +341,6 @@ Scope boundaries, with reasons rather than apologies:
   the same reason — but it means an attacker who can *write* to the wire can still inject.
   A TLS listener is the answer for clients that are not on a private link, and it is the
   largest thing still missing.
-- **A signature over the chain head.** The head is published; nothing signs it. A client can
-  see that the venue disagrees with the stream, but cannot prove to a third party which of
-  them was right.
 - **Withdrawals and fees.** Venue features, not exchange-core ones. Halts *are* here — a
   symbol has a trading state and an account has a kill switch.
 
