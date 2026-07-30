@@ -375,3 +375,76 @@ fn no_private_event_is_ever_put_on_a_group() {
         );
     }
 }
+
+#[test]
+fn a_receiver_that_missed_events_recovers_them_from_the_feed() {
+    // The other half of an incremental feed. Multicast never retransmits and
+    // never waits, so a receiver that sees a hole in the sequence has to ask
+    // somewhere -- and asking must not reach into the fast path. It asks here,
+    // on the same port subscriptions use, and is served from the retention ring
+    // by the thread that owns it.
+    let venue = Running::start();
+
+    // Trades happen with nobody watching, which is exactly the position a
+    // receiver is in after losing packets.
+    for id in 0..3_u64 {
+        trade(&venue, 40 + id * 2, 41 + id * 2);
+    }
+
+    let mut recovering = Running::connect(&venue.feed);
+    send(
+        &mut recovering,
+        &[Command::resuming(0, SYMBOL, ChannelKind::Trades, 0)],
+    );
+    let seen = collect_until(&mut recovering, Duration::from_secs(10), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Trade as u8)
+            .count()
+            >= 3
+    });
+    let trades: Vec<&Event> = seen
+        .iter()
+        .filter(|e| e.kind == EventKind::Trade as u8)
+        .collect();
+    assert!(
+        trades.len() >= 3,
+        "the feed did not replay what the receiver missed: {trades:?}"
+    );
+    // Contiguous from the position asked for: no gap inside the repair, and no
+    // repeat, which is what makes the recovered range usable as-is.
+    assert_eq!(
+        trades[0].sequence, 0,
+        "the repair started somewhere other than where it was asked to"
+    );
+    for pair in trades.windows(2) {
+        assert_eq!(
+            pair[1].sequence,
+            pair[0].sequence + 1,
+            "the repair itself had a hole in it"
+        );
+    }
+}
+
+#[test]
+fn asking_for_a_position_the_feed_never_reached_does_not_hang_the_client() {
+    // A cursor from a previous run of the venue names a sequence this one has
+    // never issued. Answering with silence would leave a receiver waiting on a
+    // repair that is never coming; it is placed at the live edge instead, and
+    // the jump in its numbering is the instruction to reconcile.
+    let venue = Running::start();
+    let mut client = Running::connect(&venue.feed);
+    send(
+        &mut client,
+        &[Command::resuming(0, SYMBOL, ChannelKind::Trades, 9_000_000)],
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    trade(&venue, 60, 61);
+
+    let seen = collect_until(&mut client, Duration::from_secs(10), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::Trade as u8)
+    });
+    assert!(
+        seen.iter().any(|e| e.kind == EventKind::Trade as u8),
+        "a client holding an impossible position was never served again: {seen:?}"
+    );
+}

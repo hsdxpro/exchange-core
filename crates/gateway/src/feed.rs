@@ -166,6 +166,7 @@ impl Feed {
                 touched: Vec::new(),
                 owing: Vec::new(),
                 sent_to: FastMap::default(),
+                retaining: FastMap::default(),
                 batches: Vec::new(),
                 handoff,
                 max_outbox,
@@ -231,6 +232,9 @@ struct State {
     owing: Vec<usize>,
     /// How far the multicast feed has packetised each channel.
     sent_to: FastMap<Channel, Sequence>,
+    /// Public channels this feed has started retaining. Bounded by the listing,
+    /// not by the audience, which is what makes a repair answerable.
+    retaining: FastMap<Channel, ()>,
     batches: Vec<Vec<Event>>,
     handoff: Handoff,
     max_outbox: usize,
@@ -349,6 +353,7 @@ impl State {
                     listener.cursors.push((channel, from));
                     self.by_channel.entry(channel).or_default().push(index);
                 }
+                self.deliver(index, channel);
             }
             Some(CommandKind::Unsubscribe) => {
                 if let Some(listener) = self.listeners.get_mut(index).and_then(Option::as_mut) {
@@ -361,19 +366,38 @@ impl State {
             Some(CommandKind::Resume) => {
                 let now = self.hub.subscribe(channel);
                 let asked = request.order_id;
-                let Some(listener) = self.listeners.get_mut(index).and_then(Option::as_mut) else {
-                    return;
+                let fresh = {
+                    let Some(listener) = self.listeners.get_mut(index).and_then(Option::as_mut)
+                    else {
+                        return;
+                    };
+                    // Never past the live edge: a cursor from a previous run of
+                    // the venue names a sequence this one has not reached, and
+                    // waiting for it would be waiting forever.
+                    let at = asked.min(now);
+                    match listener
+                        .cursors
+                        .iter_mut()
+                        .find(|(held, _)| *held == channel)
+                    {
+                        Some(entry) => {
+                            entry.1 = at;
+                            false
+                        }
+                        None => {
+                            listener.cursors.push((channel, at));
+                            true
+                        }
+                    }
                 };
-                let at = asked.min(now);
-                if let Some(entry) = listener
-                    .cursors
-                    .iter_mut()
-                    .find(|(held, _)| *held == channel)
-                {
-                    entry.1 = at;
-                } else {
-                    listener.cursors.push((channel, at));
+                if fresh {
+                    self.by_channel.entry(channel).or_default().push(index);
                 }
+                // Served now rather than when the channel next moves. A repair
+                // is asked for precisely because nothing is arriving, so
+                // waiting for the next event would answer a receiver's question
+                // with the silence it complained about.
+                self.deliver(index, channel);
             }
             _ => {}
         }
@@ -403,6 +427,23 @@ impl State {
                 .events
                 .fetch_add(batch.len() as u64, Ordering::Relaxed);
             self.counts.batches.fetch_add(1, Ordering::Relaxed);
+            // Retain every public channel the venue produces, whether or not
+            // anybody is watching it yet. The venue's own hub keeps only what
+            // has been subscribed to, which is right there -- it bounds feed
+            // memory to the audience. It is wrong here: a receiver asking for a
+            // repair asks *after* losing packets, and a ring created at that
+            // moment is empty. A distributor that can only replay what somebody
+            // was already watching cannot recover anybody.
+            for event in batch {
+                let Some(channel) = Channel::of(event) else {
+                    continue;
+                };
+                if crate::multicast::wire_channel(channel).is_some()
+                    && self.retaining.insert(channel, ()).is_none()
+                {
+                    self.hub.subscribe(channel);
+                }
+            }
             self.hub.publish(batch);
             for channel in self.hub.touched() {
                 // Small by construction -- the channels one group moved -- so a
@@ -433,37 +474,48 @@ impl State {
                 continue;
             };
             for index in following.clone() {
-                let Some(listener) = self.listeners.get_mut(index).and_then(Option::as_mut) else {
-                    continue;
-                };
-                let Some(cursor) = listener
-                    .cursors
-                    .iter_mut()
-                    .find(|(held, _)| held == channel)
-                    .map(|(_, cursor)| cursor)
-                else {
-                    continue;
-                };
-                match self
-                    .hub
-                    .resume_bytes(*channel, *cursor, &mut listener.outbox)
-                {
-                    Resume::Delivered { next } => *cursor = next,
-                    // Behind the window, or holding a position this run never
-                    // issued. There is no book to restate on an incremental
-                    // feed, so it is placed at the front and the gap in its
-                    // sequence numbers tells it to reconcile against a
-                    // snapshot.
-                    Resume::Lagged { .. } | Resume::Ahead { .. } => {
-                        *cursor = self.hub.next_sequence(*channel).unwrap_or_default();
-                    }
-                    Resume::NotSubscribed => {}
-                }
-                if !listener.outbox.is_empty() && !listener.owes {
-                    listener.owes = true;
-                    self.owing.push(index);
-                }
+                self.deliver(index, *channel);
             }
+        }
+    }
+
+    /// Copies whatever one subscriber has not yet had of one channel.
+    ///
+    /// Shared by the live path and by subscribe and resume, and that sharing is
+    /// the point rather than tidiness. Delivery used to happen only for channels
+    /// that moved *this pass*, so a client asking to resume a quiet channel set
+    /// a cursor and then waited for a trade to shake its own backlog loose --
+    /// which on a repair request is precisely the wrong answer, since a receiver
+    /// asks exactly when it has stopped hearing anything.
+    fn deliver(&mut self, index: usize, channel: Channel) {
+        let Some(listener) = self.listeners.get_mut(index).and_then(Option::as_mut) else {
+            return;
+        };
+        let Some(cursor) = listener
+            .cursors
+            .iter_mut()
+            .find(|(held, _)| *held == channel)
+            .map(|(_, cursor)| cursor)
+        else {
+            return;
+        };
+        match self
+            .hub
+            .resume_bytes(channel, *cursor, &mut listener.outbox)
+        {
+            Resume::Delivered { next } => *cursor = next,
+            // Behind the window, or holding a position this run never issued.
+            // There is no book to restate on an incremental feed, so it is
+            // placed at the front and the gap in its sequence numbers tells it
+            // to reconcile against a snapshot.
+            Resume::Lagged { .. } | Resume::Ahead { .. } => {
+                *cursor = self.hub.next_sequence(channel).unwrap_or_default();
+            }
+            Resume::NotSubscribed => {}
+        }
+        if !listener.outbox.is_empty() && !listener.owes {
+            listener.owes = true;
+            self.owing.push(index);
         }
     }
 

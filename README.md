@@ -237,9 +237,12 @@ full one plus IP and UDP headers stays inside a 1,500-byte MTU, because a
 fragmented market-data packet turns one lost fragment into a lost packet.
 
 Nothing on this path waits for anyone: no acknowledgement, no flow control, no
-retransmission. A receiver that misses a packet sees the gap and asks the
-recovery service, which is separate precisely so a slow receiver cannot reach
-back into the fast path. The private account channel has no wire name at all, so
+retransmission. A receiver that misses a packet sees the gap and asks on the feed
+port — `RESUME {channel, last_seq}`, served from the retention ring by the thread
+that owns it, so a slow receiver never reaches back into the fast path. The
+feed retains every public channel the venue produces rather than only the ones
+somebody is watching: a repair is asked for *after* the loss, and a ring created
+at that moment would be empty. The private account channel has no wire name at all, so
 it cannot be broadcast to a group anyone may join.
 
 `load --subscribers 1024 --feed 127.0.0.1:7071` against `bench.conf` reproduces
