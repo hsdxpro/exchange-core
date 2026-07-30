@@ -471,13 +471,19 @@ fn a_client_that_never_reads_is_dropped_instead_of_growing_the_venue() {
     // than to the book channel, so the feed a subscriber sees stops however
     // long the loop runs. Cancelling as we go takes that ceiling off.
     //
-    // 300 rounds is 600,000 events. With nobody here needing to keep up with
-    // the feed, there is no upper bound to respect any more -- only the lower
-    // one, that the silent client falls out of the 32,768-event window after
-    // its kernel has taken its fill. How much that kernel takes varies by
-    // machine, so this is sized well past the largest case rather than
-    // trimmed to the local one.
-    const ROUNDS: u64 = 300;
+    // Sends until the venue has responded to the silent client, then stops.
+    //
+    // There is still an upper bound, and getting it wrong is how this test
+    // failed on a two-core runner: the generator has to read its own
+    // acknowledgements, and 600,000 of them outran its reader until the venue
+    // shed the *generator* -- which surfaced as a broken pipe on the next write.
+    //
+    // Sizing that by hand needs a number that is large enough on a machine with
+    // generous kernel buffers and small enough on a slow one, and those two
+    // moved in opposite directions every time. Stopping as soon as the point is
+    // proven needs no such number: it sends the least any given machine
+    // requires. The cap is a failure bound, not a target.
+    const ROUNDS: u64 = 400;
     for round in 0..ROUNDS {
         let first = round * 1_000 + 1;
         let mut commands: Vec<Command> = (0..1_000)
@@ -494,6 +500,9 @@ fn a_client_that_never_reads_is_dropped_instead_of_growing_the_venue() {
             .collect();
         commands.extend((0..1_000).map(|i| cancel_order(1, SYMBOL, first + i)));
         send(&mut busy, &commands);
+        if venue.overload_responses() > 0 {
+            break;
+        }
     }
     sending.store(false, Ordering::Relaxed);
     let _ = ack_drain.join();
