@@ -11,6 +11,11 @@ description = "Append-only sequenced command log with replay"
 bx-protocol = { path = "../protocol" }
 socket2 = "0.6"
 zerocopy = { version = "0.8", features = ["derive"] }
+# The running hash over the sequenced stream, so a client can hold the venue to
+# the order it published rather than trusting it. Already in the tree underneath
+# `ed25519-dalek`, which uses SHA-512 internally, so this adds nothing to the
+# build. Hand-rolling a hash is in the same category as hand-rolling a MAC.
+sha2 = "0.11"
 
 [lints]
 workspace = true

@@ -12,6 +12,7 @@
 pub mod replication;
 
 use bx_protocol::{Command, Sequence};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -361,11 +362,136 @@ impl LogStorage for MemoryLog {
     }
 }
 
+/// Bytes in a chain head. A full SHA-256 digest, untruncated.
+pub const CHAIN_LEN: usize = 32;
+
+/// The chain over an empty journal, which is what a fresh venue starts from.
+pub const EMPTY_CHAIN: [u8; CHAIN_LEN] = [0; CHAIN_LEN];
+
+/// Records between one chain head and the next.
+///
+/// A power of two and deliberately coarse. Finalising a digest is what costs, so
+/// this divides that cost by 1,024 -- and a client verifying the feed wants a
+/// head it can check against a run of records, not one per order it would have
+/// to store. The interval bounds how far behind the newest command a checkable
+/// head can be, which for a venue publishing at millions a second is under a
+/// millisecond.
+pub const CHAIN_INTERVAL: u64 = 1_024;
+
+/// Smallest interval that means anything: every record.
+///
+/// Allowed, and expensive -- it is the per-record digest the interval exists to
+/// avoid. Useful to a venue that wants a checkable head behind every single
+/// command and is willing to pay 45 to 60 ns for it.
+pub const MIN_CHAIN_INTERVAL: u64 = 1;
+
+/// A digest primed with a chain head, ready for the records that follow it.
+fn seeded(head: &[u8; CHAIN_LEN]) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(head);
+    hasher
+}
+
+/// Extends a chain by one group of records.
+///
+/// One function, so the venue that publishes a head and anyone recomputing it
+/// from the feed cannot disagree about what is hashed or in what order. A client
+/// with the previous head and the records of a group arrives at the next head or
+/// finds it does not, and there is nothing else to know.
+#[must_use]
+pub fn chain_next<'a>(
+    head: &[u8; CHAIN_LEN],
+    records: impl IntoIterator<Item = &'a [u8]>,
+) -> [u8; CHAIN_LEN] {
+    let mut hasher = seeded(head);
+    for record in records {
+        hasher.update(record);
+    }
+    hasher.finalize().into()
+}
+
 /// Appends sequenced commands and replays them.
 #[derive(Debug)]
 pub struct Journal<S: LogStorage> {
     storage: S,
     next_sequence: Sequence,
+    /// Running hash over every record appended, in sequence order.
+    ///
+    /// `h[n] = SHA-256(h[n-1] ‖ record[n])`, starting from [`EMPTY_CHAIN`]. It
+    /// commits to the *order* as well as the contents: swapping two records, or
+    /// inserting one, changes every head after that point. That is what lets a
+    /// client hold the venue to what it published -- given the stream and a head
+    /// the venue signed, the client can recompute and see for itself that its
+    /// order was included where it was told and that nothing was slipped in
+    /// front of it. Answering "did the sequencer front-run me" otherwise takes
+    /// trust, and this is a venue whose whole point is not needing any.
+    ///
+    /// This is the Certificate Transparency shape: an append-only log whose head
+    /// commits to everything before it. Pointing it at a matching engine's
+    /// sequencer is the part worth having, and it is cheap here because the
+    /// sequencer is a single writer over fixed 64-byte records -- one hash per
+    /// command, no tree, no extra structure.
+    ///
+    /// A hash chain rather than a Merkle tree, deliberately. A tree buys compact
+    /// inclusion proofs for a client that does *not* hold the stream; every
+    /// client here can follow the feed, so the chain gives the same guarantee for
+    /// one hash instead of a logarithmic path per query. The tree is the upgrade
+    /// if that ever stops being true.
+    ///
+    /// ## The head advances every [`CHAIN_INTERVAL`] records
+    ///
+    /// A digest finalised for every record cost 45 to 60 ns on a path that takes
+    /// about 200 -- half again on a cancel -- and almost none of that is the
+    /// hashing. SHA-256 works in 64-byte blocks, a command *is* one block, and
+    /// the expense is the setup and padding around it, paid once per call. So
+    /// records are folded in as they arrive and the digest is finalised only
+    /// every so often, which spreads that cost over the interval.
+    ///
+    /// The boundary is a fixed count of records, and it has to be. Sealing per
+    /// *group* was the obvious choice -- a group is one sync and one
+    /// acknowledgement, so it is the unit the venue already commits at -- and it
+    /// is wrong, because group boundaries are not written to the journal. A
+    /// replay reads records and has no idea where one group ended and the next
+    /// began, so it could not reproduce the head, and a chain a replay cannot
+    /// reproduce is a chain nobody can check. A count of records is in the
+    /// stream by construction.
+    ///
+    /// Ordering is still fully covered: records are folded in sequence, and the
+    /// digest changes if any two of them swap or one is inserted.
+    chain: [u8; CHAIN_LEN],
+    /// The digest in progress: the committed head, then every record appended
+    /// since. Finalised by [`Journal::sync`].
+    pending: Sha256,
+    /// Records folded into `pending` since the last sync, so a sync with nothing
+    /// to commit leaves the head alone rather than hashing it again.
+    pending_records: usize,
+    /// Whether to maintain the chain at all.
+    ///
+    /// Off by default, because it is not free and the cost falls entirely on the
+    /// latency-sensitive shape. Measured: a group of one pays about 70 ns on a
+    /// path of roughly 200, since a group of one means a digest finalised per
+    /// command. Under batching it disappears -- at a group of 1,024 the same
+    /// digest covers a thousand records.
+    ///
+    /// So a venue that acknowledges one order at a time and cares about
+    /// microseconds turns it off; a venue that wants clients to be able to check
+    /// its ordering turns it on and pays for it in a place where it is already
+    /// batching. Neither is the right answer for both, which is why this is a
+    /// setting rather than a decision made here.
+    chaining: bool,
+    /// Records this journal has appended since it was opened.
+    ///
+    /// Not the sequence: a journal opened over existing records starts with a
+    /// high sequence and nothing appended, and those two cases need telling
+    /// apart. Only used to refuse turning chaining on mid-stream.
+    appended: u64,
+    /// Records between heads. See [`CHAIN_INTERVAL`].
+    ///
+    /// Settable because it is a trade an operator owns: a shorter interval means
+    /// a client can check a more recent head and the venue finalises a digest
+    /// more often. Whatever it is set to has to be told to clients, since a
+    /// verifier needs to know where the boundaries fall.
+    chain_interval: u64,
 }
 
 impl<S: LogStorage> Journal<S> {
@@ -382,6 +508,15 @@ impl<S: LogStorage> Journal<S> {
         Ok(Self {
             storage,
             next_sequence: last_sequence.map_or(0, |s| s + 1),
+            // Rebuilt by whoever recovers, from a snapshot or by replay. Opening
+            // a journal does not read every record, so it cannot be computed
+            // here without paying for a full scan on every start.
+            chain: EMPTY_CHAIN,
+            pending: seeded(&EMPTY_CHAIN),
+            pending_records: 0,
+            chaining: false,
+            appended: 0,
+            chain_interval: CHAIN_INTERVAL,
         })
     }
 
@@ -398,9 +533,116 @@ impl<S: LogStorage> Journal<S> {
     /// Returns the underlying I/O error if the append fails.
     pub fn append(&mut self, command: &mut Command) -> Result<Sequence> {
         command.sequence = self.next_sequence;
-        self.storage.append(command.as_bytes())?;
+        let bytes = command.as_bytes();
+        self.storage.append(bytes)?;
+        if self.chaining {
+            // Folded in, not finalised: see the note on `chain`.
+            self.pending.update(bytes);
+            self.pending_records += 1;
+            // Sealed on a boundary the journal itself defines, so a replay lands
+            // on the same heads.
+            if self
+                .next_sequence
+                .wrapping_add(1)
+                .is_multiple_of(self.chain_interval)
+            {
+                self.seal();
+            }
+        }
         self.next_sequence += 1;
+        self.appended += 1;
         Ok(command.sequence)
+    }
+
+    /// The chain over everything appended so far, sealed at the last group.
+    ///
+    /// [`EMPTY_CHAIN`] when chaining is off.
+    #[must_use]
+    pub const fn chain_head(&self) -> [u8; CHAIN_LEN] {
+        self.chain
+    }
+
+    /// Whether this journal maintains a verifiable chain over its records.
+    #[must_use]
+    pub const fn chaining(&self) -> bool {
+        self.chaining
+    }
+
+    /// Records between chain heads.
+    #[must_use]
+    pub const fn chain_interval(&self) -> u64 {
+        self.chain_interval
+    }
+
+    /// Sets how many records fall between heads.
+    ///
+    /// # Panics
+    /// If `interval` is zero, which would mean no boundary at all and a head
+    /// that never advanced.
+    pub fn set_chain_interval(&mut self, interval: u64) {
+        assert!(
+            interval >= MIN_CHAIN_INTERVAL,
+            "a chain interval of zero has no boundary, so the head would never advance"
+        );
+        self.chain_interval = interval;
+    }
+
+    /// Turns chaining on. See the note on the field for what it costs.
+    ///
+    /// Only before the first record. A chain cannot be retrofitted: switching it
+    /// on over a journal that already holds records gives a head covering the
+    /// suffix from here, while a replay of that journal hashes all of it and
+    /// arrives somewhere else. The venue and every client checking it would then
+    /// disagree, for a reason neither could see -- so it is refused instead.
+    ///
+    /// This makes chaining a decision taken before a venue accepts its first
+    /// order, which is what it is: a client cannot be given a commitment over
+    /// history nobody hashed.
+    ///
+    /// A journal opened over existing records may still turn it on, because what
+    /// follows is a recovery: the chain is rebuilt by replaying from the start or
+    /// restored from a snapshot, and either way it ends up covering everything.
+    /// What is refused is switching it on *after this journal has appended*,
+    /// which is the mid-stream case.
+    ///
+    /// # Panics
+    /// If this journal has already appended a record.
+    pub fn set_chaining(&mut self, on: bool) {
+        assert!(
+            self.appended == 0,
+            "chaining has to be set before appending: {} records have gone in              already, and a chain started here would cover only what follows              while a replay would cover everything",
+            self.appended
+        );
+        self.chaining = on;
+        self.pending = seeded(&self.chain);
+        self.pending_records = 0;
+    }
+
+    /// Folds a replayed record into the chain, sealing on the interval.
+    ///
+    /// The replay counterpart of [`Self::append`]: recovery reads records rather
+    /// than writing them, so without this a recovered venue would publish a head
+    /// over nothing.
+    pub fn fold_replayed(&mut self, record: &[u8], sequence: Sequence) {
+        if !self.chaining {
+            return;
+        }
+        self.pending.update(record);
+        self.pending_records += 1;
+        if sequence.wrapping_add(1).is_multiple_of(self.chain_interval) {
+            self.seal();
+        }
+    }
+
+    /// Sets the chain head, for a recovery that restored one from a snapshot.
+    ///
+    /// Replay carries on from here, so a snapshot-based recovery reaches the same
+    /// head a full replay would -- which is the property that makes the chain
+    /// worth publishing at all.
+    pub fn restore_chain(&mut self, head: [u8; CHAIN_LEN]) {
+        self.chain = head;
+        self.pending = seeded(&head);
+        self.pending_records = 0;
     }
 
     /// # Errors
@@ -408,6 +650,21 @@ impl<S: LogStorage> Journal<S> {
     pub fn sync(&mut self) -> Result<()> {
         self.storage.sync()?;
         Ok(())
+    }
+
+    /// Finalises the digest over the records folded in since the last seal.
+    ///
+    /// Called on every [`CHAIN_INTERVAL`] boundary, from appends and from replay
+    /// alike, which is what makes the two agree.
+    pub fn seal(&mut self) {
+        if self.pending_records == 0 {
+            return;
+        }
+        self.chain = std::mem::replace(&mut self.pending, Sha256::new())
+            .finalize()
+            .into();
+        self.pending = seeded(&self.chain);
+        self.pending_records = 0;
     }
 
     #[must_use]

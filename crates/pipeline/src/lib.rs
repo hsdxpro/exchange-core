@@ -25,6 +25,7 @@ use fastmap::FastMap;
 use instrument::{Instrument, Instruments};
 use snapshot::{Snapshot, balance_of};
 use std::sync::atomic::{AtomicU64, Ordering};
+use zerocopy::IntoBytes;
 
 /// Every reason an order can be refused, so a count can be reported against a
 /// name rather than a number. Listing them costs a compile-time check that
@@ -434,6 +435,10 @@ impl<S: LogStorage> Exchange<S> {
             next += buffer.len() as Sequence;
             count += buffer.len() as u64;
             for command in buffer.drain(..) {
+                // Folded before applying, so the chain covers the record as
+                // journalled rather than whatever the command becomes.
+                self.journal
+                    .fold_replayed(command.as_bytes(), command.sequence);
                 self.events.clear();
                 self.apply(command);
             }
@@ -515,6 +520,7 @@ impl<S: LogStorage> Exchange<S> {
             order_id_marks,
             symbol_states,
             stopped_accounts,
+            chain_head: self.journal.chain_head(),
         }
     }
 
@@ -541,6 +547,10 @@ impl<S: LogStorage> Exchange<S> {
         for record in &snapshot.stopped_accounts {
             self.stopped_accounts.insert(record.account, ());
         }
+        // Replay carries on from this head, so snapshot-plus-replay reaches the
+        // same one a full replay would. Without it the head would commit to a
+        // suffix of the stream and every client checking it would disagree.
+        self.journal.restore_chain(snapshot.chain_head);
         for record in &snapshot.balances {
             self.accounts
                 .restore(record.account, record.asset, balance_of(record));
@@ -622,6 +632,34 @@ impl<S: LogStorage> Exchange<S> {
                 }
             }
         }
+    }
+
+    /// The journal's verifiable chain head, sealed at the last group.
+    ///
+    /// Zero when the venue runs without chaining.
+    #[must_use]
+    pub const fn chain_head(&self) -> [u8; 32] {
+        self.journal.chain_head()
+    }
+
+    /// Turns the verifiable chain on or off. Off by default; see the journal for
+    /// what it costs.
+    pub fn set_chaining(&mut self, on: bool) {
+        self.journal.set_chaining(on);
+    }
+
+    /// Records between chain heads.
+    #[must_use]
+    pub const fn chain_interval(&self) -> u64 {
+        self.journal.chain_interval()
+    }
+
+    /// Sets how many records fall between chain heads.
+    ///
+    /// # Panics
+    /// If `interval` is zero.
+    pub fn set_chain_interval(&mut self, interval: u64) {
+        self.journal.set_chain_interval(interval);
     }
 
     /// Whether a symbol currently accepts new orders.

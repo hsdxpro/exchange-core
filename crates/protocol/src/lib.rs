@@ -836,12 +836,13 @@ impl Command {
 /// Printable ASCII on purpose: a magic carrying raw control bytes makes the
 /// source file read as binary to tools that diff and search it, and is easy for
 /// an editor to mangle silently.
-/// `v3` adds symbol trading states and stopped accounts; `v2` added the
+/// `v4` adds the journal chain head; `v3` added symbol trading states and
+/// stopped accounts; `v2` added the
 /// per-account highest order ID. A `v1` file is refused rather
 /// than read: the journal is always authoritative, so rejecting an old snapshot
 /// costs replay time, while reading one would restore a venue with no record of
 /// which IDs had been used and quietly accept a replayed order.
-pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAPv3";
+pub const SNAPSHOT_MAGIC: [u8; 8] = *b"BXSNAPv4";
 
 /// Header of a snapshot: what it contains and where in the journal it applies.
 #[derive(
@@ -861,6 +862,14 @@ pub struct SnapshotHeader {
     pub symbol_states: u64,
     /// Accounts stopped from opening new risk.
     pub stopped_accounts: u64,
+    /// The journal's chain head as of `sequence`, or zero when the venue runs
+    /// without chaining.
+    ///
+    /// Carried because recovery from a snapshot replays only what follows it. A
+    /// head rebuilt from that alone would commit to a suffix of the stream rather
+    /// than the whole of it, and every client checking it would disagree with the
+    /// venue for reasons neither could see.
+    pub chain_head: [u8; 32],
     /// Padding, and load-bearing.
     ///
     /// The records after this header are read straight out of the file with no
@@ -875,7 +884,7 @@ pub struct SnapshotHeader {
 
 /// A multiple of 16, so every section that follows stays aligned. Asserted
 /// rather than left to whoever edits the struct next.
-const _: () = assert!(size_of::<SnapshotHeader>() == 64);
+const _: () = assert!(size_of::<SnapshotHeader>() == 96);
 const _: () = assert!(size_of::<SnapshotHeader>().is_multiple_of(align_of::<SnapshotBalance>()));
 const _: () = assert!(size_of::<SnapshotOrder>().is_multiple_of(align_of::<SnapshotBalance>()));
 
@@ -1225,6 +1234,7 @@ mod tests {
             order_id_marks: 4,
             symbol_states: 5,
             stopped_accounts: 6,
+            chain_head: [7; 32],
             _pad: [0; 8],
         };
         assert_eq!(

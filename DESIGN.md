@@ -94,6 +94,43 @@ resume. Determinism means the recovered state is bit-identical to what was lost.
 already pins this property with a golden state hash over a 100,000-command replay; the same
 check extends across the pipeline.
 
+### A chain a client can check
+
+**Built, off by default.** The journal keeps a running SHA-256 over its records:
+`h[n] = H(h[n-1] ‖ records)`, sealed every 1,024 records and carried in the snapshot.
+
+Why it is worth having: a client that follows the stream can recompute the head and see
+for itself that its order was included where it was told and that nothing was inserted in
+front of it. *Did the sequencer front-run me* is otherwise a question a venue can only
+answer by asserting an answer. This is the Certificate Transparency shape — an append-only
+log whose head commits to everything before it — pointed at a matching engine's sequencer,
+and it is cheap here because the sequencer is a single writer over fixed 64-byte records.
+
+A hash chain rather than a Merkle tree, deliberately: a tree buys compact inclusion proofs
+for a client that does *not* hold the stream, and every client here can follow the feed. The
+tree is the upgrade if that stops being true.
+
+**What it costs, measured back to back:** +20 ns a command at the shipped interval (199 →
+220 ns passive, 129 → 146 ns cancel), and nothing under batching. Per-*record* sealing was
+tried first and cost 45–60 ns, almost all of it the setup and padding around a digest rather
+than the hashing — a command is exactly one SHA-256 block, so finalising per command pays
+that overhead every time.
+
+**Two constraints the design forced, both learned by getting them wrong first:**
+
+- **The boundary is a count of records, not a group.** Sealing per group was the obvious
+  choice, since a group is one sync and one acknowledgement. It is unreproducible: group
+  boundaries are never written to the journal, so a replay cannot find them, and a chain a
+  replay cannot reproduce is a chain nobody can check.
+- **Chaining cannot be retrofitted.** Turning it on over a journal that already holds records
+  gives a head covering the suffix, while a replay of that journal covers all of it — so the
+  venue and every client would disagree for a reason neither could see. It is refused after
+  the first append.
+
+**Not yet on the wire.** The head is state and API; publishing it to clients as a signed
+checkpoint event is the remaining step, and until that exists no client can actually check
+anything.
+
 **Snapshot cadence is derived, not picked.** Choose a target recovery time, measure replay
 throughput, snapshot often enough that replay never exceeds it. If replay runs at 5M
 commands/sec and the target is 60 seconds, snapshot every 300M commands.

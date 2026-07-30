@@ -79,6 +79,8 @@ pub struct Snapshot {
     pub symbol_states: Vec<SnapshotSymbolState>,
     /// Accounts stopped from opening new risk, sorted.
     pub stopped_accounts: Vec<SnapshotStoppedAccount>,
+    /// The journal's chain head as of `sequence`. Zero without chaining.
+    pub chain_head: [u8; 32],
 }
 
 impl Snapshot {
@@ -93,6 +95,7 @@ impl Snapshot {
             order_id_marks: self.order_id_marks.len() as u64,
             symbol_states: self.symbol_states.len() as u64,
             stopped_accounts: self.stopped_accounts.len() as u64,
+            chain_head: self.chain_head,
             _pad: [0; 8],
         };
         out.write_all(header.as_bytes())?;
@@ -171,6 +174,7 @@ impl Snapshot {
             order_id_marks: order_id_marks.to_vec(),
             symbol_states: symbol_states.to_vec(),
             stopped_accounts: stopped_accounts.to_vec(),
+            chain_head: header.chain_head,
         })
     }
 }
@@ -226,6 +230,7 @@ mod tests {
                 _pad: [0; 3],
             }],
             stopped_accounts: vec![SnapshotStoppedAccount { account: 9 }],
+            chain_head: [0xC1; 32],
             order_id_marks: vec![
                 SnapshotOrderIdMark {
                     account: 7,
