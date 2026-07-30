@@ -14,6 +14,10 @@ members = [
 edition = "2024"
 rust-version = "1.97.1"
 publish = false
+# Declared here rather than only in the LICENSE file. A repository with a licence
+# on disk and no `license` field has crates that every tool reads as unlicensed,
+# which is what `cargo deny` found: a reader who wants to use this has to guess.
+license = "MIT"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

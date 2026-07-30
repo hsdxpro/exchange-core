@@ -16,22 +16,28 @@ unmaintained = "workspace"
 # Two versions of the same crate in one binary is usually somebody's transitive
 # dependency lagging, and it is worth seeing rather than failing over.
 multiple-versions = "warn"
+# A dependency pinned to `*` accepts whatever is published next, which is how a
+# build stops being reproducible and how a supply-chain change arrives without
+# anyone choosing it.
 wildcards = "deny"
+# Except between the crates in this workspace. `{ path = "../protocol" }` carries
+# no version because it is not published, and there is nothing to pin to: the
+# path *is* the version. Counting those as wildcards flagged every internal
+# dependency and would have meant either fake version numbers or turning the
+# check off entirely.
+allow-wildcard-paths = true
 
 [licenses]
-# Permissive only. A copyleft dependency in a venue that may be distributed as a
-# binary is a decision for a person, not something to discover at release.
+# Permissive only, and exactly the set this dependency tree actually uses. A
+# copyleft dependency in a venue that may be distributed as a binary is a
+# decision for a person, not something to discover at release -- and an allow
+# list padded with licences nothing uses hides the moment a new one arrives.
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",
     "Unicode-3.0",
-    "Zlib",
-    "MPL-2.0",
-    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
