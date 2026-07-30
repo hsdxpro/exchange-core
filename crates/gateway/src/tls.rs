@@ -17,6 +17,7 @@
 //! The private key is loaded from a file the operator holds, like the chain
 //! key: a key inline in configuration is a key in every backup of it.
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, version::TLS13};
 use std::io;
@@ -44,8 +45,10 @@ pub fn server_config(cert_file: &Path, key_file: &Path) -> io::Result<Arc<Server
 }
 
 fn read_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    let mut file = io::BufReader::new(std::fs::File::open(path).map_err(|e| at(path, &e))?);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut file).collect::<Result<_, _>>()?;
+    let certs: Vec<_> = CertificateDer::pem_file_iter(path)
+        .map_err(|e| pem_error(path, &e))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| pem_error(path, &e))?;
     if certs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -56,15 +59,12 @@ fn read_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
 }
 
 fn read_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    let mut file = io::BufReader::new(std::fs::File::open(path).map_err(|e| at(path, &e))?);
-    rustls_pemfile::private_key(&mut file)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: no usable private key in file", path.display()),
-        )
-    })
+    PrivateKeyDer::from_pem_file(path).map_err(|e| pem_error(path, &e))
 }
 
-fn at(path: &Path, e: &io::Error) -> io::Error {
-    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+fn pem_error(path: &Path, e: &dyn std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{}: {e}", path.display()),
+    )
 }

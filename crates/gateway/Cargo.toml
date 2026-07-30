@@ -25,7 +25,8 @@ mio = { version = "1", features = ["os-poll", "net"] }
 # `ring` provider rather than the default aws-lc, because aws-lc wants a C
 # toolchain and NASM on Windows and this workspace builds with rustup alone.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
+# PEM parsing lives here now; rustls-pemfile is archived (RUSTSEC-2025-0134).
+rustls-pki-types = "1"
 # Authentication. The client signs a per-connection nonce and the key never
 # crosses the wire. Asymmetric rather than an HMAC, which is what this used to
 # be: an HMAC secret is symmetric, so whoever reads the venue's key file can
