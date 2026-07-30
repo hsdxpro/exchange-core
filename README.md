@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-391%20passing-success" alt="391 tests">
+  <img src="https://img.shields.io/badge/tests-394%20passing-success" alt="394 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -29,7 +29,7 @@
 - **6.6M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **0.9 ms** to restart from a snapshot instead of 9.6 ms replaying from zero
-- **391 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
+- **394 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
 - Ed25519 logon, a per-symbol kill switch, and an optional hash chain a client can check against the stream
 
 Every number measured on the machine this was built on. `cargo x latency` reproduces the
@@ -49,7 +49,7 @@ green locally and green on a runner cannot become two different things.
 cargo x
 ```
 
-Format, `clippy -D warnings`, and all 391 tests.
+Format, `clippy -D warnings`, and all 394 tests.
 
 ```bash
 cargo x latency
@@ -210,7 +210,10 @@ What the pair says:
 ### Verifiable ordering
 
 **Optional, off by default, +20 ns a command.** The journal keeps a running SHA-256 over its
-records, sealed every 1,024 of them and published on a `checkpoint` channel.
+records, sealed every 1,024 of them and published on a `checkpoint` channel. Each head names
+the first sequence it does **not** cover, because it lags the log between boundaries — naming
+the newest sequence instead would claim coverage of records the head has not committed to,
+and a client folding those would disagree with a venue that had done nothing wrong.
 
 A client that follows the stream recomputes the head and sees for itself that its order was
 included where it was told and that nothing was inserted in front of it. *Did the sequencer
@@ -290,7 +293,7 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 ## Testing
 
-391 tests. The ones worth reading:
+394 tests. The ones worth reading:
 
 | Test | What it proves |
 |---|---|
