@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 const BTC: u32 = 1;
 const USD: u32 = 2;
 const SYMBOL: u32 = 1;
+/// A second listing, so a test can tell "this symbol" from "every symbol".
+const OTHER: u32 = 2;
 const FLOOR: Ticks = 10_000;
 /// Retention window. Sized so the burst test below stays inside it when a pass
 /// is bounded (a few hundred events at a time) and would blow straight through
@@ -37,6 +39,7 @@ const MAX_RECORDS: usize = 256;
 fn instruments() -> Instruments {
     let mut instruments = Instruments::new();
     instruments.insert(Instrument::new(SYMBOL, BTC, USD, FLOOR, 1_000_000, 65_536));
+    instruments.insert(Instrument::new(OTHER, BTC, USD, FLOOR, 1_000_000, 65_536));
     instruments
 }
 
@@ -1786,5 +1789,113 @@ fn resuming_a_private_feed_from_an_impossible_cursor_keeps_the_session() {
             .iter()
             .any(|e| e.kind == EventKind::Received as u8 && e.order_id == 2),
         "the session was dropped by a resume it had asked for: {events:?}"
+    );
+}
+
+#[test]
+fn a_book_restatement_does_not_discard_a_clients_own_orders() {
+    // One session, one outbox, independent per-channel cursors. A restatement
+    // repairs the channel that needs it and must not spend anything belonging to
+    // the others: their cursors have already moved past those bytes, so whatever
+    // is dropped here is dropped permanently.
+    //
+    // Batched into one write so both land in the same pass, which is what makes
+    // the overlap deterministic rather than a matter of socket timing. The same
+    // overlap happens on its own whenever a client is slow enough to lag a book
+    // out of retention -- a full send buffer is exactly why its own events are
+    // still queued -- but that arrival order cannot be pinned down in a test.
+    let venue = Running::start();
+    let mut trader = venue.connect();
+    send(
+        &mut trader,
+        &[
+            limit_order(1, SYMBOL, 1, Side::Ask, 10_100, 5),
+            limit_order(1, SYMBOL, 2, Side::Ask, 10_110, 5),
+        ],
+    );
+    let _ = collect_until(&mut trader, Duration::from_millis(400), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Resting as u8)
+            .count()
+            >= 2
+    });
+
+    let mut client = venue.connect();
+    send(
+        &mut client,
+        &[
+            query_open_orders(1, SYMBOL),
+            // Ahead of anything this run issued, so the book channel restates.
+            Command::resuming(1, SYMBOL, ChannelKind::Book, u64::MAX / 2),
+        ],
+    );
+    let seen = collect_until(&mut client, Duration::from_secs(10), |seen| {
+        has_kind(seen, EventKind::BookSnapshot)
+            && seen
+                .iter()
+                .filter(|e| e.kind == EventKind::OrderState as u8)
+                .count()
+                >= 2
+    });
+
+    assert!(
+        has_kind(&seen, EventKind::BookSnapshot),
+        "the book was never restated: {seen:?}"
+    );
+    let states: Vec<u64> = seen
+        .iter()
+        .filter(|e| e.kind == EventKind::OrderState as u8)
+        .map(|e| e.order_id)
+        .collect();
+    assert_eq!(
+        states.len(),
+        2,
+        "the book restatement threw away the client's own order state: got {states:?}"
+    );
+}
+
+/// The answer to a private resume covers the symbol the command names, and stops
+/// there.
+///
+/// Sweeping every listing instead would make the reply grow with the venue, and
+/// the queue budget that sheds a slow session counts exactly those bytes -- so a
+/// large enough account would be disconnected by the answer to its own resume,
+/// then reconnect and be disconnected again. One symbol is bounded by that
+/// book's own order limit. `QueryOpenOrders` remains how a client walks the rest,
+/// one symbol per message, at whatever pace it can read.
+#[test]
+fn a_private_resume_answers_for_the_symbol_it_names_and_no_others() {
+    let venue = Running::start();
+    let mut client = venue.connect();
+    send(
+        &mut client,
+        &[
+            limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1),
+            limit_order(1, OTHER, 2, Side::Bid, 10_050, 1),
+        ],
+    );
+    let _ = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::Resting as u8)
+            .count()
+            >= 2
+    });
+
+    send(
+        &mut client,
+        &[Command::resuming(1, OTHER, ChannelKind::Account, 5_000_001)],
+    );
+    let events = collect_until(&mut client, Duration::from_secs(5), |seen| {
+        has_kind(seen, EventKind::OrderState)
+    });
+    let named: Vec<u32> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::OrderState as u8)
+        .map(|e| e.symbol)
+        .collect();
+    assert_eq!(
+        named,
+        vec![OTHER],
+        "a private resume answered for symbols the client did not name: {events:?}"
     );
 }

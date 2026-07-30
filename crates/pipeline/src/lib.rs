@@ -408,6 +408,10 @@ impl<S: LogStorage> Exchange<S> {
     /// # Errors
     /// Fails if the journal is unreadable, corrupt, or has a gap.
     pub fn recover(&mut self) -> bx_journal::Result<u64> {
+        // Explicit rather than relying on a freshly opened journal already being
+        // in this state: a full replay starts the chain from nothing and accounts
+        // for every record, which is exactly what makes appending safe afterwards.
+        self.journal.restore_chain(bx_journal::EMPTY_CHAIN, 0);
         self.replay_from(0)
     }
 
@@ -719,12 +723,6 @@ impl<S: LogStorage> Exchange<S> {
     #[must_use]
     pub const fn chain_sealed_at(&self) -> Sequence {
         self.journal.chain_sealed_at()
-    }
-
-    /// Every symbol this venue lists, ascending.
-    #[must_use]
-    pub fn listed_symbols(&self) -> Vec<SymbolId> {
-        self.instruments.iter().map(|i| i.symbol).collect()
     }
 
     /// Turns the verifiable chain on or off. Off by default; see the journal for

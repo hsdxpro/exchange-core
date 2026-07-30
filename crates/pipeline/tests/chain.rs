@@ -505,3 +505,54 @@ fn a_checkpoint_names_only_what_its_head_covers() {
     );
     assert_eq!(checkpoint.chain_head(), exchange.chain_head());
 }
+
+/// A chain switched on over an existing journal must not be usable until
+/// something has replayed that journal.
+///
+/// The dangerous shape: open a log holding a thousand records, enable chaining
+/// (legal, because *this* journal has appended nothing yet -- that is how a
+/// recovering node enables it before replaying), then append without ever
+/// recovering. The first boundary seals a head covering only the new records
+/// while naming a sequence that spans all of them, so the venue publishes a
+/// commitment over history it never hashed. A client folding the stream would
+/// disagree, and the venue would look like it was lying.
+///
+/// Enabling before a replay is legitimate and has to stay legal, so the refusal
+/// belongs at the append.
+#[test]
+#[should_panic(expected = "nothing has replayed")]
+fn a_chain_enabled_over_an_unreplayed_journal_refuses_to_append() {
+    let mut exchange = funded();
+    let mut command = limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1);
+    exchange.submit(&mut command).unwrap();
+    let storage = exchange.into_storage();
+
+    // A fresh venue over a journal that already holds records, chaining on, and
+    // no recovery in between.
+    let mut careless = Exchange::new(storage, instruments()).unwrap();
+    careless.set_chaining(true);
+    careless.set_chain_interval(4);
+    let mut order = limit_order(1, SYMBOL, 99, Side::Bid, 10_050, 1);
+    let _ = careless.submit(&mut order);
+}
+
+/// And the legitimate flow still works: enable, then recover, then trade.
+#[test]
+fn a_chain_enabled_before_a_replay_is_fine() {
+    let mut exchange = chaining_with_interval(4);
+    for id in 1..=10_u64 {
+        let mut command = limit_order(1, SYMBOL, id, Side::Bid, 10_050, 1);
+        exchange.submit(&mut command).unwrap();
+    }
+    let live = exchange.chain_head();
+
+    let mut restored = Exchange::new(exchange.into_storage(), instruments()).unwrap();
+    restored.set_chaining(true);
+    restored.set_chain_interval(4);
+    restored.recover().unwrap();
+    assert_eq!(restored.chain_head(), live, "a full replay diverged");
+
+    // And it may append afterwards.
+    let mut more = limit_order(1, SYMBOL, 11, Side::Bid, 10_050, 1);
+    restored.submit(&mut more).unwrap();
+}

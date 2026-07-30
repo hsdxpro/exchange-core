@@ -1191,7 +1191,7 @@ impl<S: LogStorage> Server<S> {
         };
         let channel = Channel::requested(kind, command.symbol, account);
         if command.kind() == Some(CommandKind::Resume) {
-            self.resume_from(index, channel, command.order_id);
+            self.resume_from(index, channel, command.order_id, command.symbol);
             return;
         }
         if command.kind() == Some(CommandKind::Subscribe) {
@@ -1231,7 +1231,7 @@ impl<S: LogStorage> Server<S> {
     /// replay, which costs the whole feed budget on a venue with no subscribers at
     /// all. Restating is correct and cheap; the cost is one snapshot per client per
     /// promotion.
-    fn resume_from(&mut self, index: usize, channel: Channel, from: Sequence) {
+    fn resume_from(&mut self, index: usize, channel: Channel, from: Sequence, symbol: SymbolId) {
         // Retained from here on whatever happens next, so a client that is told
         // to restate is already being followed when it does.
         let now = self.venue.subscribe(channel);
@@ -1269,15 +1269,20 @@ impl<S: LogStorage> Server<S> {
                     // it to reconnect and ask again identically, forever.
                     //
                     // So it is placed at the current end of its own feed and
-                    // told what it holds right now, which is the same answer a
+                    // told what it holds there, which is the same answer a
                     // client gets from `QueryOpenOrders` and the only thing that
                     // makes the position it has been given meaningful.
+                    // Bounded to the instrument the command names, not swept over
+                    // every listed symbol. The budget that sheds a session counts
+                    // queued bytes, so a sweep makes the answer to a resume large
+                    // enough to shed the client it is answering -- and a client
+                    // shed by its own resume reconnects, resumes, and is shed
+                    // again. One symbol costs at most that book's order limit,
+                    // and `QueryOpenOrders` is how a client walks the rest at its
+                    // own pace, which is the mechanism it already uses.
                     let at = self.venue.hub().next_sequence(channel).unwrap_or_default();
                     self.session_at(index).reposition(channel, at);
-                    for symbol in self.venue.exchange().listed_symbols() {
-                        self.answer_open_orders(index, symbol, account);
-                    }
-                    self.owes_bytes(index);
+                    self.answer_open_orders(index, symbol, account);
                 } else {
                     self.resynchronise(&[(index, channel)]);
                 }
@@ -1634,10 +1639,19 @@ impl<S: LogStorage> Server<S> {
                     let at = self.venue.hub().next_sequence(channel).unwrap_or_default();
                     if let Some(session) = self.sessions[index].as_mut() {
                         session.reposition(channel, at);
-                        // Anything already queued describes a book the client is
-                        // about to be told afresh.
-                        session.outbox.clear();
                     }
+                    // Queued bytes are left alone. Dropping them looks free --
+                    // superseded book deltas the snapshot is about to overwrite --
+                    // but a session has one outbox and a cursor per channel, so
+                    // the queue also holds this client's own fills, and those
+                    // cursors have already moved past them. Clearing lost them
+                    // permanently: a trader whose depth feed fell behind stopped
+                    // being told about its own orders, which is the one failure a
+                    // private feed may never have. The snapshot carries the
+                    // sequence it was taken at and supersedes anything before it,
+                    // so the stale deltas ahead of it are harmless -- a few
+                    // wasted frames on the repair path, and nothing on the hot
+                    // path, which never comes here.
                     self.send_book_state(index, symbol, at);
                 }
                 // Also state, and cheaper to restate than a book: two events.

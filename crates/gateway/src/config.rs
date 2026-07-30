@@ -548,6 +548,29 @@ impl Config {
             ));
         }
 
+        // An administrator is a privilege, and a privilege is only worth
+        // anything over a proven identity. On an open venue a session's account
+        // is whatever its first command claims, so naming one here would let any
+        // client at all halt a symbol or stop an account from trading -- the two
+        // commands that most need to be somebody's.
+        if let Some(admin) = admin_account {
+            if authentication == Mode::Open {
+                return Err(ConfigError::whole_file(
+                    "admin_account is set but authentication is `open`, so any \
+                     client could claim that account and halt the venue",
+                ));
+            }
+            // The other half: an administrator who cannot connect is a halt
+            // switch that does not exist, and it fails at the moment it is
+            // needed rather than at startup.
+            if !credentials.knows(admin) {
+                return Err(ConfigError::whole_file(format!(
+                    "admin_account is {admin} but no [credential] block lists \
+                     that account, so the administrator could never connect"
+                )));
+            }
+        }
+
         // A cluster that cannot say which node it is, or where its vote is kept,
         // is one that would either wait forever or forget what it voted.
         if !peers.is_empty() {
@@ -747,6 +770,34 @@ max_open_orders = 1000000
         // Reads as though the venue is secured. It is not.
         let text = VALID.replace("authentication = required", "authentication = open");
         assert!(refusal(&text).contains("would never be checked"));
+    }
+
+    #[test]
+    fn an_administrator_on_an_open_venue_is_refused() {
+        // Nothing proves an account on an open venue, so a named administrator
+        // is a halt switch handed to every client that connects.
+        let text = VALID
+            .replace("authentication = required", "authentication = open")
+            .replace("\n[credential]\naccount = 1\npublic_key = d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737\n", "\n")
+            + "admin_account = 1\n";
+        assert!(refusal(&text).contains("could claim that account"));
+    }
+
+    #[test]
+    fn an_administrator_with_no_key_of_its_own_is_refused() {
+        // Configured, plausible, and unusable: the account named can never
+        // connect, so the halt fails at the moment somebody reaches for it.
+        let text = VALID.to_owned() + "admin_account = 99\n";
+        let message = refusal(&text);
+        assert!(message.contains("admin_account is 99"), "{message}");
+        assert!(message.contains("never connect"), "{message}");
+    }
+
+    #[test]
+    fn an_administrator_that_holds_a_key_is_accepted() {
+        let text = VALID.to_owned() + "admin_account = 1\n";
+        let settings = Config::parse(&text).expect("a keyed administrator is valid");
+        assert_eq!(settings.admin_account, Some(1));
     }
 
     #[test]

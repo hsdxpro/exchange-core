@@ -482,6 +482,19 @@ pub struct Journal<S: LogStorage> {
     /// batching. Neither is the right answer for both, which is why this is a
     /// setting rather than a decision made here.
     chaining: bool,
+    /// Whether the chain covers this journal from its first record.
+    ///
+    /// True for a journal opened empty, and set by [`Self::restore_chain`], which
+    /// is how a recovery says "the head I am giving you accounts for everything
+    /// before it". False for a journal opened over existing records that nothing
+    /// has replayed -- appending then would fold only the new records while the
+    /// sealed sequence spans all of them, so the venue would publish a commitment
+    /// over history it never hashed.
+    ///
+    /// Enabling chaining before replaying is legitimate and has to stay legal: it
+    /// is exactly what a recovering node does. So the refusal belongs at the
+    /// append, not at the switch.
+    chain_ready: bool,
     /// Records this journal has appended since it was opened.
     ///
     /// Not the sequence: a journal opened over existing records starts with a
@@ -518,6 +531,7 @@ impl<S: LogStorage> Journal<S> {
             pending: seeded(&EMPTY_CHAIN),
             pending_records: 0,
             chain_sealed_at: 0,
+            chain_ready: last_sequence.is_none(),
             chaining: false,
             appended: 0,
             chain_interval: CHAIN_INTERVAL,
@@ -540,6 +554,14 @@ impl<S: LogStorage> Journal<S> {
         let bytes = command.as_bytes();
         self.storage.append(bytes)?;
         if self.chaining {
+            assert!(
+                self.chain_ready,
+                "chaining is on over a journal holding {} records that nothing has \
+                 replayed: the head would cover only what follows while the \
+                 sequence it names spans everything, so it would commit to history \
+                 that was never hashed. Recover first.",
+                self.next_sequence
+            );
             // Folded in, not finalised: see the note on `chain`.
             self.pending.update(bytes);
             self.pending_records += 1;
@@ -659,6 +681,9 @@ impl<S: LogStorage> Journal<S> {
     pub fn restore_chain(&mut self, head: [u8; CHAIN_LEN], sealed_at: Sequence) {
         self.chain = head;
         self.chain_sealed_at = sealed_at;
+        // A caller handing over a head is asserting it accounts for everything
+        // before `sealed_at`, which is what makes appending safe again.
+        self.chain_ready = true;
         self.pending = seeded(&head);
         self.pending_records = 0;
     }

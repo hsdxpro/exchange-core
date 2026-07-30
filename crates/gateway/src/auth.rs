@@ -115,6 +115,16 @@ impl Credentials {
         self.keys.is_empty()
     }
 
+    /// Whether a key is held for this account.
+    ///
+    /// For validating configuration, not for admitting sessions: answering this
+    /// on the wire would let anyone enumerate the venue's accounts, which is why
+    /// [`Self::verifies`] treats an unknown account and a bad signature alike.
+    #[must_use]
+    pub fn knows(&self, account: AccountId) -> bool {
+        self.keys.contains_key(&account)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.keys.len()
