@@ -272,3 +272,40 @@ fn a_halt_leaves_the_book_exactly_as_it_stood() {
     let after = exchange.book(SYMBOL).unwrap().depth(Side::Bid, 10);
     assert_eq!(before, after, "a halt changed the book");
 }
+
+/// Fails today, and is kept because it is the defect stated exactly.
+///
+/// Order IDs are venue-global, so the second account to use ID 1 is refused as
+/// a duplicate. This was written down as a griefing vector -- one client
+/// denying another an ID -- which undersold it: nothing adversarial is
+/// required. Two ordinary clients that both number their orders from one
+/// collide on their first, which is what every client library does by default
+/// and what FIX and OUCH namespace per client precisely to avoid.
+///
+/// Ignored rather than deleted so the fix has something to switch on. See
+/// DESIGN.md for what closing it costs.
+#[test]
+#[ignore = "known defect: order IDs are venue-global, see DESIGN.md"]
+fn two_accounts_may_each_number_their_own_orders_from_one() {
+    // The ordinary case, not an attack: two clients that both start counting at
+    // one. If the venue refuses the second, every pair of honest clients using
+    // the obvious numbering collides on their first order.
+    let mut exchange = funded();
+    let mut first = limit_order(1, SYMBOL, 1, Side::Bid, 10_050, 1);
+    let events = exchange.submit(&mut first).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Resting as u8),
+        "account 1's first order did not rest"
+    );
+
+    let mut second = limit_order(2, SYMBOL, 1, Side::Bid, 10_040, 1);
+    let events = exchange.submit(&mut second).unwrap().to_vec();
+    let refused: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Rejected as u8)
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "account 2 was refused its own order id 1 because account 1 holds one: {refused:?}"
+    );
+}
