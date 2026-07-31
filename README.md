@@ -237,20 +237,20 @@ tens of microseconds. The venue now rings a `mio::Waker` when it fills the seam.
 
 That wake is a syscall on the thread that sequences orders, so it is suppressed
 twice over — skipped while the feed is already draining, and capped at one per
-50 µs. The two multiply, and neither alone is worth much:
+50 µs. A far side told that recently is already on its way.
 
-| wake suppressed by | round trip, min | p50 | orders/sec |
-|---|---:|---:|---:|
-| nothing — no wake at all | 8.1 µs | 12.1 µs | 3,959,737 |
-| **both** | **8.6 µs** | **16.1 µs** | **3,888,577** |
-| the 50 µs cap alone | 16.2 µs | 20.1 µs | 3,492,010 |
-| the draining flag alone | 16.9 µs | 20.9 µs | 4,042,887 |
-| neither — ring every pass | 18.3 µs | 31.8 µs | 3,541,885 |
+**What the suppression is worth, this benchmark cannot say.** Five variants were
+measured — both suppressors, each alone, neither, and no wake at all — warm,
+1,024 subscribers, median of three. Within one session they ranked cleanly.
+Re-measured later the ranking *inverted*, on unchanged binaries: the no-wake
+build went from fastest of the five to slowest. One variant's round trip spans
+8–18 µs across sessions, which swamps every gap between variants. Publishing
+that table would have been reporting the machine's mood, so it is not here.
 
-Half a microsecond of round trip against never waking the feed at all, for
-market data that leaves on the trade. Warm figures, median of three: the first
-run against a fresh venue lands near 1.5M while the process warms, which is what
-a single-shot A/B reports and mistakes for the cost of whatever it is testing.
+The numbers this section does keep are the ones a deterministic test produces,
+not a loaded benchmark: **61.7 ms** of market-data latency without the wake,
+and a handoff stress test that goes from timing out at 20 s to passing in 0.01 s
+once the seam rings on the path where it drops.
 
 ### One packet, however many are listening
 

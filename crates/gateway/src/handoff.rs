@@ -40,20 +40,23 @@ const PER_BATCH: usize = 4 * 1024;
 ///
 /// Waking is a syscall on the thread that sequences orders, and the two things
 /// that suppress it multiply: a wake happens only when the far side is asleep
-/// *and* this long has passed since the last one. Either alone leaves most of
-/// them standing. Warm, 1,024 subscribers, median of three runs:
+/// *and* this long has passed since the last one.
 ///
-/// | wake suppressed by | round trip, min | p50 | orders/sec |
-/// |---|---|---|---|
-/// | nothing -- no wake at all | 8.1 us | 12.1 us | 3,959,737 |
-/// | the flag and this cap | 8.6 us | 16.1 us | 3,888,577 |
-/// | this cap alone | 16.2 us | 20.1 us | 3,492,010 |
-/// | the flag alone | 16.9 us | 20.9 us | 4,042,887 |
-/// | neither -- ring every pass | 18.3 us | 31.8 us | 3,541,885 |
+/// **What that is worth is not something the load bench can answer.** Five
+/// variants were measured -- both suppressors, each alone, neither, and no wake
+/// at all -- warm, 1,024 subscribers, median of three. Within one session they
+/// ranked cleanly. Re-measured in a later session the ranking *inverted*: the
+/// no-wake build went from the fastest of the five to the slowest, on an
+/// unchanged binary. Round trip for one variant spans 8 to 18 microseconds
+/// across sessions, which swamps every gap between variants. So the honest
+/// statement is that this bench cannot resolve them, and any table of per-
+/// variant figures from it would be reporting the machine's mood.
 ///
-/// Both earn their place, and together they cost the venue half a microsecond
-/// of round trip against never waking the feed at all. What that buys is market
-/// data leaving on the trade rather than 61.7 milliseconds later.
+/// The cap stays on the argument it can carry: a syscall per pass on the
+/// sequencing thread is work the venue does not need to do, since a far side
+/// told this recently is already on its way. What the wake *buys* rests on a
+/// deterministic test rather than a benchmark -- market data left 61.7
+/// milliseconds late without it, and leaves on the trade with it.
 ///
 /// A quiet venue still rings on the first trade, the last wake being long past.
 /// The one case left over is a group this cap suppresses with nothing behind it
@@ -172,17 +175,30 @@ impl Handoff {
             // a market-data thread is not permitted to take the book with it.
             return false;
         };
-        let Some(mut batch) = shared.spare.pop() else {
+        let taken = if let Some(mut batch) = shared.spare.pop() {
+            batch.clear();
+            batch.extend_from_slice(events);
+            shared.filled.push_back(batch);
+            true
+        } else {
             shared.dropped += 1;
             shared.events_dropped += events.len() as u64;
-            return false;
+            false
         };
-        batch.clear();
-        batch.extend_from_slice(events);
-        shared.filled.push_back(batch);
         drop(shared);
-        // Outside the lock, and only when the far side is not already on its
-        // way: a consumer mid-drain will see this batch without being told.
+        // Rung on both paths, and the dropping one is the one that needs it:
+        // a full seam means the far side is behind, so skipping the wake there
+        // would go quiet exactly when market data is being lost.
+        self.ring();
+        taken
+    }
+
+    /// Tells the far side to look, if it is asleep and enough time has passed.
+    ///
+    /// Outside the lock. A consumer mid-drain will find what is queued without
+    /// being told, and one told within [`WAKE_EVERY`] has been told recently
+    /// enough -- see there for what each of those is worth.
+    fn ring(&self) {
         if !self.awake.load(Ordering::Acquire)
             && let Some(waker) = self.wake.get()
         {
@@ -200,7 +216,6 @@ impl Handoff {
                 let _ = waker.wake();
             }
         }
-        true
     }
 
     /// Whether anything is waiting to be taken.
@@ -266,6 +281,76 @@ mod tests {
         let mut out = Vec::new();
         handoff.take(&mut out);
         out
+    }
+
+    /// Two threads running the real protocol against the real seam.
+    ///
+    /// The unit tests either side of this one pin the wake logic down a step at
+    /// a time, single-threaded, which is what makes them able to say *which*
+    /// step broke. None of them can say the steps compose once a producer and a
+    /// consumer are actually racing, so this drives both and checks the two
+    /// things a lost wake would break: every batch offered is taken exactly
+    /// once, and the run does not fall back on the timer to notice them.
+    ///
+    /// The timeout is the detector. A consumer that has to wait it out for a
+    /// meaningful share of these batches cannot finish inside the deadline,
+    /// where a correct one finishes in well under a second and waits once at the
+    /// end -- for the tail batch the rate limit is allowed to suppress.
+    #[test]
+    fn a_producer_and_a_consumer_racing_strand_nothing() {
+        const BATCHES: usize = 20_000;
+        const WAIT: Duration = Duration::from_millis(500);
+        const DEADLINE: Duration = Duration::from_secs(20);
+
+        let handoff = Handoff::new();
+        let mut poll = mio::Poll::new().expect("no poll");
+        handoff.wakes(Waker::new(poll.registry(), mio::Token(0)).expect("no waker"));
+
+        let producer = {
+            let handoff = handoff.clone();
+            std::thread::spawn(move || {
+                let mut sent = 0;
+                while sent < BATCHES {
+                    // A full seam is the venue dropping, not a failure to sync,
+                    // so retry rather than counting it.
+                    if handoff.offer(&events(4)) {
+                        sent += 1;
+                    }
+                }
+            })
+        };
+
+        let started = Instant::now();
+        let mut ready = mio::Events::with_capacity(8);
+        let mut taken = Vec::new();
+        let mut seen = 0usize;
+        let mut events_seen = 0usize;
+        while seen < BATCHES {
+            handoff.about_to_wait();
+            if !handoff.pending() {
+                poll.poll(&mut ready, Some(WAIT)).expect("poll failed");
+            }
+            handoff.awake();
+            taken.clear();
+            handoff.take(&mut taken);
+            for batch in taken.drain(..) {
+                seen += 1;
+                events_seen += batch.len();
+                handoff.recycle(batch);
+            }
+            assert!(
+                started.elapsed() < DEADLINE,
+                "only {seen} of {BATCHES} batches after {DEADLINE:?}, so the \
+                 consumer is waiting out the timer for batches nothing rang \
+                 for -- a wake is being lost, not merely rate-limited"
+            );
+        }
+        producer.join().expect("producer panicked");
+        assert_eq!(
+            events_seen,
+            seen * 4,
+            "a batch arrived with the wrong number of events in it"
+        );
     }
 
     #[test]
