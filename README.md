@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-467%20passing-success" alt="467 tests">
+  <img src="https://img.shields.io/badge/tests-475%20passing-success" alt="475 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -29,7 +29,7 @@
 - **6.6M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **0.9 ms** to restart from a snapshot instead of 9.6 ms replaying from zero
-- **467 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
+- **475 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
 - Ed25519 logon, TLS 1.3 for internet sessions, a per-symbol kill switch, and an optional venue-signed hash chain a client can check against the stream
 
 Every number measured on the machine this was built on. `cargo x latency` reproduces the
@@ -49,7 +49,7 @@ green locally and green on a runner cannot become two different things.
 cargo x
 ```
 
-Format, `clippy -D warnings`, and all 467 tests.
+Format, `clippy -D warnings`, and all 475 tests.
 
 ```bash
 cargo x latency
@@ -435,7 +435,7 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 ## Testing
 
-467 tests. The ones worth reading:
+475 tests. The ones worth reading:
 
 | Test | What it proves |
 |---|---|
@@ -459,13 +459,20 @@ orders.
 
 Scope boundaries, with reasons rather than apologies:
 
-- **Cross-partition balances.** Symbols already partition across processes, but an account
-  banking in one partition and trading a symbol in another needs a position service, not a
-  thread pool. The largest open question here.
+- **Cross-partition balances — allotments, not a lookup.** Symbols partition across
+  processes and each keeps its own `Accounts`, so what a partition holds for an account is
+  an *allotment*, not the account's holdings. Value moves between them as a `Withdraw`
+  sequenced in one journal and a `Deposit` in the other — that order deliberately, since a
+  crash between the two strands funds where crediting first would mint them. No
+  coordination on the order path, which is why it is this and not a balance service every
+  order has to ask. What is not built is the settlement process that drives the pair and
+  rebalances allotments; the primitives and the conservation property are.
 - **`io_uring`.** Linux-only, and untested platform-specific I/O is worse than none.
   Batching writes recovered 8.6× without leaving `std`.
-- **Withdrawals and fees.** Venue features, not exchange-core ones. Halts *are* here — a
-  symbol has a trading state and an account has a kill switch.
+- **Client withdrawals and fees.** Venue features, not exchange-core ones. The `Withdraw`
+  command above is the operator's tool for moving an allotment, and is administrative —
+  a client cannot send one for itself, any more than it can fund itself. Halts *are* here:
+  a symbol has a trading state and an account has a kill switch.
 
 ## Related
 

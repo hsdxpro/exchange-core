@@ -83,6 +83,36 @@ impl Accounts {
         Ok(())
     }
 
+    /// Takes `amount` out of this venue's free balance entirely.
+    ///
+    /// The inverse of [`Self::deposit`], and the primitive that lets value leave
+    /// a partition. What this venue holds for an account is its *allotment*, not
+    /// the account's holdings: symbols partition across processes, each process
+    /// keeps its own `Accounts`, and neither can see the other. Moving funds
+    /// between them is a withdraw sequenced in one journal and a deposit
+    /// sequenced in the other, which is why both have to exist.
+    ///
+    /// Reserved balance is untouchable here. Money committed to a resting order
+    /// belongs to that order until it fills or cancels, and letting it be
+    /// withdrawn would let an account pull collateral out from under a live
+    /// quote. An operator moving an account between partitions cancels first.
+    ///
+    /// # Errors
+    /// [`BalanceError::Insufficient`] if the free balance will not cover it.
+    pub fn withdraw(
+        &mut self,
+        account: AccountId,
+        asset: AssetId,
+        amount: u128,
+    ) -> Result<(), BalanceError> {
+        let balance = self.balances.entry((account, asset)).or_default();
+        if balance.free < amount {
+            return Err(BalanceError::Insufficient);
+        }
+        balance.free -= amount;
+        Ok(())
+    }
+
     /// Moves `amount` back from reserved to free, when an order is cancelled or
     /// its unfilled remainder is released.
     ///
@@ -291,6 +321,65 @@ mod tests {
         assert_eq!(accounts.balance(1, BTC).free, 5);
         assert_eq!(accounts.balance(2, USD).free, 500);
         assert_eq!(accounts.balance(1, USD).total(), 500);
+    }
+
+    #[test]
+    fn more_cannot_be_withdrawn_than_is_free() {
+        let mut accounts = Accounts::new();
+        accounts.deposit(1, USD, 100);
+        assert_eq!(
+            accounts.withdraw(1, USD, 101),
+            Err(BalanceError::Insufficient)
+        );
+        assert_eq!(
+            accounts.balance(1, USD).free,
+            100,
+            "a refused withdrawal still moved money"
+        );
+    }
+
+    #[test]
+    fn a_withdrawal_cannot_reach_collateral_under_a_resting_order() {
+        let mut accounts = Accounts::new();
+        accounts.deposit(1, USD, 100);
+        accounts.reserve(1, USD, 60).unwrap();
+        // 40 free, 60 committed to a live quote. An operator moving this account
+        // to another partition must cancel first; taking the 60 here would leave
+        // an order resting on collateral that had gone somewhere else.
+        assert_eq!(
+            accounts.withdraw(1, USD, 50),
+            Err(BalanceError::Insufficient)
+        );
+        assert_eq!(accounts.withdraw(1, USD, 40), Ok(()));
+        assert_eq!(accounts.balance(1, USD).reserved, 60);
+    }
+
+    #[test]
+    fn moving_an_allotment_between_partitions_creates_no_money() {
+        // Two `Accounts`, because that is what two partitions are: separate
+        // processes that cannot see each other's balances. The operator debits
+        // one and credits the other, and the pair has to conserve.
+        let mut first = Accounts::new();
+        let mut second = Accounts::new();
+        first.deposit(1, USD, 1_000);
+
+        first.withdraw(1, USD, 400).unwrap();
+        second.deposit(1, USD, 400);
+
+        assert_eq!(first.total_supply(USD), 600);
+        assert_eq!(second.total_supply(USD), 400);
+        assert_eq!(
+            first.total_supply(USD) + second.total_supply(USD),
+            1_000,
+            "the account holds more or less across the two partitions than it \
+             started with, which is the double-spend this exists to prevent"
+        );
+        // And neither partition can spend what the other holds.
+        assert_eq!(
+            first.reserve(1, USD, 700),
+            Err(BalanceError::Insufficient),
+            "a partition reserved against an allotment it had given away"
+        );
     }
 
     #[test]

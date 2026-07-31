@@ -774,6 +774,22 @@ impl<S: LogStorage> Exchange<S> {
                 command.deposit_asset(),
                 u128::from(command.quantity),
             ),
+            // Unlike a deposit, this can fail: an operator can ask for more than
+            // the partition holds free. Rejected rather than clamped, because a
+            // partial transfer that reports success loses the difference.
+            CommandKind::Withdraw => {
+                if self
+                    .accounts
+                    .withdraw(
+                        command.account,
+                        command.deposit_asset(),
+                        u128::from(command.quantity),
+                    )
+                    .is_err()
+                {
+                    self.reject(&command, RejectReason::InsufficientBalance);
+                }
+            }
             // The venue's own marker: no state, no events. Its meaning lives
             // entirely in where it sits in the sequence, which replay reads.
             CommandKind::Watermark => {}
@@ -1670,6 +1686,25 @@ pub fn market_order(
 pub fn deposit(account: AccountId, asset: instrument::AssetId, amount: Quantity) -> Command {
     Command::new(
         CommandKind::Deposit,
+        account,
+        asset,
+        0,
+        Side::Bid,
+        0,
+        amount,
+        TimeInForce::GoodTillCancel,
+    )
+}
+
+/// Debits an account, so an allotment can be moved to another partition.
+///
+/// Same layout as [`deposit`], and the operator sends the pair: this one first,
+/// against the partition giving the funds up, then a deposit against the one
+/// receiving them.
+#[must_use]
+pub fn withdraw(account: AccountId, asset: instrument::AssetId, amount: Quantity) -> Command {
+    Command::new(
+        CommandKind::Withdraw,
         account,
         asset,
         0,

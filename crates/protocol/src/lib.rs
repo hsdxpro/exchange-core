@@ -253,6 +253,20 @@ pub enum CommandKind {
     /// the redelivery boundary. The gateway refuses it like any other command
     /// that is the venue's own business.
     Watermark = 16,
+    /// Debits an account, the inverse of [`Self::Deposit`] and the same layout:
+    /// `symbol` carries the asset and `quantity` the amount.
+    ///
+    /// Exists so value can *leave* a partition. What a venue holds for an
+    /// account is its allotment, not the account's holdings: symbols partition
+    /// across processes and neither process can see the other's balances, so
+    /// moving funds between them is a withdraw sequenced in one journal and a
+    /// deposit sequenced in the other. Ordered that way deliberately -- a crash
+    /// between the two strands the funds, where crediting first would mint them.
+    ///
+    /// Rejected with `InsufficientBalance` rather than clamped, and never takes
+    /// from reserved: collateral under a live quote is not the operator's to
+    /// move.
+    Withdraw = 17,
     /// Drops an account's key, so it can no longer authenticate.
     ///
     /// Handled in the gateway and deliberately *not* journalled, for the same
@@ -827,6 +841,13 @@ impl Command {
     pub const fn is_administrative(&self) -> bool {
         self.kind == CommandKind::SetSymbolState as u8
             || self.kind == CommandKind::SetAccountTrading as u8
+            // Funding is the venue's, not the funded account's. These name the
+            // account they move value for, so a session allowed to send one for
+            // itself could set its own balance -- and balance is the only thing
+            // between an order and the book, which makes it the whole risk
+            // system. They reach the venue from the administrator or not at all.
+            || self.kind == CommandKind::Deposit as u8
+            || self.kind == CommandKind::Withdraw as u8
     }
 
     /// The 32 bytes proving a [`CommandKind::Authenticate`]. Meaningless for any
@@ -998,6 +1019,7 @@ impl Command {
             14 => Some(CommandKind::RevokeKey),
             15 => Some(CommandKind::Resume),
             16 => Some(CommandKind::Watermark),
+            17 => Some(CommandKind::Withdraw),
             _ => None,
         }
     }
@@ -1226,14 +1248,18 @@ mod tests {
             (14, CommandKind::RevokeKey),
             (15, CommandKind::Resume),
             (16, CommandKind::Watermark),
+            (17, CommandKind::Withdraw),
         ] {
             let mut command = sample();
             command.kind = byte;
             assert_eq!(command.kind(), Some(kind));
             assert!(command.is_well_formed());
         }
+        // One past the last real kind. Named from the enum rather than written
+        // as a literal, so adding a kind moves this with it instead of turning
+        // a live discriminant into the "unknown" case.
         let mut unknown = sample();
-        unknown.kind = 17;
+        unknown.kind = CommandKind::Withdraw as u8 + 1;
         assert!(unknown.kind().is_none());
     }
 

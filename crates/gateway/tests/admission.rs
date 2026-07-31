@@ -13,7 +13,7 @@ use bx_gateway::limit::RateLimit;
 use bx_gateway::tcp::{Server, read_events};
 use bx_journal::MemoryLog;
 use bx_pipeline::instrument::{Instrument, Instruments};
-use bx_pipeline::limit_order;
+use bx_pipeline::{deposit, limit_order, withdraw};
 use bx_protocol::{
     CHALLENGE_LEN, Command, Event, EventKind, PROOF_LEN, RejectReason, SIGNATURE_LEN, Side, Ticks,
 };
@@ -1295,4 +1295,43 @@ fn an_ordinary_account_cannot_revoke_a_key() {
     let mut admin = venue.connect();
     let events = authenticate(&mut admin, ALICE, &alice_key());
     assert_eq!(kinds(&events, EventKind::Authenticated), 1);
+}
+
+/// Funding is the venue's business, not a client's.
+///
+/// A deposit names the account it credits and nothing else, so a session that
+/// may send one for its own account may credit itself any amount it likes.
+/// Nothing else in the venue can catch it: the command is well formed, the
+/// account is the session's own, and the exchange applies it exactly as an
+/// operator's. Balance is the only thing standing between an order and the
+/// book, so this is the whole risk system.
+///
+/// The same argument covers a withdrawal, which is the operator's tool for
+/// moving an allotment between partitions.
+#[test]
+fn a_client_cannot_fund_or_drain_its_own_account() {
+    let venue = Running::start_with_admin(ALICE);
+    let mut stream = venue.connect();
+    authenticate(&mut stream, BOB, &bob_key());
+
+    for (name, command) in [
+        ("deposit", deposit(BOB, USD, 1_000_000)),
+        ("withdraw", withdraw(BOB, USD, 1_000_000)),
+    ] {
+        send(&mut stream, &[command]);
+        let events = collect_until(&mut stream, Duration::from_secs(2), |seen| {
+            seen.iter().any(|event| {
+                event.kind == EventKind::Rejected as u8
+                    && event.reject_reason() == Some(RejectReason::NotPermitted)
+            })
+        });
+        assert!(
+            events.iter().any(|event| {
+                event.kind == EventKind::Rejected as u8
+                    && event.reject_reason() == Some(RejectReason::NotPermitted)
+            }),
+            "a client sent a {name} for itself and the venue did not refuse it, \
+             so any account can set its own balance"
+        );
+    }
 }
