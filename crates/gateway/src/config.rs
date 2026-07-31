@@ -278,9 +278,226 @@ pub fn feed_memory(retained_per_channel: usize, symbols: usize) -> u64 {
     retained_per_channel as u64 * symbols as u64 * PUBLIC_CHANNELS_PER_SYMBOL * EVENT_BYTES
 }
 
+/// Settings whose zero would be a venue that does nothing rather than a venue
+/// with a small limit.
+fn check_non_zero(values: &[(u64, &str)]) -> Result<()> {
+    for (value, name) in values {
+        if *value == 0 {
+            return Err(ConfigError::whole_file(format!("{name} must not be zero")));
+        }
+    }
+    Ok(())
+}
+
+/// Builds the instrument table, refusing a duplicate symbol and a retention
+/// window the feed could not afford.
+///
+/// The window is per channel, so its cost multiplies by the instrument list. At
+/// 65,536 events a channel and a thousand symbols that is 7.8 GiB, which is an
+/// out-of-memory kill rather than a slow venue -- and it was the shipped
+/// default. Refusing here is the difference between a startup error and a venue
+/// that dies under load.
+fn build_instruments(
+    drafts: Vec<InstrumentDraft>,
+    retained: u64,
+    budget_mb: u64,
+) -> Result<(Instruments, usize)> {
+    let mut instruments = Instruments::new();
+    let mut listed: Vec<u32> = Vec::new();
+    for draft in drafts {
+        let line = draft.line;
+        let instrument = draft.finish()?;
+        if listed.contains(&instrument.symbol) {
+            return Err(ConfigError::at(
+                line,
+                format!("symbol {} is listed twice", instrument.symbol),
+            ));
+        }
+        listed.push(instrument.symbol);
+        instruments.insert(instrument);
+    }
+
+    let retained = usize::try_from(retained)
+        .map_err(|_| ConfigError::whole_file("retained_per_channel is too large"))?;
+    let needed = feed_memory(retained, listed.len());
+    if needed > budget_mb * 1024 * 1024 {
+        return Err(ConfigError::whole_file(format!(
+            "the feed needs {} MiB for {} instruments at {retained} events a \
+             channel, over the {budget_mb} MiB budget; lower \
+             retained_per_channel or raise max_feed_memory_mb",
+            needed / 1024 / 1024,
+            listed.len()
+        )));
+    }
+    Ok((instruments, retained))
+}
+
+/// Resolves the authentication mode and the keys that go with it.
+///
+/// Stated, never inferred. A venue open because a key was forgotten reads
+/// exactly like one open on purpose, and the two could not be further apart.
+fn resolve_authentication(
+    mode: Option<Mode>,
+    secrets: Vec<CredentialDraft>,
+) -> Result<(Mode, Credentials)> {
+    let mode = mode.ok_or_else(|| {
+        ConfigError::whole_file(
+            "authentication is not set: `required` to make every session prove \
+             which account it is, or `open` for measurement runs only",
+        )
+    })?;
+    let mut credentials = Credentials::new();
+    for draft in secrets {
+        let (account, secret) = draft.finish()?;
+        credentials
+            .insert(account, secret)
+            .map_err(|why| ConfigError::at(0, why))?;
+    }
+    if mode == Mode::Required && credentials.is_empty() {
+        return Err(ConfigError::whole_file(
+            "authentication is required but no [credential] block is listed, so \
+             no client could ever connect",
+        ));
+    }
+    if mode == Mode::Open && !credentials.is_empty() {
+        return Err(ConfigError::whole_file(
+            "credentials are listed but authentication is `open`, so they would \
+             never be checked",
+        ));
+    }
+    Ok((mode, credentials))
+}
+
+/// An administrator is a privilege, and a privilege is only worth anything over
+/// a proven identity.
+///
+/// On an open venue a session's account is whatever its first command claims, so
+/// naming one here would let any client at all halt a symbol or stop an account
+/// from trading -- the two commands that most need to be somebody's. The other
+/// half: an administrator who cannot connect is a halt switch that does not
+/// exist, and it fails at the moment it is needed rather than at startup.
+fn check_admin(admin: Option<AccountId>, mode: Mode, credentials: &Credentials) -> Result<()> {
+    let Some(admin) = admin else {
+        return Ok(());
+    };
+    if mode == Mode::Open {
+        return Err(ConfigError::whole_file(
+            "admin_account is set but authentication is `open`, so any client \
+             could claim that account and halt the venue",
+        ));
+    }
+    if !credentials.knows(admin) {
+        return Err(ConfigError::whole_file(format!(
+            "admin_account is {admin} but no [credential] block lists that \
+             account, so the administrator could never connect"
+        )));
+    }
+    Ok(())
+}
+
+/// A chain that signs or seals nothing, which reads as verifiability that is
+/// not there.
+fn check_chain(on: Option<bool>, key_file: Option<&PathBuf>, interval: Option<u64>) -> Result<()> {
+    if !on.unwrap_or(false) {
+        if key_file.is_some() {
+            return Err(ConfigError::whole_file(
+                "chain_key_file is set but chain is off, so nothing would be signed",
+            ));
+        }
+        if interval.is_some() {
+            return Err(ConfigError::whole_file(
+                "chain_interval is set but chain is off, so nothing would be sealed",
+            ));
+        }
+    }
+    if interval == Some(0) {
+        return Err(ConfigError::whole_file(
+            "chain_interval of zero would seal nothing; leave it unset for the default",
+        ));
+    }
+    Ok(())
+}
+
+/// Half a TLS door is worse than none: a listener with no identity cannot
+/// serve, and a certificate nothing listens with reads as encryption that is
+/// not there.
+fn check_tls(listen: bool, cert: bool, key: bool) -> Result<()> {
+    let parts = [listen, cert, key];
+    if parts.iter().any(|set| *set) && !parts.iter().all(|set| *set) {
+        return Err(ConfigError::whole_file(
+            "tls_listen, tls_cert_file and tls_key_file go together: all three, or none",
+        ));
+    }
+    Ok(())
+}
+
+/// Groups nothing builds packets for, and more lines than redundancy needs.
+fn check_multicast(groups: &[String], feed_listening: bool) -> Result<()> {
+    if !groups.is_empty() && !feed_listening {
+        return Err(ConfigError::whole_file(
+            "multicast is listed but feed_listen is not: the packets are built \
+             by the feed thread, so there is nothing to send them",
+        ));
+    }
+    if groups.len() > 2 {
+        return Err(ConfigError::whole_file(
+            "multicast takes one group, or two for A and B; more than two is \
+             bandwidth rather than redundancy",
+        ));
+    }
+    Ok(())
+}
+
+/// A cluster that cannot say which node it is, or where its vote is kept, is one
+/// that would either wait forever or forget what it voted.
+fn check_cluster(
+    peers: &[(u64, String)],
+    node_id: Option<u64>,
+    leadership_state: Option<&PathBuf>,
+) -> Result<()> {
+    if peers.is_empty() {
+        return Ok(());
+    }
+    let me = node_id
+        .ok_or_else(|| ConfigError::whole_file("peers are listed but node_id is not set"))?;
+    if !peers.iter().any(|(id, _)| *id == me) {
+        return Err(ConfigError::whole_file(format!(
+            "node_id {me} is not among the peers, so this node could never be \
+             elected and would wait forever"
+        )));
+    }
+    if leadership_state.is_none() {
+        return Err(ConfigError::whole_file(
+            "peers are listed but leadership_state is not set; a vote that does \
+             not survive a restart is a vote that can be cast twice, and two \
+             leaders in one term is what an election exists to prevent",
+        ));
+    }
+    let mut listed: Vec<u64> = peers.iter().map(|(id, _)| *id).collect();
+    listed.sort_unstable();
+    let before = listed.len();
+    listed.dedup();
+    if listed.len() != before {
+        return Err(ConfigError::whole_file(
+            "two peers share an identity, so a majority could be counted twice",
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     /// # Errors
     /// Reports the first problem found, with the line it is on.
+    ///
+    /// Long, and deliberately so after the parts that could usefully leave did.
+    /// What remains is one `match` from key name to field, plus the two section
+    /// blocks that do the same for `[instrument]` and `[credential]`. That match
+    /// *is* the configuration schema: splitting it across functions would scatter
+    /// the list of what a venue can be told over several places, and the first
+    /// question anyone brings to this file is "what keys are there". Every check
+    /// that can be named and read on its own already is one -- see the functions
+    /// above, each of which states an invariant and is testable without a file.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(text: &str) -> Result<Self> {
         let mut listen = None;
         let mut journal = None;
@@ -525,7 +742,7 @@ impl Config {
                 "no instruments listed, so the venue would accept nothing",
             ));
         }
-        for value in [
+        check_non_zero(&[
             (target_recovery_ms, "target_recovery_ms"),
             (replay_rate, "replay_rate"),
             (retained, "retained_per_channel"),
@@ -533,183 +750,20 @@ impl Config {
             (max_sessions, "max_sessions"),
             (ack_timeout_ms, "ack_timeout_ms"),
             (max_feed_memory_mb, "max_feed_memory_mb"),
-        ] {
-            if value.0 == 0 {
-                return Err(ConfigError::whole_file(format!(
-                    "{} must not be zero",
-                    value.1
-                )));
-            }
-        }
+        ])?;
 
-        let mut instruments = Instruments::new();
-        let mut listed: Vec<u32> = Vec::new();
-        for draft in drafts {
-            let line = draft.line;
-            let instrument = draft.finish()?;
-            if listed.contains(&instrument.symbol) {
-                return Err(ConfigError::at(
-                    line,
-                    format!("symbol {} is listed twice", instrument.symbol),
-                ));
-            }
-            listed.push(instrument.symbol);
-            instruments.insert(instrument);
-        }
+        let (instruments, retained) = build_instruments(drafts, retained, max_feed_memory_mb)?;
+        let (authentication, credentials) = resolve_authentication(authentication, secrets)?;
+        check_admin(admin_account, authentication, &credentials)?;
 
-        // The retention window is per channel, so its cost multiplies by the
-        // instrument list. At 65,536 events a channel and a thousand symbols that
-        // is 7.8 GiB, which is an out-of-memory kill rather than a slow venue --
-        // and it was the shipped default. Refusing here is the difference
-        // between a startup error and a venue that dies under load.
-        let retained = usize::try_from(retained)
-            .map_err(|_| ConfigError::whole_file("retained_per_channel is too large"))?;
-        let needed = feed_memory(retained, listed.len());
-        let budget = max_feed_memory_mb * 1024 * 1024;
-        if needed > budget {
-            return Err(ConfigError::whole_file(format!(
-                "the feed needs {} MiB for {} instruments at {retained} events a \
-                 channel, over the {max_feed_memory_mb} MiB budget; lower \
-                 retained_per_channel or raise max_feed_memory_mb",
-                needed / 1024 / 1024,
-                listed.len()
-            )));
-        }
-
-        // Stated, never inferred. A venue open because a key was forgotten
-        // reads exactly like one open on purpose, and the two could not be
-        // further apart.
-        let authentication = authentication.ok_or_else(|| {
-            ConfigError::whole_file(
-                "authentication is not set: `required` to make every session prove \
-                 which account it is, or `open` for measurement runs only",
-            )
-        })?;
-        let mut credentials = Credentials::new();
-        for draft in secrets {
-            let (account, secret) = draft.finish()?;
-            credentials
-                .insert(account, secret)
-                .map_err(|why| ConfigError::at(0, why))?;
-        }
-        if authentication == Mode::Required && credentials.is_empty() {
-            return Err(ConfigError::whole_file(
-                "authentication is required but no [credential] block is listed, \
-                 so no client could ever connect",
-            ));
-        }
-        if authentication == Mode::Open && !credentials.is_empty() {
-            return Err(ConfigError::whole_file(
-                "credentials are listed but authentication is `open`, so they \
-                 would never be checked",
-            ));
-        }
-
-        // An administrator is a privilege, and a privilege is only worth
-        // anything over a proven identity. On an open venue a session's account
-        // is whatever its first command claims, so naming one here would let any
-        // client at all halt a symbol or stop an account from trading -- the two
-        // commands that most need to be somebody's.
-        if let Some(admin) = admin_account {
-            if authentication == Mode::Open {
-                return Err(ConfigError::whole_file(
-                    "admin_account is set but authentication is `open`, so any \
-                     client could claim that account and halt the venue",
-                ));
-            }
-            // The other half: an administrator who cannot connect is a halt
-            // switch that does not exist, and it fails at the moment it is
-            // needed rather than at startup.
-            if !credentials.knows(admin) {
-                return Err(ConfigError::whole_file(format!(
-                    "admin_account is {admin} but no [credential] block lists \
-                     that account, so the administrator could never connect"
-                )));
-            }
-        }
-
-        // A key with no chain to sign, or an interval nothing seals: both read as
-        // though verifiability is on when it is not, which is the failure mode
-        // this file exists to refuse.
-        if !chain.unwrap_or(false) {
-            if chain_key_file.is_some() {
-                return Err(ConfigError::whole_file(
-                    "chain_key_file is set but chain is off, so nothing would be \
-                     signed",
-                ));
-            }
-            if chain_interval.is_some() {
-                return Err(ConfigError::whole_file(
-                    "chain_interval is set but chain is off, so nothing would be \
-                     sealed",
-                ));
-            }
-        }
-        if chain_interval == Some(0) {
-            return Err(ConfigError::whole_file(
-                "chain_interval of zero would seal nothing; leave it unset for the \
-                 default",
-            ));
-        }
-
-        // Half a TLS door is worse than none: a listener with no identity
-        // cannot serve, and a certificate nothing listens with reads as
-        // encryption that is not there.
-        let tls_parts = [
+        check_chain(chain, chain_key_file.as_ref(), chain_interval)?;
+        check_tls(
             tls_listen.is_some(),
             tls_cert_file.is_some(),
             tls_key_file.is_some(),
-        ];
-        if tls_parts.iter().any(|p| *p) && !tls_parts.iter().all(|p| *p) {
-            return Err(ConfigError::whole_file(
-                "tls_listen, tls_cert_file and tls_key_file go together: all \
-                 three, or none",
-            ));
-        }
-
-        if !multicast.is_empty() && feed_listen.is_none() {
-            return Err(ConfigError::whole_file(
-                "multicast is listed but feed_listen is not: the packets are \
-                 built by the feed thread, so there is nothing to send them",
-            ));
-        }
-        if multicast.len() > 2 {
-            return Err(ConfigError::whole_file(
-                "multicast takes one group, or two for A and B; more than two \
-                 is bandwidth rather than redundancy",
-            ));
-        }
-
-        // A cluster that cannot say which node it is, or where its vote is kept,
-        // is one that would either wait forever or forget what it voted.
-        if !peers.is_empty() {
-            let me = node_id.ok_or_else(|| {
-                ConfigError::whole_file("peers are listed but node_id is not set")
-            })?;
-            if !peers.iter().any(|(id, _)| *id == me) {
-                return Err(ConfigError::whole_file(format!(
-                    "node_id {me} is not among the peers, so this node could never \
-                     be elected and would wait forever"
-                )));
-            }
-            if leadership_state.is_none() {
-                return Err(ConfigError::whole_file(
-                    "peers are listed but leadership_state is not set; a vote that \
-                     does not survive a restart is a vote that can be cast twice, \
-                     and two leaders in one term is what an election exists to \
-                     prevent",
-                ));
-            }
-            let mut listed: Vec<u64> = peers.iter().map(|(id, _)| *id).collect();
-            listed.sort_unstable();
-            let duplicates = listed.len();
-            listed.dedup();
-            if listed.len() != duplicates {
-                return Err(ConfigError::whole_file(
-                    "two peers share an identity, so a majority could be counted twice",
-                ));
-            }
-        }
+        )?;
+        check_multicast(&multicast, feed_listen.is_some())?;
+        check_cluster(&peers, node_id, leadership_state.as_ref())?;
 
         // Both or neither: a rate without a burst refuses the opening quotes
         // every market maker sends, and a burst without a rate never refills.
@@ -774,7 +828,7 @@ impl Config {
             node_id: node_id.unwrap_or(1),
             peers,
             leadership_state,
-            max_feed_memory: budget,
+            max_feed_memory: max_feed_memory_mb * 1024 * 1024,
             instruments,
         })
     }
