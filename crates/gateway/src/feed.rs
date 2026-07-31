@@ -40,7 +40,7 @@ use crate::handoff::Handoff;
 use crate::multicast::Multicast;
 use bx_pipeline::fastmap::FastMap;
 use bx_pipeline::hub::{Channel, Hub, Resume};
-use bx_protocol::{Command, CommandKind, Event, Sequence};
+use bx_protocol::{Command, CommandKind, Event, EventKind, Sequence, Side, SymbolId, Ticks};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use std::io::{self, ErrorKind, Read, Write};
@@ -106,6 +106,63 @@ impl Listener {
     }
 }
 
+/// One symbol's price levels, as the feed believes them.
+///
+/// Built from the increments it distributes rather than asked for: a `BookDelta`
+/// carries the quantity now standing at a price, not a change to it, so applying
+/// one is an insert and a zero is a removal. That is what lets a distributor
+/// answer a joining client without reaching back into the venue -- the book it
+/// hands over is the one it has been forwarding all along.
+#[derive(Debug, Default)]
+struct Levels {
+    /// Ordered so a snapshot goes out best-first, which is the order a client
+    /// wants to fill from and the order the venue's own restatement uses.
+    bid: std::collections::BTreeMap<Ticks, u64>,
+    ask: std::collections::BTreeMap<Ticks, u64>,
+}
+
+impl Levels {
+    fn apply(&mut self, event: &Event) {
+        let side = if event.side == Side::Bid as u8 {
+            &mut self.bid
+        } else {
+            &mut self.ask
+        };
+        if event.quantity == 0 {
+            side.remove(&event.price);
+        } else {
+            side.insert(event.price, event.quantity);
+        }
+    }
+
+    /// The book as `BookSnapshot` events, best price first on each side.
+    ///
+    /// The same event kind the venue emits when a client subscribes on the
+    /// trading session, so a client has one thing to parse whichever door it
+    /// came through.
+    fn snapshot(&self, symbol: SymbolId, at: Sequence) -> Vec<Event> {
+        let mut out = Vec::with_capacity(self.bid.len() + self.ask.len());
+        let mut push = |side: Side, price: Ticks, quantity: u64| {
+            out.push(Event {
+                sequence: at,
+                quantity,
+                price,
+                symbol,
+                kind: EventKind::BookSnapshot as u8,
+                side: side as u8,
+                ..Event::default()
+            });
+        };
+        for (price, quantity) in self.bid.iter().rev() {
+            push(Side::Bid, *price, *quantity);
+        }
+        for (price, quantity) in &self.ask {
+            push(Side::Ask, *price, *quantity);
+        }
+        out
+    }
+}
+
 /// Counters an operator reads without touching the thread that keeps them.
 #[derive(Debug, Default)]
 pub struct Counts {
@@ -167,6 +224,7 @@ impl Feed {
                 owing: Vec::new(),
                 sent_to: FastMap::default(),
                 retaining: FastMap::default(),
+                books: FastMap::default(),
                 batches: Vec::new(),
                 handoff,
                 max_outbox,
@@ -295,6 +353,9 @@ struct State {
     /// Public channels this feed has started retaining. Bounded by the listing,
     /// not by the audience, which is what makes a repair answerable.
     retaining: FastMap<Channel, ()>,
+    /// Each symbol's levels, rebuilt from the deltas passing through. What a
+    /// client joining mid-stream is given before the increments start.
+    books: FastMap<SymbolId, Levels>,
     batches: Vec<Vec<Event>>,
     handoff: Handoff,
     max_outbox: usize,
@@ -413,6 +474,27 @@ impl State {
                     listener.cursors.push((channel, from));
                     self.by_channel.entry(channel).or_default().push(index);
                 }
+                // A book is state, and increments alone cannot convey it: a
+                // client joining mid-stream has no idea what stood at a price
+                // before it arrived. It is stated first, at the sequence the
+                // increments then resume from, so the two join without a gap
+                // and without an overlap.
+                if let Channel::Book(symbol) = channel {
+                    let stated = self
+                        .books
+                        .get(&symbol)
+                        .map(|levels| levels.snapshot(symbol, from))
+                        .unwrap_or_default();
+                    if let Some(listener) = self.listeners.get_mut(index).and_then(Option::as_mut) {
+                        for event in &stated {
+                            encode(event, &mut listener.outbox);
+                        }
+                        if !listener.outbox.is_empty() && !listener.owes {
+                            listener.owes = true;
+                            self.owing.push(index);
+                        }
+                    }
+                }
                 self.deliver(index, channel);
             }
             Some(CommandKind::Unsubscribe) => {
@@ -495,6 +577,12 @@ impl State {
             // moment is empty. A distributor that can only replay what somebody
             // was already watching cannot recover anybody.
             for event in batch {
+                // The book the feed hands to a joining client, kept from the
+                // increments it is already forwarding rather than asked of the
+                // venue. Costs one map write per level that moved.
+                if event.kind == EventKind::BookDelta as u8 {
+                    self.books.entry(event.symbol).or_default().apply(event);
+                }
                 let Some(channel) = Channel::of(event) else {
                     continue;
                 };
@@ -698,6 +786,72 @@ pub fn framed(event: &Event) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn delta(symbol: SymbolId, side: Side, price: Ticks, quantity: u64) -> Event {
+        Event {
+            quantity,
+            price,
+            symbol,
+            kind: EventKind::BookDelta as u8,
+            side: side as u8,
+            ..Event::default()
+        }
+    }
+
+    #[test]
+    fn a_delta_states_the_level_rather_than_adjusting_it() {
+        // The semantic the whole book rests on: a BookDelta carries what now
+        // stands at a price, not a change to it. Reading it as a change would
+        // build a book that drifts further from the venue with every update
+        // and never says so.
+        let mut levels = Levels::default();
+        levels.apply(&delta(1, Side::Bid, 100, 5));
+        levels.apply(&delta(1, Side::Bid, 100, 9));
+        let stated = levels.snapshot(1, 0);
+        assert_eq!(stated.len(), 1, "a restated level was counted twice");
+        assert_eq!(stated[0].quantity, 9, "the level was adjusted, not stated");
+    }
+
+    #[test]
+    fn a_zero_removes_a_level_rather_than_standing_at_nothing() {
+        let mut levels = Levels::default();
+        levels.apply(&delta(1, Side::Ask, 100, 5));
+        levels.apply(&delta(1, Side::Ask, 100, 0));
+        assert!(
+            levels.snapshot(1, 0).is_empty(),
+            "an emptied level stayed in the book, so a client would see depth \
+             that is not there"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_goes_out_best_price_first_on_both_sides() {
+        // The order a client fills from, and the order the venue's own
+        // restatement uses -- a snapshot in the wrong order is a book that
+        // looks inverted.
+        let mut levels = Levels::default();
+        for price in [100, 102, 101] {
+            levels.apply(&delta(7, Side::Bid, price, 1));
+            levels.apply(&delta(7, Side::Ask, price + 10, 1));
+        }
+        let stated = levels.snapshot(7, 42);
+        let bids: Vec<Ticks> = stated
+            .iter()
+            .filter(|e| e.side == Side::Bid as u8)
+            .map(|e| e.price)
+            .collect();
+        let asks: Vec<Ticks> = stated
+            .iter()
+            .filter(|e| e.side == Side::Ask as u8)
+            .map(|e| e.price)
+            .collect();
+        assert_eq!(bids, vec![102, 101, 100], "bids were not best-first");
+        assert_eq!(asks, vec![110, 111, 112], "asks were not best-first");
+        assert!(
+            stated.iter().all(|e| e.sequence == 42),
+            "a snapshot must name the position the increments resume from"
+        );
+    }
 
     #[test]
     fn the_feed_exports_the_counters_an_operator_pages_on() {

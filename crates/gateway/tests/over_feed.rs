@@ -448,3 +448,74 @@ fn asking_for_a_position_the_feed_never_reached_does_not_hang_the_client() {
         "a client holding an impossible position was never served again: {seen:?}"
     );
 }
+
+#[test]
+fn a_client_joining_mid_stream_is_given_the_book_before_the_increments() {
+    // The half of recovery that retransmission cannot do. Increments alone
+    // never tell a joiner what stood at a price before it arrived, so a client
+    // that connects to a moving market would build a book out of whatever
+    // happened next and be wrong about everything else.
+    let venue = Running::start();
+
+    // A market forms with nobody watching the feed.
+    let mut maker = Running::connect(&venue.orders);
+    for (id, price) in [(1_u64, 10_050_i64), (2, 10_040), (3, 10_030)] {
+        send(
+            &mut maker,
+            &[limit_order(1, SYMBOL, id, Side::Bid, price, 5)],
+        );
+        let _ = collect_until(&mut maker, Duration::from_secs(2), |seen| {
+            seen.iter()
+                .any(|e| e.kind == EventKind::Resting as u8 && e.order_id == id)
+        });
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Only now does anybody subscribe.
+    let mut joiner = Running::connect(&venue.feed);
+    send(&mut joiner, &[subscribe(0, SYMBOL, ChannelKind::Book)]);
+    let seen = collect_until(&mut joiner, Duration::from_secs(10), |seen| {
+        seen.iter()
+            .filter(|e| e.kind == EventKind::BookSnapshot as u8)
+            .count()
+            >= 3
+    });
+    let stated: Vec<&Event> = seen
+        .iter()
+        .filter(|e| e.kind == EventKind::BookSnapshot as u8)
+        .collect();
+    assert_eq!(
+        stated.len(),
+        3,
+        "the joining client was not told the book that already existed: {seen:?}"
+    );
+    // Best first, and the prices the venue actually holds.
+    let prices: Vec<i64> = stated.iter().map(|e| e.price).collect();
+    assert_eq!(
+        prices,
+        vec![10_050, 10_040, 10_030],
+        "the stated book was not best-first or not the venue's"
+    );
+    assert!(
+        stated.iter().all(|e| e.quantity == 5),
+        "the stated depth is not what rests on the venue: {stated:?}"
+    );
+
+    // And the increments continue from where the snapshot was taken, so
+    // applying them on top lands on the venue's book rather than beside it.
+    send(
+        &mut maker,
+        &[limit_order(1, SYMBOL, 9, Side::Bid, 10_060, 7)],
+    );
+    let after = collect_until(&mut joiner, Duration::from_secs(10), |seen| {
+        seen.iter().any(|e| e.kind == EventKind::BookDelta as u8)
+    });
+    let moved: Vec<&Event> = after
+        .iter()
+        .filter(|e| e.kind == EventKind::BookDelta as u8)
+        .collect();
+    assert!(
+        moved.iter().any(|e| e.price == 10_060 && e.quantity == 7),
+        "the increments after the snapshot did not arrive: {after:?}"
+    );
+}

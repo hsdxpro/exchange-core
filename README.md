@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-458%20passing-success" alt="458 tests">
+  <img src="https://img.shields.io/badge/tests-462%20passing-success" alt="462 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -29,7 +29,7 @@
 - **6.6M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **0.9 ms** to restart from a snapshot instead of 9.6 ms replaying from zero
-- **458 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
+- **462 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
 - Ed25519 logon, TLS 1.3 for internet sessions, a per-symbol kill switch, and an optional venue-signed hash chain a client can check against the stream
 
 Every number measured on the machine this was built on. `cargo x latency` reproduces the
@@ -49,7 +49,7 @@ green locally and green on a runner cannot become two different things.
 cargo x
 ```
 
-Format, `clippy -D warnings`, and all 458 tests.
+Format, `clippy -D warnings`, and all 462 tests.
 
 ```bash
 cargo x latency
@@ -236,8 +236,14 @@ arithmetic. Ours drops the per-message length prefix because an event is a fixed
 full one plus IP and UDP headers stays inside a 1,500-byte MTU, because a
 fragmented market-data packet turns one lost fragment into a lost packet.
 
-Nothing on this path waits for anyone: no acknowledgement, no flow control, no
-retransmission. A receiver that misses a packet sees the gap and asks on the feed
+A client joining a market already in motion is stated the book first — the feed
+rebuilds each symbol's levels from the deltas it is already forwarding, so the
+snapshot costs the venue nothing and needs no round trip to it. The stated book
+carries the sequence the increments then resume from, so the two join without a
+gap and without an overlap.
+
+Nothing on the packet path waits for anyone: no acknowledgement, no flow control,
+no retransmission. A receiver that misses a packet sees the gap and asks on the feed
 port — `RESUME {channel, last_seq}`, served from the retention ring by the thread
 that owns it, so a slow receiver never reaches back into the fast path. The
 feed retains every public channel the venue produces rather than only the ones
@@ -394,7 +400,7 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 ## Testing
 
-458 tests. The ones worth reading:
+462 tests. The ones worth reading:
 
 | Test | What it proves |
 |---|---|
