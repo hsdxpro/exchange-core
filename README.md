@@ -216,7 +216,8 @@ subscribers, the only difference being which port they watch:
 | Orders acknowledged | 200,000 of 200,000 | **200,000 of 200,000** |
 
 **1,207× on p50, 81× on throughput**, and the order path is back to roughly what it
-costs with nobody watching at all. This is the OUCH/ITCH split every venue
+costs with nobody watching at all. Three orders of magnitude is clear of any
+noise this bench has; the smaller claims further down are not, and say so. This is the OUCH/ITCH split every venue
 converges on, and the reason is this table rather than tradition. The private
 account feed stays on the trading session — that is the trader's own reply path
 — and the feed port serves the public channels only, which is why it can ask for
@@ -226,9 +227,11 @@ The feed thread earns a fifth of that on its own. Its first version walked every
 subscriber for every channel that moved and fanned out once per group; indexing
 subscribers by channel, accumulating the channels across every group waiting and
 walking the audience once, and visiting only the sessions holding bytes took p50
-from 30.5 to 23.3 µs and throughput from 1.97M to 2.53M. The same three
-mechanisms the venue's own loop uses, which is where they should have been
-copied from in the first place.
+from 30.5 to 23.3 µs and throughput from 1.97M to 2.53M — measured in one
+session, and about 1.3×, which is inside this bench's session-to-session spread
+rather than clear of it. Read it as the direction, not the size. The three
+mechanisms are the venue's own loop's, which is where they should have been
+copied from in the first place, and that is the reason to keep them.
 
 **Woken, not polled.** The feed thread waits on its sockets, and the handoff is
 not a socket — so a group handed over in a quiet moment sat there until that wait
