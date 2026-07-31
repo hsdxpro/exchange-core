@@ -232,14 +232,25 @@ copied from in the first place.
 
 **Woken, not polled.** The feed thread waits on its sockets, and the handoff is
 not a socket — so a group handed over in a quiet moment sat there until that wait
-timed out. Measured: **61.7 ms** of market-data latency on a venue that answers
-orders in tens of microseconds. The venue now rings a `mio::Waker` when it fills
-the seam, at most once per 50 µs. The cap is what makes it free — warm, with the
-same 1,024 subscribers, **3,888,577/sec with the wake against 3,959,737
-without**, inside the spread of repeated runs of either build. The first run
-against a fresh venue is worth discarding: it lands near 1.5M while the process
-warms, which is the number a single-shot benchmark reports and the reason this
-one is a median of three.
+timed out: **61.7 ms** of market-data latency on a venue that answers orders in
+tens of microseconds. The venue now rings a `mio::Waker` when it fills the seam.
+
+That wake is a syscall on the thread that sequences orders, so it is suppressed
+twice over — skipped while the feed is already draining, and capped at one per
+50 µs. The two multiply, and neither alone is worth much:
+
+| wake suppressed by | round trip, min | p50 | orders/sec |
+|---|---:|---:|---:|
+| nothing — no wake at all | 8.1 µs | 12.1 µs | 3,959,737 |
+| **both** | **8.6 µs** | **16.1 µs** | **3,888,577** |
+| the 50 µs cap alone | 16.2 µs | 20.1 µs | 3,492,010 |
+| the draining flag alone | 16.9 µs | 20.9 µs | 4,042,887 |
+| neither — ring every pass | 18.3 µs | 31.8 µs | 3,541,885 |
+
+Half a microsecond of round trip against never waking the feed at all, for
+market data that leaves on the trade. Warm figures, median of three: the first
+run against a fresh venue lands near 1.5M while the process warms, which is what
+a single-shot A/B reports and mistakes for the cost of whatever it is testing.
 
 ### One packet, however many are listening
 

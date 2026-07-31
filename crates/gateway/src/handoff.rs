@@ -38,21 +38,27 @@ const PER_BATCH: usize = 4 * 1024;
 
 /// How often the seam is allowed to ring the bell.
 ///
-/// Waking is a syscall, and the flag alone does not stop it being paid on every
-/// pass: the far side drains fast, so it is back asleep before the next group
-/// arrives, and each group finds a sleeper. Capping the rate bounds that to
-/// twenty thousand a second however hard the venue is driven.
+/// Waking is a syscall on the thread that sequences orders, and the two things
+/// that suppress it multiply: a wake happens only when the far side is asleep
+/// *and* this long has passed since the last one. Either alone leaves most of
+/// them standing. Warm, 1,024 subscribers, median of three runs:
 ///
-/// It costs nothing to bound. Warm, with a thousand subscribers, the venue runs
-/// 3,888,577 orders/sec with this wake and 3,959,737 with no wake at all, which
-/// is inside the spread of repeated runs of either build. What it buys is market
-/// data that arrives when the trade prints rather than when a timer expires --
-/// 61.7 milliseconds, measured, before this existed.
+/// | wake suppressed by | round trip, min | p50 | orders/sec |
+/// |---|---|---|---|
+/// | nothing -- no wake at all | 8.1 us | 12.1 us | 3,959,737 |
+/// | the flag and this cap | 8.6 us | 16.1 us | 3,888,577 |
+/// | this cap alone | 16.2 us | 20.1 us | 3,492,010 |
+/// | the flag alone | 16.9 us | 20.9 us | 4,042,887 |
+/// | neither -- ring every pass | 18.3 us | 31.8 us | 3,541,885 |
 ///
-/// A quiet venue still wakes the feed on the first trade, because the last wake
-/// is long past. A busy one does not need telling more often than this: the next
-/// group is already on its way. Only the last group of a burst can be suppressed
-/// and then find nothing behind it, and the feed's idle timer bounds that.
+/// Both earn their place, and together they cost the venue half a microsecond
+/// of round trip against never waking the feed at all. What that buys is market
+/// data leaving on the trade rather than 61.7 milliseconds later.
+///
+/// A quiet venue still rings on the first trade, the last wake being long past.
+/// The one case left over is a group this cap suppresses with nothing behind it
+/// -- the last of a burst, just before the venue goes quiet -- and the feed's
+/// idle timer bounds that.
 const WAKE_EVERY: Duration = Duration::from_micros(50);
 
 #[derive(Debug, Default)]
@@ -78,20 +84,21 @@ pub struct Handoff {
     ///
     /// Without it the consumer can only find out by looking, and a consumer
     /// that waits on sockets looks when a socket does something -- so a batch
-    /// handed over in a quiet moment sat until that wait timed out. Two hundred
-    /// microseconds of market-data latency, on a venue that measures order
-    /// entry in tens. The same argument as telling a maker its order filled
-    /// rather than making it ask.
+    /// handed over in a quiet moment sat until that wait timed out: 61.7
+    /// milliseconds of market-data latency, measured, on a venue that answers
+    /// orders in tens of microseconds. The same argument as telling a maker its
+    /// order filled rather than making it ask.
+    ///
     /// Shared across clones, and set by whichever clone the consumer holds.
     /// The venue's copy is made before the consumer exists, so a waker stored
     /// in one clone and not the others would be a waker nobody ever rings.
     wake: Arc<std::sync::OnceLock<Waker>>,
     /// Whether the far side is already awake and on its way to the queue.
     ///
-    /// The wake is a syscall, and one per group would be paid on the thread
-    /// that sequences orders. A consumer that is already draining does not need
-    /// telling twice, so the flag turns a wake per group into a wake per idle
-    /// period.
+    /// A consumer already draining does not need telling twice. On its own this
+    /// stops fewer wakes than it sounds like it should, because the far side
+    /// drains fast and is asleep again before the next group -- see
+    /// [`WAKE_EVERY`] for what each suppressor is worth on its own.
     awake: Arc<AtomicBool>,
     /// When the seam started, so a wake can be timed without a shared clock.
     started: Instant,
