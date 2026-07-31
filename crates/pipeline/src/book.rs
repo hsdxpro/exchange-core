@@ -228,8 +228,12 @@ impl Book {
 
     #[must_use]
     pub fn best_bid(&self) -> Option<Ticks> {
-        let best = self.engine.best_bid();
-        (best >= 0).then(|| self.instrument.to_price(best as u16))
+        // `try_from` is the whole bounds check: it rejects the -1 the engine
+        // reports for an empty side and anything above the ladder in one step,
+        // where `>= 0` plus a cast would have checked one end and truncated at
+        // the other.
+        let slot = u16::try_from(self.engine.best_bid()).ok()?;
+        Some(self.instrument.to_price(slot))
     }
 
     /// Aggregate quantity resting at a price.
@@ -476,6 +480,18 @@ impl Book {
                     let execution = &out.executions[index];
                     let engine_slot = u32::try_from(execution.resting_order).unwrap_or(0);
                     let client_order = self.slots.order_of(engine_slot);
+                    // Still a ladder slot here, not yet a wire price. The engine
+                    // addresses the ladder by u16 and every price reaching it
+                    // passed `to_slot`, so this is in range by construction --
+                    // see the assertion beside `LADDER_SLOTS`, which is what
+                    // keeps that true if the ladder is ever resized. Asserted
+                    // rather than trusted: a truncated slot books a wrong price
+                    // that looks entirely valid.
+                    debug_assert!(
+                        u16::try_from(execution.price).is_ok(),
+                        "engine reported ladder slot {} outside the u16 ladder",
+                        execution.price
+                    );
                     let price = self.instrument.to_price(execution.price as u16);
                     out.executions[index].resting_account = client_order.0;
                     out.executions[index].resting_order = client_order.1;

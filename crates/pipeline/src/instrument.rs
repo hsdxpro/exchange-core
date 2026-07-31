@@ -12,6 +12,21 @@ use bx_protocol::{Quantity, SymbolId, Ticks};
 /// Slots in the engine's ladder. Fixed by the engine's design.
 pub const LADDER_SLOTS: i64 = 65_536;
 
+// A slot is carried as a `u16` everywhere: out of `to_slot`, into `to_price`,
+// and back off the engine as an execution price. That holds only while the
+// ladder is no larger than the `u16` range, and it is currently exactly that
+// size -- no margin. Raising it without widening the slot type would not fail
+// to compile and would not panic. `to_slot` would quietly reject every price in
+// the upper half of each band, and prices coming back off the engine would
+// truncate into a different, valid-looking price. Wrong fills, no error.
+//
+// So the build fails here instead.
+const _: () = assert!(
+    LADDER_SLOTS <= u16::MAX as i64 + 1,
+    "LADDER_SLOTS exceeds the u16 slot index: widen the slot type in to_slot, \
+     to_price and Book::drain before raising it"
+);
+
 /// Largest symbol ID a venue may assign.
 ///
 /// Instruments are held in a table indexed by symbol, which is what makes
