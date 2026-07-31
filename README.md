@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-462%20passing-success" alt="462 tests">
+  <img src="https://img.shields.io/badge/tests-467%20passing-success" alt="467 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -29,7 +29,7 @@
 - **6.6M commands/sec** durable, acknowledged by a quorum of replicas
 - **66.7 µs** round trip replicated, against 357 µs for a local `fsync`. Reaching two machines is **5.4× faster than reaching the platter**
 - **0.9 ms** to restart from a snapshot instead of 9.6 ms replaying from zero
-- **462 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
+- **467 tests**, including multi-process failover, kill-and-restart recovery, and seeded crash simulation
 - Ed25519 logon, TLS 1.3 for internet sessions, a per-symbol kill switch, and an optional venue-signed hash chain a client can check against the stream
 
 Every number measured on the machine this was built on. `cargo x latency` reproduces the
@@ -49,7 +49,7 @@ green locally and green on a runner cannot become two different things.
 cargo x
 ```
 
-Format, `clippy -D warnings`, and all 462 tests.
+Format, `clippy -D warnings`, and all 467 tests.
 
 ```bash
 cargo x latency
@@ -100,6 +100,16 @@ slower than earlier revisions: order IDs are now checked for monotonicity and ev
 is checked against the account its session proved, and both cost something on the path that
 accepts. The trade is stated rather than smoothed — a duplicate fill or an order placed for
 somebody else's account is worth more than 20 ns.
+
+**Cancel is the exception, and it is stated too.** Orders are now keyed by account *and* ID,
+because venue-global IDs meant two ordinary clients that both number their orders from one
+collided on their first — no attacker needed, and what every client library does by default.
+Cancel is the most lookup-heavy path and the key went from eight bytes to sixteen: measured
+back to back on one machine, **207 → 335 ns**. Everything else was flat or better on the same
+run, the self-match check improving because the book now carries the owner and no longer needs
+a hash lookup per crossable order. The absolute figures in this table were taken on a quiet
+machine and want re-measuring there; the delta was taken hot, on both sides, which is what
+makes it a delta. A venue two honest clients cannot both use is not worth 128 ns.
 
 "Full path" = sequence, journal, balance reservation, match, event emission. Not the book
 in isolation.
@@ -400,7 +410,7 @@ bugs worth remembering, is in [`ENGINEERING.md`](ENGINEERING.md).
 
 ## Testing
 
-462 tests. The ones worth reading:
+467 tests. The ones worth reading:
 
 | Test | What it proves |
 |---|---|

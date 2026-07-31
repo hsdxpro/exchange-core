@@ -273,19 +273,15 @@ fn a_halt_leaves_the_book_exactly_as_it_stood() {
     assert_eq!(before, after, "a halt changed the book");
 }
 
-/// Fails today, and is kept because it is the defect stated exactly.
+/// The case the per-account keying exists for.
 ///
-/// Order IDs are venue-global, so the second account to use ID 1 is refused as
-/// a duplicate. This was written down as a griefing vector -- one client
-/// denying another an ID -- which undersold it: nothing adversarial is
+/// Order IDs used to be venue-global, so the second account to use ID 1 was
+/// refused as a duplicate. That was written down as a griefing vector -- one
+/// client denying another an ID -- which undersold it: nothing adversarial is
 /// required. Two ordinary clients that both number their orders from one
-/// collide on their first, which is what every client library does by default
-/// and what FIX and OUCH namespace per client precisely to avoid.
-///
-/// Ignored rather than deleted so the fix has something to switch on. See
-/// DESIGN.md for what closing it costs.
+/// collide on their first, which is what a client library does by default and
+/// what FIX and OUCH namespace per client precisely to avoid.
 #[test]
-#[ignore = "known defect: order IDs are venue-global, see DESIGN.md"]
 fn two_accounts_may_each_number_their_own_orders_from_one() {
     // The ordinary case, not an attack: two clients that both start counting at
     // one. If the venue refuses the second, every pair of honest clients using
@@ -307,5 +303,143 @@ fn two_accounts_may_each_number_their_own_orders_from_one() {
     assert!(
         refused.is_empty(),
         "account 2 was refused its own order id 1 because account 1 holds one: {refused:?}"
+    );
+}
+
+#[test]
+fn one_accounts_order_one_is_not_the_others() {
+    // Sharing an ID must not make two orders the same order. Each has to fill,
+    // cancel and be reported on its own, or per-account IDs would have traded
+    // one defect for a much worse one.
+    let mut exchange = funded();
+    let mut resting = limit_order(1, SYMBOL, 1, Side::Ask, 10_100, 5);
+    exchange.submit(&mut resting).unwrap();
+    let mut also_one = limit_order(2, SYMBOL, 1, Side::Ask, 10_110, 7);
+    exchange.submit(&mut also_one).unwrap();
+
+    // Cancelling account 1's order 1 must leave account 2's standing.
+    let mut cancel = common::cancel(1, 1);
+    let events = exchange.submit(&mut cancel).unwrap().to_vec();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Canceled as u8),
+        "account 1 could not cancel its own order: {events:?}"
+    );
+    let still = exchange.open_orders_for(2, SYMBOL);
+    assert_eq!(
+        still.len(),
+        1,
+        "cancelling one account's order 1 took the other account's with it"
+    );
+    assert_eq!(
+        still[0].quantity, 7,
+        "the survivor is not account 2's order"
+    );
+    assert!(
+        exchange.open_orders_for(1, SYMBOL).is_empty(),
+        "account 1's order survived its own cancel"
+    );
+}
+
+#[test]
+fn a_fill_settles_against_the_maker_that_actually_rested() {
+    // The lookup that made this change non-trivial: the pipeline finds the
+    // maker's reservation from what the engine reports. Get the account wrong
+    // and the wrong participant is paid.
+    let mut exchange = funded();
+    let mut maker = limit_order(1, SYMBOL, 1, Side::Ask, 10_100, 4);
+    exchange.submit(&mut maker).unwrap();
+    // Account 2 also holds an order numbered 1, on the other side, so a lookup
+    // by ID alone would find the wrong one.
+    let mut decoy = limit_order(2, SYMBOL, 1, Side::Bid, 10_000, 4);
+    exchange.submit(&mut decoy).unwrap();
+
+    let mut taker = limit_order(3, SYMBOL, 1, Side::Bid, 10_100, 4);
+    let events = exchange.submit(&mut taker).unwrap().to_vec();
+    let fills: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Filled as u8)
+        .collect();
+    assert!(!fills.is_empty(), "the cross did not fill: {events:?}");
+    // The maker that was actually consumed is account 1's, not account 2's
+    // order carrying the same ID. Checked through the books rather than the
+    // events, because the fill event names the taker.
+    assert!(
+        exchange.open_orders_for(1, SYMBOL).is_empty(),
+        "the resting maker was not the one consumed"
+    );
+    assert_eq!(
+        exchange.open_orders_for(2, SYMBOL).len(),
+        1,
+        "the decoy holding the same ID was consumed by somebody else's trade"
+    );
+    assert!(
+        fills.iter().all(|e| e.counterparty_order_id == 1),
+        "the fill named a maker order nobody placed: {fills:?}"
+    );
+    assert_eq!(bx_pipeline::accounting_violations(), 0);
+}
+
+#[test]
+fn self_match_prevention_still_looks_at_the_owner_not_the_id() {
+    // Two accounts sharing an ID must still be allowed to trade with each
+    // other, and one account must still not trade with itself.
+    let mut exchange = funded();
+    let mut mine = limit_order(1, SYMBOL, 1, Side::Ask, 10_100, 3);
+    exchange.submit(&mut mine).unwrap();
+
+    // Same account, same ID space, crossing its own order: refused.
+    let mut against_myself = limit_order(1, SYMBOL, 2, Side::Bid, 10_100, 3);
+    let events = exchange.submit(&mut against_myself).unwrap().to_vec();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Rejected as u8
+            && e.reject_reason == RejectReason::SelfMatchPrevented as u8),
+        "an account traded with itself: {events:?}"
+    );
+
+    // A different account, whose order is also numbered 1: allowed.
+    let mut someone_else = limit_order(2, SYMBOL, 1, Side::Bid, 10_100, 3);
+    let events = exchange.submit(&mut someone_else).unwrap().to_vec();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Filled as u8),
+        "two accounts sharing an ID were prevented from trading: {events:?}"
+    );
+}
+
+#[test]
+fn a_maker_is_told_when_its_resting_order_is_filled() {
+    // A market maker's whole position changes when somebody lifts it. If only
+    // the taker is told, the maker learns by polling -- and a venue that fills
+    // an order without telling its owner is one nobody can quote on.
+    let mut exchange = funded();
+    let mut resting = limit_order(1, SYMBOL, 1, Side::Ask, 10_100, 4);
+    exchange.submit(&mut resting).unwrap();
+
+    let mut taker = limit_order(2, SYMBOL, 1, Side::Bid, 10_100, 4);
+    let events = exchange.submit(&mut taker).unwrap().to_vec();
+
+    let told: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.account == 1 && e.kind == EventKind::Filled as u8)
+        .collect();
+    assert_eq!(
+        told.len(),
+        1,
+        "the maker was told nothing about its own order being filled: {events:?}"
+    );
+    let fill = told[0];
+    assert_eq!(fill.order_id, 1, "the maker's fill names the wrong order");
+    assert_eq!(
+        fill.counterparty_order_id, 1,
+        "the maker's fill does not name who lifted it"
+    );
+    assert_eq!(fill.quantity, 4, "the maker's fill reports the wrong size");
+    assert_eq!(
+        fill.price, 10_100,
+        "the maker's fill reports the wrong price"
+    );
+    assert_eq!(
+        fill.side,
+        Side::Ask as u8,
+        "the maker's fill reports the aggressor's side rather than its own"
     );
 }

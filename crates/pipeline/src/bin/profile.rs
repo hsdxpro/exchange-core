@@ -130,7 +130,7 @@ fn book_only() -> f64 {
         for (i, command) in commands.iter().enumerate() {
             book.submit_into(
                 &mut outcome,
-                i as u64 + 1,
+                (1, i as u64 + 1),
                 Side::Bid,
                 command.price,
                 command.quantity,

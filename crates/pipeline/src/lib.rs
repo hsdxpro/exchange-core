@@ -158,9 +158,9 @@ pub struct Exchange<S: LogStorage> {
     instruments: Instruments,
     /// A table indexed by symbol, so finding a book is a bounds check.
     books: Books,
-    /// Keyed by client order ID. A hash map, not a tree: this is looked up
-    /// several times per command and nothing iterates it, so ordering is not
-    /// needed and O(log n) tree descents are pure cost.
+    /// Keyed by account *and* client order ID. A hash map, not a tree: this is
+    /// looked up several times per command and nothing iterates it, so ordering
+    /// is not needed and O(log n) tree descents are pure cost.
     ///
     /// It grows from empty rather than being sized to `max_open_orders`, and
     /// that is deliberate. Pre-sizing it looks obviously right -- the bound is
@@ -170,7 +170,14 @@ pub struct Exchange<S: LogStorage> {
     /// spans tens of megabytes and every probe into it misses, where a table
     /// grown to the live set stays dense enough to stay cached. The rehashes
     /// cost less than the misses they would have avoided.
-    reservations: FastMap<OrderId, Reservation>,
+    ///
+    /// The account is in the key because IDs were once venue-global, so the
+    /// second account to use ID 1 was refused as a duplicate -- no attacker
+    /// required, just two clients that both number their orders from one, which
+    /// is what a client library does by default and what FIX and OUCH namespace
+    /// per client to avoid. The key is sixteen bytes rather than eight; what
+    /// that costs is in the README's command-path table, measured either side.
+    reservations: FastMap<crate::book::OrderKey, Reservation>,
     /// Orders refused, by reason. A fixed array indexed by the discriminant, so
     /// counting one costs an increment and nothing on the path that accepts.
     rejects: [u64; REJECT_REASONS],
@@ -600,7 +607,7 @@ impl<S: LogStorage> Exchange<S> {
         let mut orders = Vec::new();
         for (symbol, book) in self.books.iter() {
             book.for_each_resting(|resting| {
-                let held = self.reservations.get(&resting.order);
+                let held = self.reservations.get(&(resting.account, resting.order));
                 orders.push(SnapshotOrder {
                     reserved: held.map_or(0, |r| r.remaining),
                     order_id: resting.order,
@@ -705,14 +712,19 @@ impl<S: LogStorage> Exchange<S> {
                 continue;
             };
             let restored = self.books.get_mut(record.symbol).is_some_and(|book| {
-                book.restore(record.order_id, side, record.price, record.quantity)
+                book.restore(
+                    (record.account, record.order_id),
+                    side,
+                    record.price,
+                    record.quantity,
+                )
             });
             if !restored {
                 Self::violation();
                 continue;
             }
             self.hold(
-                record.order_id,
+                (record.account, record.order_id),
                 Reservation {
                     account: record.account,
                     symbol: record.symbol,
@@ -949,7 +961,10 @@ impl<S: LogStorage> Exchange<S> {
             self.reject(command, RejectReason::QuantityTooLarge);
             return;
         }
-        if self.reservations.contains_key(&command.order_id) {
+        if self
+            .reservations
+            .contains_key(&(command.account, command.order_id))
+        {
             self.reject(command, RejectReason::DuplicateOrderId);
             return;
         }
@@ -1025,7 +1040,7 @@ impl<S: LogStorage> Exchange<S> {
         self.highest_order_id
             .insert(command.account, command.order_id);
         self.hold(
-            command.order_id,
+            (command.account, command.order_id),
             Reservation {
                 account: command.account,
                 symbol: command.symbol,
@@ -1039,13 +1054,13 @@ impl<S: LogStorage> Exchange<S> {
         let mut outcome = std::mem::take(&mut self.scratch);
         let Some(book) = self.books.get_mut(command.symbol) else {
             self.scratch = outcome;
-            self.release_all(command.order_id);
+            self.release_all((command.account, command.order_id));
             self.reject(command, RejectReason::UnknownSymbol);
             return;
         };
         book.submit_into(
             &mut outcome,
-            command.order_id,
+            (command.account, command.order_id),
             side,
             command.price,
             command.quantity,
@@ -1055,7 +1070,7 @@ impl<S: LogStorage> Exchange<S> {
 
         if let Some(reason) = outcome.reject {
             self.scratch = outcome;
-            self.release_all(command.order_id);
+            self.release_all((command.account, command.order_id));
             self.reject(command, reason);
             return;
         }
@@ -1064,7 +1079,7 @@ impl<S: LogStorage> Exchange<S> {
 
         // Anything that neither traded nor rested is gone; release its hold.
         if outcome.resting_quantity == 0 {
-            self.release_all(command.order_id);
+            self.release_all((command.account, command.order_id));
         }
         self.emit_outcome(command, side, &outcome);
         self.scratch = outcome;
@@ -1084,7 +1099,7 @@ impl<S: LogStorage> Exchange<S> {
             .get(&(account, symbol))
             .map(|held| {
                 held.iter()
-                    .filter_map(|order| book.resting_order(*order))
+                    .filter_map(|order| book.resting_order((account, *order)))
                     .collect()
             })
             .unwrap_or_default()
@@ -1117,11 +1132,11 @@ impl<S: LogStorage> Exchange<S> {
         let mut remaining = command.quantity;
         let mut ours = false;
         book.for_each_crossable(side, command.price, command.is_market(), |resting| {
-            if self
-                .reservations
-                .get(&resting.order)
-                .is_some_and(|held| held.account == command.account)
-            {
+            // The book now says who owns a resting order, so preventing a
+            // self-match is a comparison rather than a hash lookup per
+            // crossable order -- the account had to be carried anyway once IDs
+            // stopped being unique, and this path gets it for nothing.
+            if resting.account == command.account {
                 ours = true;
                 return false;
             }
@@ -1140,13 +1155,13 @@ impl<S: LogStorage> Exchange<S> {
             self.reject(command, RejectReason::UnknownSymbol);
             return false;
         };
-        book.cancel_into(&mut outcome, command.order_id);
+        book.cancel_into(&mut outcome, (command.account, command.order_id));
         if let Some(reason) = outcome.reject {
             self.scratch = outcome;
             self.reject(command, reason);
             return false;
         }
-        self.release_all(command.order_id);
+        self.release_all((command.account, command.order_id));
         self.push(command, EventKind::Canceled, command.order_id, 0, 0, 0);
         self.emit_levels(command, &outcome);
         self.scratch = outcome;
@@ -1160,14 +1175,22 @@ impl<S: LogStorage> Exchange<S> {
             self.reject(command, RejectReason::UnknownSymbol);
             return;
         };
-        book.amend_down_into(&mut outcome, command.order_id, command.quantity);
+        book.amend_down_into(
+            &mut outcome,
+            (command.account, command.order_id),
+            command.quantity,
+        );
         if let Some(reason) = outcome.reject {
             self.scratch = outcome;
             self.reject(command, reason);
             return;
         }
         // Give back the part of the hold a smaller order no longer needs.
-        if let Some(reservation) = self.reservations.get(&command.order_id).copied() {
+        if let Some(reservation) = self
+            .reservations
+            .get(&(command.account, command.order_id))
+            .copied()
+        {
             let still_needed = match reservation.side {
                 Side::Bid => self
                     .instruments
@@ -1178,11 +1201,11 @@ impl<S: LogStorage> Exchange<S> {
             };
             let excess = reservation.remaining.saturating_sub(still_needed);
             if excess > 0 {
-                self.release(command.order_id, excess);
+                self.release((command.account, command.order_id), excess);
             }
         }
         if command.quantity == 0 {
-            self.release_all(command.order_id);
+            self.release_all((command.account, command.order_id));
         }
         self.push(
             command,
@@ -1215,7 +1238,11 @@ impl<S: LogStorage> Exchange<S> {
                 Self::violation();
                 continue;
             };
-            let Some(maker) = self.reservations.get(&execution.resting_order).copied() else {
+            let Some(maker) = self
+                .reservations
+                .get(&(execution.resting_account, execution.resting_order))
+                .copied()
+            else {
                 Self::violation();
                 continue;
             };
@@ -1242,8 +1269,11 @@ impl<S: LogStorage> Exchange<S> {
                 Side::Bid => (notional, quantity),
                 Side::Ask => (quantity, notional),
             };
-            self.consume(command.order_id, taker_used);
-            self.consume(execution.resting_order, maker_used);
+            self.consume((command.account, command.order_id), taker_used);
+            self.consume(
+                (execution.resting_account, execution.resting_order),
+                maker_used,
+            );
 
             // A buy that traded below its limit over-reserved; give it back. A
             // market buy has no limit to compare against: it was reserved at
@@ -1254,16 +1284,16 @@ impl<S: LogStorage> Exchange<S> {
                 && let Some(at_limit) = instrument.notional(command.price, execution.quantity)
                 && at_limit > notional
             {
-                self.release(command.order_id, at_limit - notional);
+                self.release((command.account, command.order_id), at_limit - notional);
             }
 
             // A maker the engine fully consumed releases whatever is left.
             let maker_gone = !self
                 .books
                 .get(command.symbol)
-                .is_some_and(|b| b.contains(execution.resting_order));
+                .is_some_and(|b| b.contains((execution.resting_account, execution.resting_order)));
             if maker_gone {
-                self.release_all(execution.resting_order);
+                self.release_all((execution.resting_account, execution.resting_order));
             }
         }
     }
@@ -1280,14 +1310,14 @@ impl<S: LogStorage> Exchange<S> {
     }
 
     /// Reduces a hold because the asset left the account.
-    fn consume(&mut self, order: OrderId, amount: u128) {
+    fn consume(&mut self, order: book::OrderKey, amount: u128) {
         if let Some(reservation) = self.reservations.get_mut(&order) {
             reservation.remaining = reservation.remaining.saturating_sub(amount);
         }
     }
 
     /// Returns part of a hold to the free balance.
-    fn release(&mut self, order: OrderId, amount: u128) {
+    fn release(&mut self, order: book::OrderKey, amount: u128) {
         let Some(reservation) = self.reservations.get_mut(&order) else {
             return;
         };
@@ -1307,7 +1337,7 @@ impl<S: LogStorage> Exchange<S> {
     }
 
     /// Records a hold, and that the account now has one more order resting.
-    fn hold(&mut self, order: OrderId, mut reservation: Reservation) {
+    fn hold(&mut self, order: book::OrderKey, mut reservation: Reservation) {
         match self.reservations.get(&order) {
             // Already indexed. It keeps its place, or the swap that removes it
             // later would take out somebody else's order.
@@ -1319,7 +1349,7 @@ impl<S: LogStorage> Exchange<S> {
                     .or_default();
                 debug_assert!(held.len() < u32::MAX as usize, "resting list overflowed");
                 reservation.at = held.len() as u32;
-                held.push(order);
+                held.push(order.1);
             }
         }
         self.reservations.insert(order, reservation);
@@ -1336,24 +1366,40 @@ impl<S: LogStorage> Exchange<S> {
     /// already here; it was the search in front of it that dominated. This is
     /// worst for exactly the client the venue exists to serve, since a market
     /// maker is defined by having a great many orders resting at once.
-    fn release_all(&mut self, order: OrderId) {
-        let Some(reservation) = self.reservations.get(&order).copied() else {
+    fn release_all(&mut self, order: book::OrderKey) {
+        // Taken out first, and the hold given back from what came out. This used
+        // to read the reservation, call `release` -- which read it again -- and
+        // then remove it: three lookups of a key it was about to discard, on the
+        // path a market maker uses most.
+        let Some(reservation) = self.reservations.remove(&order) else {
             return;
         };
-        self.release(order, reservation.remaining);
-        self.reservations.remove(&order);
+        if reservation.remaining > 0
+            && let Some(instrument) = self.instruments.get(reservation.symbol)
+        {
+            let asset = match reservation.side {
+                Side::Bid => instrument.quote,
+                Side::Ask => instrument.base,
+            };
+            Self::record(
+                self.accounts
+                    .release(reservation.account, asset, reservation.remaining),
+            );
+        }
         let key = (reservation.account, reservation.symbol);
         let Some(held) = self.resting_per_account.get_mut(&key) else {
             return;
         };
 
         let at = reservation.at as usize;
-        if held.get(at).copied() == Some(order) {
+        if held.get(at).copied() == Some(order.1) {
             held.swap_remove(at);
             // Whatever was moved into the gap is no longer where its own
             // reservation says it is.
+            // The list is one account's, so the account half of the key is the
+            // same for everything in it.
             if let Some(moved) = held.get(at).copied()
-                && let Some(entry) = self.reservations.get_mut(&moved)
+                && let Some(entry) = self.reservations.get_mut(&(order.0, moved))
             {
                 entry.at = at as u32;
             }
@@ -1363,10 +1409,10 @@ impl<S: LogStorage> Exchange<S> {
             // out, because leaving it would let a cancelled order keep blocking
             // a self-match and be reported as open. Correct first, fast second.
             Self::violation();
-            if let Some(found) = held.iter().position(|held| *held == order) {
+            if let Some(found) = held.iter().position(|held| *held == order.1) {
                 held.swap_remove(found);
                 if let Some(moved) = held.get(found).copied()
-                    && let Some(entry) = self.reservations.get_mut(&moved)
+                    && let Some(entry) = self.reservations.get_mut(&(order.0, moved))
                 {
                     entry.at = found as u32;
                 }
@@ -1418,6 +1464,20 @@ impl<S: LogStorage> Exchange<S> {
         }
     }
 
+    /// Tells both sides of a trade, then the tape.
+    ///
+    /// The maker used to be told nothing at all. Its resting order was consumed,
+    /// the taker got a fill, the public tape got a print carrying no identities,
+    /// and the participant whose position had just changed could only find out
+    /// by asking. For a market maker -- the client this venue exists to serve,
+    /// defined by having many orders resting -- that is the difference between a
+    /// feed and a poll.
+    ///
+    /// It went unnoticed because it needed the maker's account, and until orders
+    /// were keyed per account there was nowhere here to get one: the engine
+    /// reports a fill by slot, and the pipeline resolved that to a bare ID. The
+    /// slot table carries the owner now, so the maker's event costs a field
+    /// read.
     fn push_fill(&mut self, command: &Command, side: Side, execution: &Execution) {
         let sequence = self.take_sequence();
         self.events.push(Event {
@@ -1431,6 +1491,23 @@ impl<S: LogStorage> Exchange<S> {
             symbol: command.symbol,
             kind: EventKind::Filled as u8,
             side: side as u8,
+            reject_reason: RejectReason::None as u8,
+            _pad: [0; 1],
+        });
+        // The maker's own copy: its order, the taker's as the counterparty, and
+        // its own side rather than the aggressor's.
+        let sequence = self.take_sequence();
+        self.events.push(Event {
+            sequence,
+            cause_sequence: command.sequence,
+            account: execution.resting_account,
+            order_id: execution.resting_order,
+            counterparty_order_id: command.order_id,
+            quantity: execution.quantity,
+            price: execution.price,
+            symbol: command.symbol,
+            kind: EventKind::Filled as u8,
+            side: side.opposite() as u8,
             reject_reason: RejectReason::None as u8,
             _pad: [0; 1],
         });

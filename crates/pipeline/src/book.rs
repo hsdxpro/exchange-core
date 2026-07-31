@@ -17,7 +17,14 @@
 use crate::fastmap::FastMap;
 use crate::instrument::Instrument;
 use bx_engine::{L3Book, OrderError, Side as ESide, TimeInForce as ETif};
-use bx_protocol::{OrderId, Quantity, RejectReason, Side, Ticks, TimeInForce};
+use bx_protocol::{AccountId, OrderId, Quantity, RejectReason, Side, Ticks, TimeInForce};
+
+/// How an order is named once IDs are no longer unique across the venue.
+///
+/// A client's ID is its own; two accounts may each start at one. Everything that
+/// looks an order up -- the slot table here, the reservation table in the
+/// pipeline -- keys on the pair.
+pub type OrderKey = (AccountId, OrderId);
 
 /// A price whose aggregate quantity changed, and what it changed to.
 /// A quantity of zero means the level is now empty.
@@ -31,6 +38,10 @@ pub struct LevelChange {
 /// One execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Execution {
+    /// The maker, named the way the reservation table is keyed. Without the
+    /// account the pipeline could not find the maker's reservation once IDs
+    /// stopped being unique across the venue.
+    pub resting_account: AccountId,
     pub resting_order: OrderId,
     pub price: Ticks,
     pub quantity: Quantity,
@@ -101,15 +112,22 @@ impl Outcome {
 }
 
 /// Hands out the dense `u32` slot indices the engine needs, and maps them back
-/// to the `u64` order IDs clients use.
+/// to the orders clients name.
 ///
 /// This is the concrete cost of the engine indexing orders by a dense integer.
 /// It is a hash lookup on the cancel and amend paths, which is exactly what the
 /// engine's own design avoids internally.
+///
+/// Keyed by account *and* ID, not by ID alone. Venue-global IDs meant the second
+/// account to use ID 1 was refused as a duplicate, which needs no attacker: two
+/// clients that both number their orders from one collide on their first, and
+/// that is what a client library does by default. It is also why the engine can
+/// stay ignorant of client identifiers -- this table is the only thing that maps
+/// between the two, so it is the right place to carry who owns what.
 #[derive(Debug)]
 struct SlotAllocator {
-    to_slot: FastMap<OrderId, u32>,
-    to_order: Vec<OrderId>,
+    to_slot: FastMap<OrderKey, u32>,
+    to_order: Vec<OrderKey>,
     free: Vec<u32>,
     capacity: u32,
 }
@@ -118,13 +136,13 @@ impl SlotAllocator {
     fn new(capacity: u32) -> Self {
         Self {
             to_slot: FastMap::default(),
-            to_order: vec![0; capacity as usize],
+            to_order: vec![(0, 0); capacity as usize],
             free: (0..capacity).rev().collect(),
             capacity,
         }
     }
 
-    fn allocate(&mut self, order: OrderId) -> Result<u32, SlotError> {
+    fn allocate(&mut self, order: OrderKey) -> Result<u32, SlotError> {
         if self.to_slot.contains_key(&order) {
             return Err(SlotError::Duplicate);
         }
@@ -134,15 +152,15 @@ impl SlotAllocator {
         Ok(slot)
     }
 
-    fn slot_of(&self, order: OrderId) -> Option<u32> {
+    fn slot_of(&self, order: OrderKey) -> Option<u32> {
         self.to_slot.get(&order).copied()
     }
 
-    fn order_of(&self, slot: u32) -> OrderId {
+    fn order_of(&self, slot: u32) -> OrderKey {
         self.to_order[slot as usize]
     }
 
-    fn release(&mut self, order: OrderId) {
+    fn release(&mut self, order: OrderKey) {
         if let Some(slot) = self.to_slot.remove(&order) {
             self.free.push(slot);
         }
@@ -177,6 +195,8 @@ impl SlotError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Resting {
     pub order: OrderId,
+    /// Whose it is. A book holding two accounts' order 1 has to say which.
+    pub account: AccountId,
     pub side: Side,
     pub price: Ticks,
     pub quantity: Quantity,
@@ -221,7 +241,7 @@ impl Book {
     }
 
     #[must_use]
-    pub fn contains(&self, order: OrderId) -> bool {
+    pub fn contains(&self, order: OrderKey) -> bool {
         self.slots
             .slot_of(order)
             .is_some_and(|s| self.engine.contains(s))
@@ -243,11 +263,12 @@ impl Book {
     /// The quantity is what is still working, which is the only figure a client
     /// that has just reconnected can act on.
     #[must_use]
-    pub fn resting_order(&self, order: OrderId) -> Option<Resting> {
+    pub fn resting_order(&self, order: OrderKey) -> Option<Resting> {
         let slot = self.slots.slot_of(order)?;
         let view = self.engine.order(slot)?;
         Some(Resting {
-            order,
+            order: order.1,
+            account: order.0,
             side: match view.side {
                 ESide::Bid => Side::Bid,
                 ESide::Ask => Side::Ask,
@@ -286,8 +307,10 @@ impl Book {
             }
             self.engine
                 .for_each_order_at_level_while(engine_side, slot, |view| {
+                    let (account, order) = self.slots.order_of(view.id);
                     walking = visitor(Resting {
-                        order: self.slots.order_of(view.id),
+                        order,
+                        account,
                         side: resting_side,
                         price,
                         quantity: u64::from(view.quantity),
@@ -309,8 +332,10 @@ impl Book {
                 .for_each_level(engine_side, usize::MAX, |slot, _| {
                     self.engine
                         .for_each_order_at_level(engine_side, slot, |view| {
+                            let (account, order) = self.slots.order_of(view.id);
                             visitor(Resting {
-                                order: self.slots.order_of(view.id),
+                                order,
+                                account,
                                 side,
                                 price: self.instrument.to_price(slot),
                                 quantity: u64::from(view.quantity),
@@ -327,7 +352,7 @@ impl Book {
     /// wider than the engine takes, or no free slot.
     pub fn restore(
         &mut self,
-        order: OrderId,
+        order: OrderKey,
         side: Side,
         price: Ticks,
         quantity: Quantity,
@@ -360,7 +385,7 @@ impl Book {
     pub fn submit_into(
         &mut self,
         out: &mut Outcome,
-        order: OrderId,
+        order: OrderKey,
         side: Side,
         price: Ticks,
         quantity: Quantity,
@@ -433,7 +458,8 @@ impl Book {
                 }
                 executions.push(Execution {
                     // Engine slot index for now; resolved to the client's order
-                    // ID below, once the borrow has ended.
+                    // below, once the borrow has ended.
+                    resting_account: 0,
                     resting_order: u64::from(fill.maker_order_id),
                     price: i64::from(fill.price),
                     quantity: u64::from(fill.quantity),
@@ -451,7 +477,8 @@ impl Book {
                     let engine_slot = u32::try_from(execution.resting_order).unwrap_or(0);
                     let client_order = self.slots.order_of(engine_slot);
                     let price = self.instrument.to_price(execution.price as u16);
-                    out.executions[index].resting_order = client_order;
+                    out.executions[index].resting_account = client_order.0;
+                    out.executions[index].resting_order = client_order.1;
                     out.executions[index].price = price;
                     // A maker the engine consumed entirely frees its slot.
                     if !self.engine.contains(engine_slot) {
@@ -478,7 +505,7 @@ impl Book {
         }
     }
 
-    pub fn cancel_into(&mut self, out: &mut Outcome, order: OrderId) {
+    pub fn cancel_into(&mut self, out: &mut Outcome, order: OrderKey) {
         out.clear();
         self.mark_top(out);
         let Some(slot) = self.slots.slot_of(order) else {
@@ -501,7 +528,7 @@ impl Book {
         }
     }
 
-    pub fn amend_down_into(&mut self, out: &mut Outcome, order: OrderId, quantity: Quantity) {
+    pub fn amend_down_into(&mut self, out: &mut Outcome, order: OrderKey, quantity: Quantity) {
         out.clear();
         self.mark_top(out);
         let Some(slot) = self.slots.slot_of(order) else {
@@ -683,7 +710,7 @@ mod tests {
             for _ in 0..DEEP {
                 book.submit_into(
                     &mut out,
-                    id,
+                    (1, id),
                     Side::Ask,
                     1_000 + i64::from(level),
                     1,
@@ -698,7 +725,7 @@ mod tests {
         // One order takes every level.
         book.submit_into(
             &mut out,
-            9_999,
+            (1, 9_999),
             Side::Bid,
             0,
             u64::from(LEVELS) * DEEP,
@@ -902,7 +929,7 @@ mod tests {
 
         // Cancelling returns the slot, so the venue recovers by itself.
         let mut out = Outcome::default();
-        book.cancel_into(&mut out, 1);
+        book.cancel_into(&mut out, (1, 1));
         assert!(out.reject.is_none());
         assert!(
             rest(&mut book, u64::from(POOL) + 1, Side::Bid, 1_500, 1)
@@ -913,10 +940,12 @@ mod tests {
     }
 
     fn rest(book: &mut Book, order: OrderId, side: Side, price: Ticks, qty: Quantity) -> Outcome {
+        // One account throughout: these test the book, not who owns what.
+        const WHO: bx_protocol::AccountId = 1;
         let mut out = Outcome::default();
         book.submit_into(
             &mut out,
-            order,
+            (WHO, order),
             side,
             price,
             qty,
@@ -927,14 +956,16 @@ mod tests {
     }
 
     fn cancel(book: &mut Book, order: OrderId) -> Outcome {
+        const WHO: bx_protocol::AccountId = 1;
         let mut out = Outcome::default();
-        book.cancel_into(&mut out, order);
+        book.cancel_into(&mut out, (WHO, order));
         out
     }
 
     fn amend(book: &mut Book, order: OrderId, quantity: Quantity) -> Outcome {
+        const WHO: bx_protocol::AccountId = 1;
         let mut out = Outcome::default();
-        book.amend_down_into(&mut out, order, quantity);
+        book.amend_down_into(&mut out, (WHO, order), quantity);
         out
     }
 
@@ -1100,7 +1131,7 @@ mod tests {
         let mut outcome = Outcome::default();
         book.submit_into(
             &mut outcome,
-            9,
+            (1, 9),
             Side::Bid,
             0,
             5,
@@ -1128,7 +1159,7 @@ mod tests {
         let mut outcome = Outcome::default();
         book.submit_into(
             &mut outcome,
-            9,
+            (1, 9),
             Side::Bid,
             0,
             8,

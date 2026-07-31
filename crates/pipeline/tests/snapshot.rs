@@ -132,11 +132,14 @@ fn a_snapshot_preserves_queue_priority_not_merely_depth() {
 
     // The real test of priority: a taker must hit 101 first.
     let mut taker = market_order(4, SYMBOL, 201, Side::Bid, 5);
+    // The taker's own fills. Both sides of a trade are told now, so filtering
+    // on the kind alone collects the maker's copy as well and reads its
+    // counterparty -- the taker -- as though it were another maker hit.
     let fills: Vec<u64> = restored
         .submit(&mut taker)
         .unwrap()
         .iter()
-        .filter(|e| e.kind == EventKind::Filled as u8)
+        .filter(|e| e.kind == EventKind::Filled as u8 && e.account == 4)
         .map(|e| e.counterparty_order_id)
         .collect();
     assert_eq!(fills, vec![101], "the restored queue filled out of order");
