@@ -230,6 +230,17 @@ from 30.5 to 23.3 µs and throughput from 1.97M to 2.53M. The same three
 mechanisms the venue's own loop uses, which is where they should have been
 copied from in the first place.
 
+**Woken, not polled.** The feed thread waits on its sockets, and the handoff is
+not a socket — so a group handed over in a quiet moment sat there until that wait
+timed out. Measured: **61.7 ms** of market-data latency on a venue that answers
+orders in tens of microseconds. The venue now rings a `mio::Waker` when it fills
+the seam, at most once per 50 µs. The cap is what makes it free — warm, with the
+same 1,024 subscribers, **3,888,577/sec with the wake against 3,959,737
+without**, inside the spread of repeated runs of either build. The first run
+against a fresh venue is worth discarding: it lands near 1.5M while the process
+warms, which is the number a single-shot benchmark reports and the reason this
+one is a median of three.
+
 ### One packet, however many are listening
 
 TCP fan-out still costs a copy and a write per subscriber — cheap now that it is

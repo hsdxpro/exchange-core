@@ -519,3 +519,42 @@ fn a_client_joining_mid_stream_is_given_the_book_before_the_increments() {
         "the increments after the snapshot did not arrive: {after:?}"
     );
 }
+
+#[test]
+fn market_data_does_not_wait_out_the_feeds_idle_timer() {
+    // The feed waits on sockets, and the venue has no socket here to make
+    // readable -- so a batch handed over in a quiet moment used to sit until
+    // that wait timed out. Two hundred microseconds of market-data latency on a
+    // venue that measures order entry in tens, and invisible in every test,
+    // because every test allows seconds.
+    //
+    // The venue wakes the thread instead. This measures that: the idle timer is
+    // long now precisely because nothing depends on it, so an event that waits
+    // for it would take tens of milliseconds rather than a fraction of one.
+    let venue = Running::start();
+    let mut watcher = Running::connect(&venue.feed);
+    send(&mut watcher, &[subscribe(0, SYMBOL, ChannelKind::Trades)]);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut worst = Duration::ZERO;
+    for id in 0..5_u64 {
+        let started = Instant::now();
+        trade(&venue, 200 + id * 2, 201 + id * 2);
+        let seen = collect_until(&mut watcher, Duration::from_secs(5), |seen| {
+            seen.iter().any(|e| e.kind == EventKind::Trade as u8)
+        });
+        assert!(
+            seen.iter().any(|e| e.kind == EventKind::Trade as u8),
+            "a trade never arrived at all"
+        );
+        worst = worst.max(started.elapsed());
+    }
+    // Generous against the idle timer and still far below it: the trade itself
+    // costs two round trips to the order port, so this is not a latency figure,
+    // only proof that nothing is waiting on a timeout.
+    assert!(
+        worst < Duration::from_millis(25),
+        "market data took {worst:?}, which is the feed sleeping through it \
+         rather than being woken"
+    );
+}

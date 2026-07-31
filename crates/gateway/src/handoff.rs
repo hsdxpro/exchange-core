@@ -21,7 +21,9 @@
 
 use bx_protocol::Event;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Batches in flight before the venue starts dropping.
 ///
@@ -33,6 +35,25 @@ const IN_FLIGHT: usize = 64;
 
 /// Events a batch is sized for before it has to grow.
 const PER_BATCH: usize = 4 * 1024;
+
+/// How often the seam is allowed to ring the bell.
+///
+/// Waking is a syscall, and the flag alone does not stop it being paid on every
+/// pass: the far side drains fast, so it is back asleep before the next group
+/// arrives, and each group finds a sleeper. Capping the rate bounds that to
+/// twenty thousand a second however hard the venue is driven.
+///
+/// It costs nothing to bound. Warm, with a thousand subscribers, the venue runs
+/// 3,888,577 orders/sec with this wake and 3,959,737 with no wake at all, which
+/// is inside the spread of repeated runs of either build. What it buys is market
+/// data that arrives when the trade prints rather than when a timer expires --
+/// 61.7 milliseconds, measured, before this existed.
+///
+/// A quiet venue still wakes the feed on the first trade, because the last wake
+/// is long past. A busy one does not need telling more often than this: the next
+/// group is already on its way. Only the last group of a burst can be suppressed
+/// and then find nothing behind it, and the feed's idle timer bounds that.
+const WAKE_EVERY: Duration = Duration::from_micros(50);
 
 #[derive(Debug, Default)]
 struct Shared {
@@ -53,7 +74,33 @@ struct Shared {
 #[derive(Clone, Debug)]
 pub struct Handoff {
     shared: Arc<Mutex<Shared>>,
+    /// How the far side is told there is something to take.
+    ///
+    /// Without it the consumer can only find out by looking, and a consumer
+    /// that waits on sockets looks when a socket does something -- so a batch
+    /// handed over in a quiet moment sat until that wait timed out. Two hundred
+    /// microseconds of market-data latency, on a venue that measures order
+    /// entry in tens. The same argument as telling a maker its order filled
+    /// rather than making it ask.
+    /// Shared across clones, and set by whichever clone the consumer holds.
+    /// The venue's copy is made before the consumer exists, so a waker stored
+    /// in one clone and not the others would be a waker nobody ever rings.
+    wake: Arc<std::sync::OnceLock<Waker>>,
+    /// Whether the far side is already awake and on its way to the queue.
+    ///
+    /// The wake is a syscall, and one per group would be paid on the thread
+    /// that sequences orders. A consumer that is already draining does not need
+    /// telling twice, so the flag turns a wake per group into a wake per idle
+    /// period.
+    awake: Arc<AtomicBool>,
+    /// When the seam started, so a wake can be timed without a shared clock.
+    started: Instant,
+    /// Nanoseconds since `started` at the last wake, for [`WAKE_EVERY`].
+    last_wake: Arc<AtomicU64>,
 }
+
+/// What the far side registers to be woken through.
+pub use mio::Waker;
 
 impl Default for Handoff {
     fn default() -> Self {
@@ -75,7 +122,32 @@ impl Handoff {
                 dropped: 0,
                 events_dropped: 0,
             })),
+            wake: Arc::new(std::sync::OnceLock::new()),
+            awake: Arc::new(AtomicBool::new(false)),
+            started: Instant::now(),
+            last_wake: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Gives the seam a way to wake whoever drains it.
+    ///
+    /// Called by the consumer once, with a waker registered on its own poll.
+    pub fn wakes(&self, waker: Waker) {
+        let _ = self.wake.set(waker);
+    }
+
+    /// Marks the far side as about to sleep, so the next offer wakes it.
+    ///
+    /// Called by the consumer immediately before it waits. Anything offered
+    /// between this and the wait still wakes it, because the flag is cleared
+    /// first and the offer that follows sees a sleeper.
+    pub fn about_to_wait(&self) {
+        self.awake.store(false, Ordering::Release);
+    }
+
+    /// Marks the far side as running, so offers stop paying for a syscall.
+    pub fn awake(&self) {
+        self.awake.store(true, Ordering::Release);
     }
 
     /// Hands over one pass's events. Returns whether they were taken.
@@ -101,7 +173,47 @@ impl Handoff {
         batch.clear();
         batch.extend_from_slice(events);
         shared.filled.push_back(batch);
+        drop(shared);
+        // Outside the lock, and only when the far side is not already on its
+        // way: a consumer mid-drain will see this batch without being told.
+        if !self.awake.load(Ordering::Acquire)
+            && let Some(waker) = self.wake.get()
+        {
+            let now = self.started.elapsed().as_nanos() as u64;
+            let last = self.last_wake.load(Ordering::Relaxed);
+            // Reading the clock is tens of nanoseconds against a syscall's
+            // thousands, and the exchange only settles the newer time when it
+            // is the thread that will actually ring.
+            if now.saturating_sub(last) >= WAKE_EVERY.as_nanos() as u64
+                && self
+                    .last_wake
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let _ = waker.wake();
+            }
+        }
         true
+    }
+
+    /// Whether anything is waiting to be taken.
+    ///
+    /// Checked by the consumer after [`Self::about_to_wait`] and before it
+    /// waits, which is what closes the window between the two: a batch offered
+    /// while the flag still said awake was never rung for, and the drain that
+    /// would have found it has already been and gone. Either this sees it, or
+    /// the offer happens after the flag is clear and rings.
+    ///
+    /// The lock is what makes that airtight rather than nearly so. Two threads
+    /// each writing one flag and reading the other is the store-buffer shape,
+    /// which acquire and release alone do not settle. Taking the mutex here puts
+    /// this check and the offer's push into one order: either the push came
+    /// first and is seen, or this came first, and then clearing the flag
+    /// happened before the offer's read of it and the offer rings.
+    pub fn pending(&self) -> bool {
+        self.shared
+            .lock()
+            .is_ok_and(|shared| !shared.filled.is_empty())
     }
 
     /// Takes everything waiting, oldest first. Empty when there is nothing.
@@ -161,6 +273,35 @@ mod tests {
         assert_eq!(
             taken[0][2].sequence, 2,
             "events were reordered inside a batch"
+        );
+    }
+
+    #[test]
+    fn a_batch_offered_while_the_consumer_looked_awake_is_still_found() {
+        let handoff = Handoff::new();
+        // The consumer's last drain has been and gone, and it has not yet said
+        // it is about to wait -- so this offer sees an awake consumer and does
+        // not ring. Without the check after the flag, this batch waits out the
+        // idle timer on a thread that had already stopped looking.
+        handoff.awake();
+        assert!(handoff.offer(&events(1)));
+        handoff.about_to_wait();
+        assert!(
+            handoff.pending(),
+            "a batch offered in the window between the drain and the wait was \
+             neither rung for nor seen, so it sits until the timer expires"
+        );
+    }
+
+    #[test]
+    fn a_drained_seam_lets_the_consumer_sleep() {
+        let handoff = Handoff::new();
+        handoff.offer(&events(1));
+        drop(drain(&handoff));
+        handoff.about_to_wait();
+        assert!(
+            !handoff.pending(),
+            "an empty seam reported work, which turns every wait into a spin"
         );
     }
 

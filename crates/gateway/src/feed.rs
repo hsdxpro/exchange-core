@@ -48,15 +48,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-/// The listener's token. Subscribers take `index + 1`.
+/// The listener's token. Subscribers take `index + 2`.
 const LISTENER: Token = Token(0);
 
-/// How long a pass waits for something to happen when nothing has.
+/// How the venue tells this thread there is a batch waiting.
+const WAKE: Token = Token(1);
+
+/// How long a pass waits when nothing at all is happening.
 ///
-/// A market-data thread is not a matching thread: it may sleep. Busy-polling
-/// here would take a core away from the venue to answer a feed that measures
-/// its deadlines in microseconds rather than nanoseconds.
-const IDLE: Duration = Duration::from_micros(200);
+/// A backstop rather than the mechanism: the venue wakes this thread the moment
+/// it has a batch, so market data does not wait on this timer. What is left for
+/// the timer is the batch the venue chose not to ring for, having already rung
+/// within its rate limit -- the last group of a burst, arriving just before the
+/// venue goes quiet. That is the only case this bounds, and a millisecond bounds
+/// it while still leaving an idle thread asleep for all but a thousandth of a
+/// second at a time.
+const IDLE: Duration = Duration::from_millis(1);
 
 /// Records a subscriber may send in one pass. Subscriptions, not orders: a
 /// client with more than this to say is not subscribing.
@@ -206,6 +213,10 @@ impl Feed {
         let poll = Poll::new()?;
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
+        // The venue has no socket here to make readable, so it needs a way to
+        // interrupt the wait. Without one a batch handed over in a quiet moment
+        // waits out the timeout below before anybody looks at it.
+        handoff.wakes(mio::Waker::new(poll.registry(), WAKE)?);
 
         let stop = Arc::new(AtomicBool::new(false));
         let counts = Arc::new(Counts::default());
@@ -374,15 +385,29 @@ struct State {
 impl State {
     /// One pass: take what the venue published, accept, read requests, write.
     fn pass(&mut self) {
-        // Waiting here rather than spinning, and the timeout is what bounds how
-        // long a batch sits when no socket is doing anything.
-        if self.poll.poll(&mut self.events, Some(IDLE)).is_ok() {
+        // Waiting here rather than spinning: a market-data thread is not a
+        // matching thread, and busy-polling would take a core off the venue.
+        // Said before waiting, so a batch offered in the gap rings the bell
+        // rather than being noticed a timeout later.
+        self.handoff.about_to_wait();
+        // And read after saying it, because a batch offered while this thread
+        // still looked awake was not rung for and the drain that would have
+        // caught it is already past. Ordering the check after the flag means
+        // one of the two always fires.
+        let wait = if self.handoff.pending() {
+            Duration::ZERO
+        } else {
+            IDLE
+        };
+        let polled = self.poll.poll(&mut self.events, Some(wait));
+        self.handoff.awake();
+        if polled.is_ok() {
             let ready: Vec<Token> = self.events.iter().map(mio::event::Event::token).collect();
             for token in ready {
                 if token == LISTENER {
                     self.accept();
-                } else {
-                    self.read_requests(token.0 - 1);
+                } else if token != WAKE {
+                    self.read_requests(token.0 - 2);
                 }
             }
         }
@@ -396,7 +421,7 @@ impl State {
             if self
                 .poll
                 .registry()
-                .register(&mut stream, Token(index + 1), Interest::READABLE)
+                .register(&mut stream, Token(index + 2), Interest::READABLE)
                 .is_err()
             {
                 self.free.push(index);
