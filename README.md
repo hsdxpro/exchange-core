@@ -18,8 +18,7 @@
   <a href="#quick-start">Quick start</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#design-decisions">Design decisions</a> &middot;
-  <a href="#testing">Testing</a> &middot;
-  <a href="#not-included">Not included</a>
+  <a href="#testing">Testing</a>
 </p>
 
 <p align="center">
@@ -193,22 +192,6 @@ two constraints learned by getting them wrong.
   (`gateway/tests/failover.rs`).
 - **Real-socket admission, subscription, idle-cost and churn suites** in
   `gateway/tests/`.
-
-## Not included
-
-Scope boundaries, with reasons rather than apologies:
-
-- **Cross-partition balances — allotments, not a lookup.** Symbols partition
-  across processes; value moves between them as a `Withdraw` sequenced in one
-  journal and a `Deposit` in the other — that order deliberately, since a crash
-  between the two strands funds where crediting first would mint them. The
-  primitives and the conservation property are built; the settlement process
-  that drives the pair is not.
-- **`io_uring`.** Linux-only, and untested platform-specific I/O is worse than
-  none. Batching writes recovered 8.6× without leaving `std`.
-- **Client withdrawals and fees.** Venue features, not exchange-core ones.
-  `Withdraw` is administrative — a client cannot send one for itself, any more
-  than it can fund itself. Halts *are* here.
 
 ## Related
 
