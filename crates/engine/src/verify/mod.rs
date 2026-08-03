@@ -294,8 +294,9 @@ macro_rules! register_checks {
                 names.dedup();
                 assert_eq!(names.len(), total, "duplicate check name registered");
                 assert_eq!(
-                    total, 43,
-                    "expected the 42 ported C++ groups plus the Rust-only API-surface group"
+                    total, 45,
+                    "expected the 42 ported C++ groups, the Rust-only API-surface group, \
+                     and the two windowed-ladder growth groups"
                 );
             }
         }
@@ -342,9 +343,11 @@ register_checks! {
     l3::aggregate_quantity_uses_64_bits, "L3", "64-bit aggregate level quantity";
     l3::level_iteration_and_order_lookup, "L3", "level iteration and direct order lookup";
     l3::sparse_1000_level_sweep, "L3", "sparse 1000-level matching sweep";
+    l3::window_growth_preserves_queues_and_priority, "L3", "window growth preserves queues, priority, and the hash";
 
     differential::randomized_differential_large_capacity, "differential", "randomized differential model: large capacity";
-    differential::randomized_differential_capacity_pressure, "differential", "randomized differential model: capacity pressure";
+    differential::randomized_differential_capacity_pressure, "differential", "randomized differential model: growth under pool pressure";
+    differential::randomized_differential_wide_prices, "differential", "randomized differential model: 31-bit price domain";
     differential::exhaustive_fifo_quantities_and_tif, "differential", "exhaustive FIFO quantities across all TIF modes";
     differential::deterministic_replay_is_reproducible, "differential", "deterministic replay reproducibility";
 

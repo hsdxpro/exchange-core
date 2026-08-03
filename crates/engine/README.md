@@ -3,9 +3,12 @@
 A single-instrument order book, aggregated by price (MBP/L2) and by order (MBO/L3),
 with a price-time FIFO matching engine. Safe, dependency-free Rust.
 
-One design throughout: a fixed 65,536-tick ladder with a three-tier occupancy bitmap.
-Empty prices are never scanned, so traversal cost tracks how many levels are *occupied*,
-not how far apart they sit.
+One design throughout: a three-tier occupancy bitmap over a windowed ladder. The L3
+price domain is 31 bits; the window covers the slice where prices actually rest, boots
+65,536 ticks wide, and grows toward any price that rests outside it — re-anchored for
+free while the book is empty, extended or shifted geometrically while it is not. Empty
+prices are never scanned, so traversal cost tracks how many levels are *occupied*, not
+how far apart they sit.
 
 The library is `#![forbid(unsafe_code)]` and has no third-party crates. It allocates
 nothing after construction.
@@ -29,8 +32,8 @@ Rust 1.97.1 release build, Windows 11 desktop, no CPU pinning, minimum of three 
 | L3 sweep 1,000 sparse levels | 21.90 µs | **21.90 ns/fill** |
 | Mixed order-entry stream | 35.99 ns | 35.99 ns/message |
 
-Read the **per item** column. Walking 1,000 levels spread across the full 65,536-tick
-domain costs 4.90 ns each, against 4.30 ns for 10 adjacent levels. Spreading the book out
+Read the **per item** column. Walking 1,000 levels spread across the 65,536-tick
+boot window costs 4.90 ns each, against 4.30 ns for 10 adjacent levels. Spreading the book out
 costs almost nothing, which is what the bitmap buys. Matching behaves the same way: one
 fill costs 19.63 ns, 64 fills cost 11.77 ns each.
 
@@ -101,7 +104,7 @@ fails.
 
 The randomized groups are differential tests. The engine is compared against reference
 models built from completely different primitives: `BTreeMap` plus plain FIFO vectors,
-against the engine's bitmap ladder over a fixed slot arena. Agreement is therefore
+against the engine's bitmap ladder over a growable slot arena. Agreement is therefore
 evidence that both are right; it does not define what right means. Every operation
 compares reject reason, fill sequence, queue order, BBO, level aggregates, state hash and
 free-list integrity exactly.

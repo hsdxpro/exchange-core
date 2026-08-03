@@ -225,10 +225,16 @@ Each of these was settled against a specific alternative, noted below.
   question than "shard the matching thread". Pretending a thread pool answers it
   would be the wrong kind of progress.
 
-- **Windowed ladder with re-centring — deleted.** It solved a memory problem
-  that does not exist: 1000 symbols is ~2 GB of level tables on a machine with
-  256 GB+. An invented crisis with an invented 4,096 constant and a re-centring
-  mechanism to cover for it. The engine is unchanged.
+- **Windowed ladder with re-centring — deleted, then returned for a different
+  reason.** The first draft windowed the ladder to cut memory, a problem that
+  does not exist (1000 symbols is ~2 GB of level tables), and was deleted.
+  The window that ships solves *range*: the price domain is 31 bits per
+  instrument instead of a fixed 65,536 ticks, and the level tables cover the
+  slice where prices rest — boot at the old 2 MiB, re-anchor free on an empty
+  book, extend upward without a rebuild, shift downward one copy per
+  doubling. Slots store absolute prices so growth moves no order, and a book
+  that stays inside the boot window hashes identically to the fixed ladder —
+  the golden replay's state hash did not move when this landed.
 - **Aeron** — mature and the right answer for reliable UDP in trading, but Rust
   access is a third-party wrapper over the C API plus a separate media driver
   process. Too heavy. Revisit only if the custom transport becomes the
@@ -330,20 +336,21 @@ for the reasons above; nothing here should read as shipped until it is.
   venue-assigned, so numbering them densely from zero costs nothing;
   `MAX_SYMBOL` makes that a refusal instead of a kill.
 - **Price levels and order slots are different things and must not share a
-  number.** The book has 65,536 *price levels* because that is the bitmap
-  ladder, and that is the design. It separately needs a pool of *resting order
-  slots*, because the engine addresses orders by dense index to keep insert and
-  cancel O(1) with no allocation. That pool used to be a `DEFAULT_BOOK_CAPACITY`
-  of 65,535 sitting in `lib.rs` — a magic number that, by coinciding with the
-  ladder size, read as though the book could only hold 65,535 prices. It is now
-  `Instrument::max_open_orders`, declared per instrument. A benchmark had
-  already saturated it silently, so every order past the limit was being
-  rejected and the measurement was meaningless. Proving there is no per-level
-  limit then turned up a second bug: the slot allocator returned `None` for
-  both a duplicate order ID and an exhausted pool, and the caller reported both
-  as `DuplicateOrderId`. A full venue therefore told every client "order ID is
-  already live", which a client answers by retrying with a fresh ID forever.
-  `OrderLimitReached` existed and was never emitted.
+  number.** The book boots with 65,536 *price levels* (the window) and
+  separately needs a pool of *resting order slots*, because the engine
+  addresses orders by dense index to keep insert and cancel O(1). That pool
+  used to be a `DEFAULT_BOOK_CAPACITY` of 65,535 sitting in `lib.rs` — a
+  magic number that, by coinciding with the ladder size, read as though the
+  book could only hold 65,535 prices. It became `Instrument::max_open_orders`
+  and is now a boot size: the pool grows on demand, so the number an operator
+  writes decides the allocation the venue starts with, never what it can
+  hold. A benchmark had already saturated the old cap silently, so every
+  order past the limit was being rejected and the measurement was
+  meaningless. Proving there is no per-level limit then turned up a second
+  bug: the slot allocator returned `None` for both a duplicate order ID and
+  an exhausted pool, and the caller reported both as `DuplicateOrderId` —
+  `OrderLimitReached` existed and was never emitted. Growth retires that
+  refusal below the `u32` index space entirely.
 - **An instrument's ladder range IS its price band.** The memory bound and the
   fat-finger control are the same mechanism. Implemented in
   `instrument.rs::to_slot`.

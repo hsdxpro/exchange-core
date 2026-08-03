@@ -150,10 +150,13 @@ commands/sec and the target is 60 seconds, snapshot every 300M commands.
 
 ## 4. Memory
 
-**The engine is unchanged.** An earlier draft proposed a windowed ladder to cut memory. The
-arithmetic does not support it: 1000 symbols is about 2 GB of level tables, on a machine
-with 256 GB or more. That is under 1% of the box. Ten thousand symbols is 20 GB, still
-unremarkable. There was no memory problem to solve.
+**The ladder is windowed for range, not for memory.** An earlier draft proposed a windowed
+ladder to cut memory and was rightly deleted — 1000 symbols at the boot window is about
+2 GB of level tables on a machine with 256 GB, no problem to solve. The window that ships
+exists for a different reason: the price *domain* is 31 bits per instrument rather than a
+fixed 65,536 ticks, so a fine-tick listing is not boxed into a sliver of its price space.
+Books still boot at the old 2 MiB and grow only toward prices that actually rest; a
+default-band instrument never grows at all.
 
 What is worth doing:
 
@@ -161,7 +164,10 @@ What is worth doing:
   option, not a redesign.
 - **One order-slot arena per partition**, shared across the symbols it lists, rather than a
   fixed per-book allocation. Total concurrent orders is the real bound, not orders × symbols.
-- **Hard caps** on orders per account and per symbol, sized at startup.
+- **Boot sizes, not caps**: the slot pool and the price window are sized at startup and
+  grow on demand — a venue does not refuse a customer's order because a number chosen at
+  boot turned out small. What bounds memory is policy an operator states: the instrument
+  band (the window's worst case) and the feed-memory budget.
 - **Fixed-size ring buffers** for subscriber replay. They overwrite; they never grow.
 
 No unbounded queue anywhere. Every backpressure path either blocks the producer or drops
@@ -187,9 +193,10 @@ Applied at the risk stage, before matching, in this order:
    never got an answer for without risking a second execution.
 7. Sufficient free balance; reserve it.
 8. Order is inside the price band, checked in the book adapter as the price maps onto the
-   ladder — the instrument's ladder range *is* the band, so the memory bound and the
-   fat-finger control are one mechanism rather than two.
-9. Order count under the instrument's `max_open_orders` cap.
+   ladder — the instrument's band *is* the window's worst-case bound, so the fat-finger
+   control and the memory statement are one mechanism rather than two.
+9. A slot allocates. The pool grows on demand, so this refuses only at the `u32` index
+   space — `max_open_orders` sizes the boot allocation, not a ceiling.
 
 **Every restriction stops new risk and none of them stops reducing it.** A halted symbol
 and a stopped account both still accept cancels and amends down. A venue that will not let

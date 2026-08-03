@@ -63,6 +63,8 @@ fn randomized_model_for_seed(
     capacity: usize,
     order_id_capacity: usize,
     operation_count: usize,
+    price_base: u32,
+    price_mask: u32,
 ) -> CheckResult {
     let mut fast = L3Book::new(capacity, order_id_capacity);
     let mut reference = ReferenceL3::new(capacity, order_id_capacity);
@@ -78,7 +80,7 @@ fn randomized_model_for_seed(
         } else {
             Side::Ask
         };
-        let price = (random >> 24) as u16;
+        let price = price_base + (((random >> 24) as u32) & price_mask);
         let quantity = random_quantity(random);
 
         if action < 22 {
@@ -150,7 +152,7 @@ pub fn randomized_differential_large_capacity(workload: Workload) -> CheckResult
         0xc001_d00d_5eed_1234,
     ];
     for seed in SEEDS {
-        randomized_model_for_seed(seed, 4_096, 8_192, workload.scale(250_000))?;
+        randomized_model_for_seed(seed, 4_096, 8_192, workload.scale(250_000), 0, 0xffff)?;
     }
     Ok(())
 }
@@ -159,8 +161,37 @@ pub fn randomized_differential_capacity_pressure(workload: Workload) -> CheckRes
     const CONFIGURATIONS: [(usize, usize); 5] = [(0, 8), (1, 8), (2, 16), (7, 32), (31, 128)];
     let mut seed = 0x5a17_cafe_1234_9001;
     for (capacity, id_capacity) in CONFIGURATIONS {
-        randomized_model_for_seed(seed, capacity, id_capacity, workload.scale(120_000))?;
+        randomized_model_for_seed(
+            seed,
+            capacity,
+            id_capacity,
+            workload.scale(120_000),
+            0,
+            0xffff,
+        )?;
         seed = mix64(seed);
+    }
+    Ok(())
+}
+
+/// The same engine-versus-model differential over the whole 31-bit price
+/// domain: every operation can land anywhere, so the window re-anchors,
+/// extends and shifts constantly while the model — an ordered map with no
+/// window at all — arbitrates every outcome, hash and queue.
+pub fn randomized_differential_wide_prices(workload: Workload) -> CheckResult {
+    // A window is dense between the lowest and highest resting price, so a
+    // caller feeding uniformly random 31-bit prices would grow it to the
+    // whole domain -- 64 GiB of level tables. That is the documented worst
+    // case the venue's instrument band exists to bound, not a behaviour to
+    // exercise here. These domains are wide slices placed far from zero --
+    // one mid-domain, one against the top edge, where growth must clamp.
+    const SPAN_MASK: u32 = (1 << 21) - 1;
+    const DOMAINS: [(u64, u32); 2] = [
+        (0x77aa_1290_beef_4411, 1 << 30),
+        (0x1b2d_9c44_a0e6_f00d, crate::PRICE_LIMIT - (1 << 22)),
+    ];
+    for (seed, base) in DOMAINS {
+        randomized_model_for_seed(seed, 1_024, 4_096, workload.scale(120_000), base, SPAN_MASK)?;
     }
     Ok(())
 }
@@ -241,7 +272,7 @@ fn deterministic_replay(
         } else {
             Side::Ask
         };
-        let price = (random >> 24) as u16;
+        let price = u32::from((random >> 24) as u16);
         let quantity = 1 + ((random >> 40) % 100) as u32;
 
         let result_hash = match random % 4 {
@@ -283,8 +314,13 @@ fn reject_code(result: Result<(), crate::OrderError>) -> u64 {
 /// into a regression detector: any unintended change to matching, rejection
 /// codes, or book state moves these numbers. Update them only alongside a
 /// deliberate, reviewed behavior change.
+///
+/// Last such change: the slot pool grows on demand, so the commands this
+/// stream once bounced off the 256-slot boot pool now rest. The stream and
+/// the hash formula are unchanged -- the outcomes moved, 201 live orders
+/// either way.
 const REPLAY_GOLDEN: ReplaySummary = ReplaySummary {
-    command_hash: 0x2a51_914c_9685_e43e,
+    command_hash: 0xb902_3479_02cd_0c28,
     state_hash: 0xfbcc_a825_7a5a_5188,
     live_orders: 201,
 };

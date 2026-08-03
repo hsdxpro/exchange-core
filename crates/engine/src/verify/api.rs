@@ -5,6 +5,7 @@
 //! benchmark and would otherwise ship with no test at all.
 
 use super::{CheckResult, Workload, require};
+use crate::PRICE_COUNT;
 use crate::{
     ConfigurationError, ExecutionReport, HierarchicalBitmap, L2Book, NO_ASK, NO_BID, OrderError,
     Side, SweepResult, TimeInForce,
@@ -39,7 +40,7 @@ pub fn public_api_surface(_workload: Workload) -> CheckResult {
     require!(!ConfigurationError.to_string().is_empty());
 
     // `Default` must agree with `new` rather than deriving a zeroed state.
-    require!(HierarchicalBitmap::default().is_empty());
+    require!(HierarchicalBitmap::new(PRICE_COUNT).is_empty());
     require!(L2Book::default().best_bid() == NO_BID);
     require!(L2Book::default().best_ask() == NO_ASK);
 

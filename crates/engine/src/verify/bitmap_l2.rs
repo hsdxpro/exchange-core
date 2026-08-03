@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::ops::Bound;
 
 pub fn bitmap_empty_and_idempotence(_workload: Workload) -> CheckResult {
-    let mut bitmap = HierarchicalBitmap::new();
+    let mut bitmap = HierarchicalBitmap::new(PRICE_COUNT);
     require!(bitmap.is_empty());
     require!(bitmap.first() == NO_ASK);
     require!(bitmap.last() == NO_BID);
@@ -31,9 +31,9 @@ pub fn bitmap_empty_and_idempotence(_workload: Workload) -> CheckResult {
 }
 
 pub fn bitmap_all_singletons(_workload: Workload) -> CheckResult {
-    let mut bitmap = HierarchicalBitmap::new();
+    let mut bitmap = HierarchicalBitmap::new(PRICE_COUNT);
     for value in 0..PRICE_COUNT {
-        let price = value as u16;
+        let price = value as u32;
         bitmap.insert(price);
         require!(bitmap.contains(price), price);
         require!(bitmap.first() == value as i32, price);
@@ -48,10 +48,10 @@ pub fn bitmap_all_singletons(_workload: Workload) -> CheckResult {
 }
 
 pub fn bitmap_hierarchy_boundaries(_workload: Workload) -> CheckResult {
-    const PRICES: [u16; 14] = [
+    const PRICES: [u32; 14] = [
         0, 1, 62, 63, 64, 65, 4_094, 4_095, 4_096, 4_097, 65_470, 65_471, 65_534, 65_535,
     ];
-    let mut bitmap = HierarchicalBitmap::new();
+    let mut bitmap = HierarchicalBitmap::new(PRICE_COUNT);
     for &price in &PRICES {
         bitmap.insert(price);
     }
@@ -63,12 +63,12 @@ pub fn bitmap_hierarchy_boundaries(_workload: Workload) -> CheckResult {
         let expected_previous = if index == 0 {
             NO_BID
         } else {
-            i32::from(PRICES[index - 1])
+            PRICES[index - 1] as i32
         };
         let expected_next = if index + 1 == PRICES.len() {
             NO_ASK
         } else {
-            i32::from(PRICES[index + 1])
+            PRICES[index + 1] as i32
         };
         require!(bitmap.previous(price) == expected_previous, price);
         require!(bitmap.next(price) == expected_next, price);
@@ -83,16 +83,16 @@ pub fn bitmap_hierarchy_boundaries(_workload: Workload) -> CheckResult {
 }
 
 pub fn bitmap_full_domain_and_queries(_workload: Workload) -> CheckResult {
-    let mut bitmap = HierarchicalBitmap::new();
+    let mut bitmap = HierarchicalBitmap::new(PRICE_COUNT);
     for value in 0..PRICE_COUNT {
-        bitmap.insert(value as u16);
+        bitmap.insert(value as u32);
     }
     require!(bitmap.validate());
     require!(bitmap.first() == 0);
     require!(bitmap.last() == 65_535);
 
     for value in 0..PRICE_COUNT {
-        let price = value as u16;
+        let price = value as u32;
         let expected_previous = if value == 0 { NO_BID } else { value as i32 - 1 };
         let expected_next = if value == 65_535 {
             NO_ASK
@@ -104,7 +104,7 @@ pub fn bitmap_full_domain_and_queries(_workload: Workload) -> CheckResult {
     }
 
     for value in (0..PRICE_COUNT).step_by(2) {
-        bitmap.remove(value as u16);
+        bitmap.remove(value as u32);
     }
     require!(bitmap.validate());
     require!(bitmap.first() == 1);
@@ -113,7 +113,7 @@ pub fn bitmap_full_domain_and_queries(_workload: Workload) -> CheckResult {
 }
 
 pub fn bitmap_random_differential(workload: Workload) -> CheckResult {
-    let mut bitmap = HierarchicalBitmap::new();
+    let mut bitmap = HierarchicalBitmap::new(PRICE_COUNT);
     let mut reference = BTreeSet::new();
     let mut rng = Rng::new(0xa174_5f9c_ca62_7123);
 
@@ -121,10 +121,10 @@ pub fn bitmap_random_differential(workload: Workload) -> CheckResult {
         let random = rng.next_u64();
         let price = random as u16;
         if (random >> 16) & 1 == 0 {
-            bitmap.insert(price);
+            bitmap.insert(u32::from(price));
             reference.insert(price);
         } else {
-            bitmap.remove(price);
+            bitmap.remove(u32::from(price));
             reference.remove(&price);
         }
 
@@ -149,8 +149,11 @@ pub fn bitmap_random_differential(workload: Workload) -> CheckResult {
                 .range(..query)
                 .next_back()
                 .map_or(NO_BID, |&price| i32::from(price));
-            require!(bitmap.next(query) == expected_next, operation);
-            require!(bitmap.previous(query) == expected_previous, operation);
+            require!(bitmap.next(u32::from(query)) == expected_next, operation);
+            require!(
+                bitmap.previous(u32::from(query)) == expected_previous,
+                operation
+            );
         }
     }
     Ok(())

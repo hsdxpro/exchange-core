@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-475%20passing-success" alt="475 tests">
+  <img src="https://img.shields.io/badge/tests-478%20passing-success" alt="478 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -54,7 +54,7 @@ same `cargo x` on Linux and Windows — green locally and green on a runner
 cannot become two different things.
 
 ```bash
-cargo x           # format, clippy -D warnings, all 475 tests
+cargo x           # format, clippy -D warnings, all 478 tests
 cargo x latency   # reproduces BENCH.md's command-path and durability tables
 ```
 
@@ -136,7 +136,7 @@ rejected alternatives and the bugs that changed the design.
 |---|---|
 | **One unencrypted TCP transport**, TLS 1.3 as a second door | Nothing between a market maker and the book. QUIC was built and removed: 38.6 µs against TCP's 8.6 µs. Internet sessions get `tls_listen` (rustls, 1.3 only); past the record layer the doors are identical. |
 | **One thread, no async runtime** on the matching path | Matching is a sequential dependency: each order changes what the next sees. More cores = more partitions (processes), not threads. |
-| **The price ladder is the price band** | A book covers 65,536 ticks from its floor, so the memory bound and the fat-finger control are one mechanism. |
+| **The band is the price ladder's window bound** | An instrument's band is policy up to 2^31 ticks (`ceiling_ticks`); the book's level tables boot 65,536 ticks wide and grow to cover only the span where prices rest. One mechanism is still both the fat-finger control and the memory statement. |
 | **The journal is the only source of truth** | Everything else is derived; recovery is snapshot load + replay. |
 | **Nothing acknowledged before it is durable** | On a majority of replicas, not a platter — that is the 103× at group 1. |
 | **No secret exists to steal** | Ed25519 challenge: the venue holds public keys only; reading its config yields nothing signable. |
@@ -180,7 +180,7 @@ two constraints learned by getting them wrong.
 
 ## Testing
 
-475 tests. The ones worth reading are in the claims table above; the shape:
+478 tests. The ones worth reading are in the claims table above; the shape:
 
 - **End-to-end with nothing faked** — simulated traders through the real API, a
   subscriber that knows only the event stream rebuilds the book from deltas and

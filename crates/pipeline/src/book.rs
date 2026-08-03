@@ -15,7 +15,7 @@
 //! set, without touching the engine or paying for a full book scan.
 
 use crate::fastmap::FastMap;
-use crate::instrument::Instrument;
+use crate::instrument::{Instrument, MAX_OPEN_ORDERS_LIMIT};
 use bx_engine::{L3Book, OrderError, Side as ESide, TimeInForce as ETif};
 use bx_protocol::{AccountId, OrderId, Quantity, RejectReason, Side, Ticks, TimeInForce};
 
@@ -64,7 +64,7 @@ pub struct Outcome {
     /// Quantity that came to rest, if any.
     pub resting_quantity: Quantity,
     /// Prices this command could have moved. Scratch, reused across commands.
-    touched: Vec<(Side, u16)>,
+    touched: Vec<(Side, u32)>,
     /// Best occupied slot on each side before this command ran, or a negative
     /// value for an empty side.
     ///
@@ -99,7 +99,7 @@ impl Outcome {
         self.reject = Some(reason);
     }
 
-    fn touch(&mut self, side: Side, slot: u16) {
+    fn touch(&mut self, side: Side, slot: u32) {
         if !self.touched.contains(&(side, slot)) {
             self.touched.push((side, slot));
         }
@@ -146,10 +146,32 @@ impl SlotAllocator {
         if self.to_slot.contains_key(&order) {
             return Err(SlotError::Duplicate);
         }
-        let slot = self.free.pop().ok_or(SlotError::Exhausted)?;
+        if self.free.is_empty() && !self.grow() {
+            return Err(SlotError::Exhausted);
+        }
+        let slot = self.free.pop().expect("grown or non-empty");
         self.to_slot.insert(order, slot);
         self.to_order[slot as usize] = order;
         Ok(slot)
+    }
+
+    /// Doubles the dense-index space. Slots are indices, so nothing a live
+    /// order holds moves; refused only at the engine u32 ceiling, which is
+    /// arithmetic rather than configuration.
+    fn grow(&mut self) -> bool {
+        let was = self.capacity;
+        let want = was.max(32).saturating_mul(2).min(MAX_OPEN_ORDERS_LIMIT);
+        if want <= was {
+            return false;
+        }
+        self.to_order.resize(want as usize, (0, 0));
+        self.free.extend((was..want).rev());
+        self.capacity = want;
+        true
+    }
+
+    const fn capacity(&self) -> u32 {
+        self.capacity
     }
 
     fn slot_of(&self, order: OrderKey) -> Option<u32> {
@@ -226,14 +248,21 @@ impl Book {
         self.slots.live()
     }
 
+    /// Allocates a dense engine ID, widening the engine ID table in step
+    /// with the allocator: growth is driven from here, never by an ID the
+    /// engine is merely handed.
+    fn allocate_engine_id(&mut self, order: OrderKey) -> Result<u32, SlotError> {
+        let id = self.slots.allocate(order)?;
+        let capacity = self.slots.capacity() as usize;
+        if self.engine.order_id_capacity() < capacity {
+            self.engine.widen_order_ids(capacity);
+        }
+        Ok(id)
+    }
+
     #[must_use]
     pub fn best_bid(&self) -> Option<Ticks> {
-        // `try_from` is the whole bounds check: it rejects the -1 the engine
-        // reports for an empty side and anything above the ladder in one step,
-        // where `>= 0` plus a cast would have checked one end and truncated at
-        // the other.
-        let slot = u16::try_from(self.engine.best_bid()).ok()?;
-        Some(self.instrument.to_price(slot))
+        Some(self.instrument.to_price(self.engine.best_bid()?))
     }
 
     /// Aggregate quantity resting at a price.
@@ -365,7 +394,7 @@ impl Book {
         else {
             return false;
         };
-        let Ok(id) = self.slots.allocate(order) else {
+        let Ok(id) = self.allocate_engine_id(order) else {
             return false;
         };
         if self
@@ -410,9 +439,11 @@ impl Book {
 
         // A market order addresses the far end of the band, so the price-band
         // check applies to limit orders only.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let slot = if market {
             match side {
-                Side::Bid => u16::MAX,
+                // The band assert bounds this below 2^31, so it fits.
+                Side::Bid => (self.instrument.band_slots() - 1) as u32,
                 Side::Ask => 0,
             }
         } else {
@@ -425,7 +456,7 @@ impl Book {
             }
         };
 
-        let engine_order = match self.slots.allocate(order) {
+        let engine_order = match self.allocate_engine_id(order) {
             Ok(slot) => slot,
             Err(reason) => {
                 out.reject_with(reason.reject_reason());
@@ -480,19 +511,18 @@ impl Book {
                     let execution = &out.executions[index];
                     let engine_slot = u32::try_from(execution.resting_order).unwrap_or(0);
                     let client_order = self.slots.order_of(engine_slot);
-                    // Still a ladder slot here, not yet a wire price. The engine
-                    // addresses the ladder by u16 and every price reaching it
-                    // passed `to_slot`, so this is in range by construction --
-                    // see the assertion beside `LADDER_SLOTS`, which is what
-                    // keeps that true if the ladder is ever resized. Asserted
-                    // rather than trusted: a truncated slot books a wrong price
-                    // that looks entirely valid.
+                    // Still an engine price here, not yet a wire price. Every
+                    // price reaching the engine passed to_slot, so this is
+                    // inside the band by construction. Asserted rather than
+                    // trusted: a truncated price books a wrong fill that looks
+                    // entirely valid.
                     debug_assert!(
-                        u16::try_from(execution.price).is_ok(),
-                        "engine reported ladder slot {} outside the u16 ladder",
+                        execution.price >= 0 && execution.price < self.instrument.band_slots(),
+                        "engine reported price {} outside the instrument band",
                         execution.price
                     );
-                    let price = self.instrument.to_price(execution.price as u16);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let price = self.instrument.to_price(execution.price as u32);
                     out.executions[index].resting_account = client_order.0;
                     out.executions[index].resting_order = client_order.1;
                     out.executions[index].price = price;
@@ -586,7 +616,8 @@ impl Book {
         let mut best_touched = [false; 2];
         for index in 0..out.touched.len() {
             let (side, slot) = out.touched[index];
-            if i32::from(slot) == best[side as usize] {
+            #[allow(clippy::cast_possible_wrap)]
+            if slot as i32 == best[side as usize] {
                 best_touched[side as usize] = true;
             }
             out.level_changes.push(LevelChange {
@@ -612,13 +643,16 @@ impl Book {
         }
     }
 
-    /// Best occupied slot on one side, negative when the side is empty. Held by
-    /// the engine's bitmap rather than searched for, so this is a field read.
+    /// Best occupied engine price on one side, negative when the side is
+    /// empty. Held by the engine rather than searched for. Engine prices are
+    /// 31-bit, so the i32 sentinel form is lossless.
+    #[allow(clippy::cast_possible_wrap)]
     fn best_slot(&self, side: Side) -> i32 {
         match side {
             Side::Bid => self.engine.best_bid(),
             Side::Ask => self.engine.best_ask(),
         }
+        .map_or(-1, |price| price as i32)
     }
 
     /// Best price on one side and the quantity resting there, or `(0, 0)` when
@@ -633,7 +667,7 @@ impl Book {
     /// that asking for the quantity does not convert to a price and back.
     #[must_use]
     pub fn top(&self, side: Side) -> (Ticks, Quantity) {
-        let Ok(slot) = u16::try_from(self.best_slot(side)) else {
+        let Ok(slot) = u32::try_from(self.best_slot(side)) else {
             return (0, 0);
         };
         (
@@ -678,6 +712,9 @@ const fn map_error(error: OrderError) -> RejectReason {
         OrderError::OrderIdOutOfRange | OrderError::CapacityExceeded => {
             RejectReason::EngineCapacity
         }
+        // Unreachable from here: `to_slot` bounds every price below the
+        // engine's domain. Mapped to the band reason for totality.
+        OrderError::PriceOutOfDomain => RejectReason::OutsidePriceBand,
         OrderError::DuplicateOrderId => RejectReason::DuplicateOrderId,
         OrderError::UnknownOrderId => RejectReason::UnknownOrderId,
         OrderError::WouldCross => RejectReason::WouldCross,
@@ -932,23 +969,34 @@ mod tests {
     }
 
     #[test]
-    fn exhausting_the_pool_rejects_cleanly_and_a_cancel_frees_a_slot() {
+    fn a_full_boot_pool_grows_rather_than_refusing() {
+        // The boot pool is a sizing hint, not a ceiling: filling past it
+        // grows the pool, the allocator and the engine ID space in step, and
+        // nothing a live order holds moves. A cancel afterwards still frees
+        // its slot for reuse.
         let mut book = book();
         for order in 1..=u64::from(POOL) {
             rest(&mut book, order, Side::Bid, 1_500, 1);
         }
-        // One past the pool is refused, not a panic and not silent loss.
-        assert_eq!(
-            rest(&mut book, u64::from(POOL) + 1, Side::Bid, 1_500, 1).reject,
-            Some(RejectReason::OrderLimitReached)
+        assert!(
+            rest(&mut book, u64::from(POOL) + 1, Side::Bid, 1_500, 1)
+                .reject
+                .is_none(),
+            "the pool refused instead of growing"
         );
+        assert_eq!(book.live_orders(), POOL as usize + 1);
 
-        // Cancelling returns the slot, so the venue recovers by itself.
+        // Priority survives the growth: the first arrival is still first.
+        let first = book.resting_order((1, 1)).expect("order 1 must still rest");
+        assert_eq!(first.price, 1_500);
+
+        // Cancelling returns the slot, so the pool recycles before it grows
+        // again.
         let mut out = Outcome::default();
         book.cancel_into(&mut out, (1, 1));
         assert!(out.reject.is_none());
         assert!(
-            rest(&mut book, u64::from(POOL) + 1, Side::Bid, 1_500, 1)
+            rest(&mut book, u64::from(POOL) + 2, Side::Bid, 1_500, 1)
                 .reject
                 .is_none(),
             "a freed slot was not reused"

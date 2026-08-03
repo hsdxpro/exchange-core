@@ -20,7 +20,9 @@
 
 use crate::auth::{self, Credentials, Mode};
 use crate::limit::RateLimit;
-use bx_pipeline::instrument::{Instrument, Instruments, MAX_OPEN_ORDERS_LIMIT, MAX_SYMBOL};
+use bx_pipeline::instrument::{
+    Instrument, Instruments, MAX_BAND_SLOTS, MAX_OPEN_ORDERS_LIMIT, MAX_SYMBOL,
+};
 use bx_protocol::PUBLIC_KEY_LEN;
 use bx_protocol::{AccountId, Ticks};
 use std::fmt;
@@ -99,6 +101,7 @@ struct InstrumentDraft {
     base: Option<u32>,
     quote: Option<u32>,
     floor_ticks: Option<Ticks>,
+    ceiling_ticks: Option<Ticks>,
     max_quantity: Option<u64>,
     max_open_orders: Option<u32>,
 }
@@ -157,6 +160,36 @@ impl InstrumentDraft {
             return Err(ConfigError::at(
                 line,
                 format!("max_open_orders exceeds the engine's limit of {MAX_OPEN_ORDERS_LIMIT}"),
+            ));
+        }
+        // The band is policy and the worst-case level-table allocation both:
+        // the book is dense between its lowest and highest resting prices, at
+        // 16 bytes a tick per side. A ceiling is therefore stated per
+        // instrument, and an unstated one keeps the boot-window default.
+        if let Some(ceiling_ticks) = self.ceiling_ticks {
+            if ceiling_ticks < floor_ticks {
+                return Err(ConfigError::at(
+                    line,
+                    "ceiling_ticks is below floor_ticks, so the band is empty",
+                ));
+            }
+            if ceiling_ticks - floor_ticks >= MAX_BAND_SLOTS {
+                return Err(ConfigError::at(
+                    line,
+                    format!(
+                        "the band spans more than {MAX_BAND_SLOTS} ticks, \
+                         the engine's 31-bit price domain"
+                    ),
+                ));
+            }
+            return Ok(Instrument::banded(
+                symbol,
+                base,
+                quote,
+                floor_ticks,
+                ceiling_ticks,
+                max_quantity,
+                max_open_orders,
             ));
         }
         Ok(Instrument::new(
@@ -628,6 +661,12 @@ impl Config {
                         })?);
                         true
                     }
+                    "ceiling_ticks" => {
+                        draft.ceiling_ticks = Some(value.parse::<Ticks>().map_err(|_| {
+                            ConfigError::at(line, "ceiling_ticks must be a whole number")
+                        })?);
+                        true
+                    }
                     "max_quantity" => {
                         draft.max_quantity = Some(number("max_quantity")?);
                         true
@@ -905,6 +944,34 @@ max_open_orders = 1000000
         let instrument = config.instruments.get(1).unwrap();
         assert_eq!(instrument.floor_ticks, 10_000);
         assert_eq!(instrument.max_open_orders, 1_000_000);
+        // No ceiling stated: the default band, one boot window wide.
+        assert_eq!(instrument.ceiling_ticks, 10_000 + 65_536 - 1);
+    }
+
+    #[test]
+    fn a_stated_ceiling_widens_the_band_and_a_bad_one_is_refused() {
+        let widened = VALID.replace(
+            "max_open_orders = 1000000",
+            "max_open_orders = 1000000\nceiling_ticks = 2000000000",
+        );
+        let config = Config::parse(&widened).unwrap();
+        let instrument = config.instruments.get(1).unwrap();
+        assert_eq!(instrument.ceiling_ticks, 2_000_000_000);
+        assert_eq!(instrument.band_slots(), 2_000_000_000 - 10_000 + 1);
+
+        // An empty band and a band past the engine's price domain are both
+        // configuration errors with the instrument's line number, not panics
+        // deep in a book constructor.
+        let empty = VALID.replace(
+            "max_open_orders = 1000000",
+            "max_open_orders = 1000000\nceiling_ticks = 9999",
+        );
+        assert!(refusal(&empty).contains("band is empty"));
+        let wide = VALID.replace(
+            "max_open_orders = 1000000",
+            "max_open_orders = 1000000\nceiling_ticks = 4000000000",
+        );
+        assert!(refusal(&wide).contains("31-bit price domain"));
     }
 
     /// Reports what a configuration was refused for, so a test can assert on the

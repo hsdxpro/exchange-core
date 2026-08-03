@@ -115,7 +115,7 @@ struct RefOrder {
 #[derive(Clone, Copy, Debug)]
 struct Location {
     side: Side,
-    price: u16,
+    price: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -126,17 +126,19 @@ struct LiquidityPreview {
 
 #[derive(Clone, Debug)]
 pub struct ReferenceL3 {
-    max_orders: usize,
     max_order_ids: usize,
-    levels: [BTreeMap<u16, Vec<RefOrder>>; 2],
+    levels: [BTreeMap<u32, Vec<RefOrder>>; 2],
     locations: HashMap<u32, Location>,
 }
 
 impl ReferenceL3 {
+    /// `max_orders` is accepted for call-site symmetry with the engine and
+    /// deliberately unused: the engine's pool grows on demand, so capacity is
+    /// not a behaviour either side can differ on below the `u32` index space.
     #[must_use]
     pub fn new(max_orders: usize, max_order_ids: usize) -> Self {
+        let _ = max_orders;
         Self {
-            max_orders,
             max_order_ids,
             levels: [BTreeMap::new(), BTreeMap::new()],
             locations: HashMap::new(),
@@ -162,31 +164,25 @@ impl ReferenceL3 {
     }
 
     #[must_use]
-    pub fn best_bid(&self) -> i32 {
-        self.levels[0]
-            .keys()
-            .next_back()
-            .map_or(NO_BID, |&price| i32::from(price))
+    pub fn best_bid(&self) -> Option<u32> {
+        self.levels[0].keys().next_back().copied()
     }
 
     #[must_use]
-    pub fn best_ask(&self) -> i32 {
-        self.levels[1]
-            .keys()
-            .next()
-            .map_or(NO_ASK, |&price| i32::from(price))
+    pub fn best_ask(&self) -> Option<u32> {
+        self.levels[1].keys().next().copied()
     }
 
     #[must_use]
-    pub fn would_cross(&self, side: Side, price: u16) -> bool {
+    pub fn would_cross(&self, side: Side, price: u32) -> bool {
         match side {
-            Side::Bid => self.best_ask() <= i32::from(price),
-            Side::Ask => self.best_bid() >= i32::from(price),
+            Side::Bid => self.best_ask().is_some_and(|best| best <= price),
+            Side::Ask => self.best_bid().is_some_and(|best| best >= price),
         }
     }
 
     #[must_use]
-    pub fn level_quantity(&self, side: Side, price: u16) -> u64 {
+    pub fn level_quantity(&self, side: Side, price: u32) -> u64 {
         self.levels[side.index()]
             .get(&price)
             .map(|queue| queue.iter().map(|order| u64::from(order.quantity)).sum())
@@ -194,7 +190,7 @@ impl ReferenceL3 {
     }
 
     #[must_use]
-    pub fn orders_at_level(&self, side: Side, price: u16) -> Vec<OrderView> {
+    pub fn orders_at_level(&self, side: Side, price: u32) -> Vec<OrderView> {
         self.levels[side.index()]
             .get(&price)
             .map(|queue| {
@@ -215,15 +211,15 @@ impl ReferenceL3 {
         &mut self,
         id: u32,
         side: Side,
-        price: u16,
+        price: u32,
         quantity: u32,
     ) -> Result<(), OrderError> {
+        if price >= crate::PRICE_LIMIT {
+            return Err(OrderError::PriceOutOfDomain);
+        }
         self.validate_new_order(id, quantity)?;
         if self.would_cross(side, price) {
             return Err(OrderError::WouldCross);
-        }
-        if self.locations.len() >= self.max_orders {
-            return Err(OrderError::CapacityExceeded);
         }
         self.append(id, side, price, quantity);
         Ok(())
@@ -269,13 +265,16 @@ impl ReferenceL3 {
         &mut self,
         existing_id: u32,
         replacement_id: u32,
-        new_price: u16,
+        new_price: u32,
         new_quantity: u32,
         on_fill: F,
     ) -> Result<ExecutionReport, OrderError>
     where
         F: FnMut(Fill),
     {
+        if new_price >= crate::PRICE_LIMIT {
+            return Err(OrderError::PriceOutOfDomain);
+        }
         if existing_id as usize >= self.max_order_ids {
             return Err(OrderError::OrderIdOutOfRange);
         }
@@ -303,7 +302,7 @@ impl ReferenceL3 {
         &mut self,
         id: u32,
         side: Side,
-        limit_price: u16,
+        limit_price: u32,
         quantity: u32,
         time_in_force: TimeInForce,
         on_fill: F,
@@ -311,6 +310,9 @@ impl ReferenceL3 {
     where
         F: FnMut(Fill),
     {
+        if limit_price >= crate::PRICE_LIMIT {
+            return Err(OrderError::PriceOutOfDomain);
+        }
         self.submit_limit_impl(
             id,
             side,
@@ -357,19 +359,19 @@ impl ReferenceL3 {
     fn preview_liquidity(
         &self,
         taker_side: Side,
-        limit_price: u16,
+        limit_price: u32,
         requested_quantity: u32,
     ) -> LiquidityPreview {
         let mut preview = LiquidityPreview::default();
         let mut remaining = requested_quantity;
         let maker_levels = &self.levels[taker_side.opposite().index()];
-        let ordered: Box<dyn Iterator<Item = (&u16, &Vec<RefOrder>)>> = match taker_side {
+        let ordered: Box<dyn Iterator<Item = (&u32, &Vec<RefOrder>)>> = match taker_side {
             Side::Bid => Box::new(maker_levels.iter()),
             Side::Ask => Box::new(maker_levels.iter().rev()),
         };
 
         for (&maker_price, queue) in ordered {
-            if remaining == 0 || !crosses(taker_side, limit_price, i32::from(maker_price)) {
+            if remaining == 0 || !crosses(taker_side, limit_price, maker_price) {
                 break;
             }
             for maker in queue {
@@ -392,7 +394,7 @@ impl ReferenceL3 {
         &mut self,
         id: u32,
         side: Side,
-        limit_price: u16,
+        limit_price: u32,
         quantity: u32,
         time_in_force: TimeInForce,
         mut on_fill: F,
@@ -409,9 +411,6 @@ impl ReferenceL3 {
             if self.would_cross(side, limit_price) {
                 return Err(OrderError::WouldCross);
             }
-            if self.locations.len() >= self.max_orders {
-                return Err(OrderError::CapacityExceeded);
-            }
             self.append(id, side, limit_price, quantity);
             return Ok(ExecutionReport {
                 rested_quantity: quantity,
@@ -419,10 +418,9 @@ impl ReferenceL3 {
             });
         }
 
-        let at_capacity = self.locations.len() >= self.max_orders;
-        let preview = if time_in_force == TimeInForce::FillOrKill
-            || (time_in_force == TimeInForce::GoodTillCancel && at_capacity)
-        {
+        // The engine's pool grows on demand, so capacity is not a behaviour
+        // to model below the u32 index space; only FOK still previews.
+        let preview = if time_in_force == TimeInForce::FillOrKill {
             self.preview_liquidity(side, limit_price, quantity)
         } else {
             LiquidityPreview::default()
@@ -431,29 +429,23 @@ impl ReferenceL3 {
         if time_in_force == TimeInForce::FillOrKill && preview.executable_quantity < quantity {
             return Err(OrderError::InsufficientLiquidity);
         }
-        if time_in_force == TimeInForce::GoodTillCancel && at_capacity {
-            let remainder = quantity - preview.executable_quantity;
-            if remainder != 0 && !preview.releases_slot {
-                return Err(OrderError::CapacityExceeded);
-            }
-        }
 
         let mut report = ExecutionReport::default();
         let mut remaining = quantity;
         let maker_side = side.opposite();
 
         while remaining != 0 {
-            let maker_price_value = match side {
+            let best = match side {
                 Side::Bid => self.best_ask(),
                 Side::Ask => self.best_bid(),
             };
-            if !(0..PRICE_COUNT as i32).contains(&maker_price_value)
-                || !crosses(side, limit_price, maker_price_value)
-            {
+            let Some(maker_price) = best else {
+                break;
+            };
+            if !crosses(side, limit_price, maker_price) {
                 break;
             }
 
-            let maker_price = maker_price_value as u16;
             let queue = self.levels[maker_side.index()]
                 .get_mut(&maker_price)
                 .expect("best price must have a queue");
@@ -497,7 +489,7 @@ impl ReferenceL3 {
         Ok(report)
     }
 
-    fn append(&mut self, id: u32, side: Side, price: u16, quantity: u32) {
+    fn append(&mut self, id: u32, side: Side, price: u32, quantity: u32) {
         self.levels[side.index()]
             .entry(price)
             .or_default()
@@ -522,9 +514,9 @@ impl ReferenceL3 {
     }
 }
 
-fn crosses(taker_side: Side, limit_price: u16, maker_price: i32) -> bool {
+fn crosses(taker_side: Side, limit_price: u32, maker_price: u32) -> bool {
     match taker_side {
-        Side::Bid => maker_price <= i32::from(limit_price),
-        Side::Ask => maker_price >= i32::from(limit_price),
+        Side::Bid => maker_price <= limit_price,
+        Side::Ask => maker_price >= limit_price,
     }
 }

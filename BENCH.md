@@ -42,6 +42,14 @@ says so.
 
 Best of three runs, each already a minimum of five.
 
+**2026-08-02, windowed ladder + growing pool:** measured interleaved against
+the prior revision in one sitting, minimum across two pairs: the composite
+paths are inside noise (mixed stream +3 ns, batches +2–7 ns, self-match and
+chain flat), the 2,000-level sweep pays +4 ns/level, and cancel pays +33 ns —
+the offset translation landing on the most lookup-heavy path, the same path
+that took +128 ns for account-keyed IDs. The table below is the quiet-machine
+baseline and wants re-taking there.
+
 | Operation | Cost |
 |---|---:|
 | Passive limit order, full path | **190 ns** |

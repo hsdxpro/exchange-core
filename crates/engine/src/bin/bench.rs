@@ -38,7 +38,7 @@ struct L2Update {
 struct RestingOrder {
     id: u32,
     side: Side,
-    price: u16,
+    price: u32,
     quantity: u32,
 }
 
@@ -57,7 +57,7 @@ struct Command {
     id: u32,
     replacement_id: u32,
     side: Side,
-    price: u16,
+    price: u32,
     quantity: u32,
 }
 
@@ -161,7 +161,7 @@ fn make_resting_orders(count: usize) -> Vec<RestingOrder> {
         orders.push(RestingOrder {
             id: index as u32 + 1,
             side,
-            price: prices[(index.wrapping_mul(2_654_435_761)) % prices.len()],
+            price: u32::from(prices[(index.wrapping_mul(2_654_435_761)) % prices.len()]),
             quantity: 1 + (index % 1_000) as u32,
         });
     }
@@ -225,8 +225,8 @@ fn make_mixed_commands(count: usize) -> Vec<Command> {
                 Side::Ask
             };
             let price = match side {
-                Side::Bid => 32_000 - ((random >> 16) & 2_047) as u16,
-                Side::Ask => 33_536 + ((random >> 16) & 2_047) as u16,
+                Side::Bid => 32_000 - ((random >> 16) & 2_047) as u32,
+                Side::Ask => 33_536 + ((random >> 16) & 2_047) as u32,
             };
             let quantity = 1 + ((random >> 32) % 100) as u32;
             let id = next_id;
@@ -279,8 +279,8 @@ fn make_mixed_commands(count: usize) -> Vec<Command> {
             if let Some(id) = choose_live(&model, &created, random) {
                 let side = side_by_id[id as usize];
                 let price = match side {
-                    Side::Bid => 32_000 - ((random >> 20) & 2_047) as u16,
-                    Side::Ask => 33_536 + ((random >> 20) & 2_047) as u16,
+                    Side::Bid => 32_000 - ((random >> 20) & 2_047) as u32,
+                    Side::Ask => 33_536 + ((random >> 20) & 2_047) as u32,
                 };
                 let quantity = 1 + ((random >> 40) % 200) as u32;
                 let replacement_id = next_id;
@@ -307,7 +307,11 @@ fn make_mixed_commands(count: usize) -> Vec<Command> {
             } else {
                 Side::Ask
             };
-            let price = if side == Side::Bid { u16::MAX } else { 0 };
+            let price = if side == Side::Bid {
+                u32::from(u16::MAX)
+            } else {
+                0
+            };
             let quantity = 1 + ((random >> 32) % 150) as u32;
             let id = next_id;
             next_id += 1;
@@ -609,7 +613,10 @@ fn main() -> ExitCode {
                     Ok(()) => 0,
                     Err(error) => 1_u64 << (error as u8),
                 };
-                hash = mix64(hash ^ (book.best_bid() + 1) as u64 ^ (book.best_ask() + 1) as u64);
+                hash = mix64(
+                    hash ^ u64::from(book.best_bid().map_or(0, |price| price + 1))
+                        ^ u64::from(book.best_ask().map_or(0, |price| price + 1)),
+                );
             }
             hash
         },
@@ -751,12 +758,18 @@ fn main() -> ExitCode {
     for _ in 0..sparse_samples_count {
         let mut book = L3Book::new(1_001, 2_100);
         for (index, &price) in sweep_prices.iter().enumerate() {
-            book.add_passive(index as u32 + 1, Side::Ask, price, 1)
+            book.add_passive(index as u32 + 1, Side::Ask, u32::from(price), 1)
                 .unwrap();
         }
         let started = Instant::now();
         let report = book
-            .submit_limit(2_000, Side::Bid, u16::MAX, 1_000, TimeInForce::FillOrKill)
+            .submit_limit(
+                2_000,
+                Side::Bid,
+                u32::from(u16::MAX),
+                1_000,
+                TimeInForce::FillOrKill,
+            )
             .unwrap();
         sparse_samples.push(started.elapsed().as_secs_f64() * 1_000_000_000.0);
         sink = mix64(sink ^ report.report_hash ^ book.state_hash());

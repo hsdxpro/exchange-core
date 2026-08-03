@@ -1025,7 +1025,7 @@ impl<S: LogStorage> Exchange<S> {
                 // the shortfall surfaced as a failed settle after the trade had
                 // already happened.
                 let price = if market {
-                    instrument.ceiling_ticks()
+                    instrument.ceiling_ticks
                 } else {
                     command.price
                 };

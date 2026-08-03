@@ -70,9 +70,12 @@ reservation leaves it reusable — a band-rejected resend needs a fresh ID.
 **5. Matching** — `engine/src/lib.rs`, `L3Book`
 
 Price-time FIFO; executions print at the maker's price. A market order is a
-limit at the most aggressive tick — one matching loop. Fills are delivered by
-callback after they are committed, so a panicking callback leaves the book
-valid. The engine allocates nothing after construction.
+limit at the most aggressive tick — one matching loop, and because IOC/FOK
+never rest, the extreme never grows anything. Fills are delivered by callback
+after they are committed, so a panicking callback leaves the book valid. The
+steady state allocates nothing; the slot pool doubles when it fills and the
+price window grows toward a resting price it missed, both amortised and off
+the common path.
 
 **6. Settlement** — `pipeline/src/accounts.rs`, `Exchange::settle`
 
@@ -171,12 +174,25 @@ accounts still accept cancels; both survive snapshot and replay.
 
 ## Capacity model
 
-Sized at startup, per instrument, in config — deliberately: `max_open_orders`
-sizes the slot pool (40 bytes a slot up front, ~55 live; a book's level table
-is a flat ~2 MiB, pinned by test), the 65,536-tick ladder from `floor_ticks`
-is both the memory bound and the price band, and `retained_per_channel` ×
-instruments × 3 public channels is checked against `max_feed_memory_mb` at
-startup — a config that would OOM is refused before it serves. The slot pool
-is shared across prices and sides: one price can hold every order in the book.
-Accounts and holdings grow with use; an account that never traded costs
-nothing.
+Nothing structural refuses an order below the `u32` slot-index space — 4.29
+billion resting per book, arithmetic rather than configuration.
+
+- **Slot pool**: `max_open_orders` sizes the boot allocation (40 bytes a
+  slot, ~55 live, pinned by test); the pool, its allocator and the engine's
+  ID table double together when it fills. Slots are indices, so growth moves
+  nothing a live order holds. The pool is shared across prices and sides:
+  one price can hold every order in the book.
+- **Price window**: the engine's price domain is 31 bits per instrument; the
+  level tables boot 65,536 ticks (~2.1 MiB) and follow the prices that rest —
+  re-anchored free while the book is empty, extended upward without a
+  rebuild, shifted downward with one copy per doubling. Slots store absolute
+  prices, so no growth touches an order. The instrument's band
+  (`floor_ticks`..`ceiling_ticks`, config) is the policy bound — the
+  fat-finger control and the worst-case window statement in one, since the
+  window is dense between the lowest and highest resting price at 16 bytes a
+  tick per side.
+- **Feed retention**: `retained_per_channel` × instruments × 3 public
+  channels is checked against `max_feed_memory_mb` at startup — a config
+  that would OOM is refused before it serves.
+- **Accounts and holdings** grow with use; an account that never traded
+  costs nothing.

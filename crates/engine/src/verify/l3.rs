@@ -2,15 +2,14 @@
 
 use super::{CheckResult, Workload, require};
 use crate::{
-    ConfigurationError, Fill, L3Book, NO_ASK, NO_BID, OrderError, OrderSlot, PriceLevel, Side,
-    TimeInForce,
+    ConfigurationError, Fill, L3Book, OrderError, OrderSlot, PriceLevel, Side, TimeInForce,
 };
 use std::mem::size_of;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// Checks the full FIFO queue at a price, including the side/price stamped on
 /// every slot, which is what makes direct-ID lookup trustworthy.
-fn require_queue(book: &L3Book, side: Side, price: u16, expected: &[(u32, u32)]) -> CheckResult {
+fn require_queue(book: &L3Book, side: Side, price: u32, expected: &[(u32, u32)]) -> CheckResult {
     let mut actual = Vec::new();
     book.for_each_order_at_level(side, price, |order| actual.push(order));
     require!(actual.len() == expected.len(), price);
@@ -43,8 +42,8 @@ pub fn compact_layout_and_empty_state(_workload: Workload) -> CheckResult {
     require!(book.capacity() == 0);
     require!(book.order_id_capacity() == 0);
     require!(book.live_orders() == 0);
-    require!(book.best_bid() == NO_BID);
-    require!(book.best_ask() == NO_ASK);
+    require!(book.best_bid().is_none());
+    require!(book.best_ask().is_none());
     require!(book.validate());
     require!(book.add_passive(0, Side::Bid, 100, 1) == Err(OrderError::OrderIdOutOfRange));
     Ok(())
@@ -60,15 +59,8 @@ pub fn zero_capacity_and_empty_book_time_in_force(_workload: Workload) -> CheckR
     let mut book = L3Book::new(0, 8);
     let before = book.state_hash();
 
-    require!(
-        book.submit_limit(1, Side::Bid, 100, 7, TimeInForce::GoodTillCancel)
-            == Err(OrderError::CapacityExceeded)
-    );
-    require!(
-        book.submit_limit(1, Side::Bid, 100, 7, TimeInForce::PostOnly)
-            == Err(OrderError::CapacityExceeded)
-    );
-
+    // Empty-book immediacy first, while the book is untouched: nothing to
+    // trade means IOC cancels whole and FOK refuses whole.
     let ioc = book.submit_limit(1, Side::Bid, 100, 7, TimeInForce::ImmediateOrCancel)?;
     require!(ioc.traded_quantity == 0);
     require!(ioc.canceled_quantity == 7);
@@ -92,8 +84,15 @@ pub fn zero_capacity_and_empty_book_time_in_force(_workload: Workload) -> CheckR
         book.submit_market(2, Side::Ask, 9, TimeInForce::GoodTillCancel)
             == Err(OrderError::UnsupportedTimeInForce)
     );
-
     require!(book.state_hash() == before);
+
+    // Zero capacity is a boot size, not a ceiling: the pool grows and both
+    // resting time-in-forces rest.
+    let rested = book.submit_limit(1, Side::Bid, 100, 7, TimeInForce::GoodTillCancel)?;
+    require!(rested.rested_quantity == 7);
+    let posted = book.submit_limit(2, Side::Bid, 99, 5, TimeInForce::PostOnly)?;
+    require!(posted.rested_quantity == 5);
+    require!(book.live_orders() == 2);
     require!(book.validate());
     Ok(())
 }
@@ -107,10 +106,11 @@ pub fn passive_add_validation_and_cross_prevention(_workload: Workload) -> Check
     require!(book.add_passive(1, Side::Ask, 100, 10) == Err(OrderError::WouldCross));
     require!(book.add_passive(1, Side::Ask, 101, 10).is_ok());
     require!(book.add_passive(2, Side::Bid, 99, 10).is_ok());
-    require!(book.add_passive(3, Side::Ask, 102, 10) == Err(OrderError::CapacityExceeded));
-    require!(book.live_orders() == 3);
-    require!(book.best_bid() == 100);
-    require!(book.best_ask() == 101);
+    // The boot capacity of 3 is a hint: the pool grows and the fourth rests.
+    require!(book.add_passive(3, Side::Ask, 102, 10).is_ok());
+    require!(book.live_orders() == 4);
+    require!(book.best_bid() == Some(100));
+    require!(book.best_ask() == Some(101));
     require!(book.validate());
     Ok(())
 }
@@ -120,14 +120,14 @@ pub fn boundary_prices_and_best_updates(_workload: Workload) -> CheckResult {
     require!(book.add_passive(1, Side::Bid, 0, 1).is_ok());
     require!(book.add_passive(2, Side::Bid, 65_534, 2).is_ok());
     require!(book.add_passive(3, Side::Ask, 65_535, 3).is_ok());
-    require!(book.best_bid() == 65_534);
-    require!(book.best_ask() == 65_535);
+    require!(book.best_bid() == Some(65_534));
+    require!(book.best_ask() == Some(65_535));
     require!(book.cancel(2).is_ok());
-    require!(book.best_bid() == 0);
+    require!(book.best_bid() == Some(0));
     require!(book.cancel(1).is_ok());
-    require!(book.best_bid() == NO_BID);
+    require!(book.best_bid().is_none());
     require!(book.cancel(3).is_ok());
-    require!(book.best_ask() == NO_ASK);
+    require!(book.best_ask().is_none());
     require!(book.validate());
     Ok(())
 }
@@ -199,7 +199,7 @@ pub fn panicking_fill_callback_preserves_book_invariants(_workload: Workload) ->
     require!(book.contains(2));
     require!(!book.contains(10));
     require!(book.live_orders() == 1);
-    require!(book.best_ask() == 101);
+    require!(book.best_ask() == Some(101));
     require_queue(&book, Side::Ask, 101, &[(2, 4)])?;
     require!(book.validate());
     Ok(())
@@ -243,7 +243,7 @@ pub fn price_priority_and_multi_level_matching(_workload: Workload) -> CheckResu
     require!(report.notional_ticks == 5 * 100 + 4 * 100 + 4 * 101);
     require_queue(&book, Side::Ask, 101, &[(3, 2)])?;
     require_queue(&book, Side::Ask, 102, &[(1, 7)])?;
-    require!(book.best_ask() == 101);
+    require!(book.best_ask() == Some(101));
     require!(book.validate());
     Ok(())
 }
@@ -276,7 +276,7 @@ pub fn limit_price_stops_matching_and_fok_preview(_workload: Workload) -> CheckR
             }]
     );
     require_queue(&book, Side::Ask, 101, &[(2, 3)])?;
-    require!(book.best_ask() == 101);
+    require!(book.best_ask() == Some(101));
     require!(book.validate());
     Ok(())
 }
@@ -310,7 +310,7 @@ pub fn sell_side_symmetry(_workload: Workload) -> CheckResult {
     );
     require_queue(&book, Side::Bid, 101, &[(3, 1)])?;
     require_queue(&book, Side::Bid, 100, &[(1, 3)])?;
-    require!(book.best_bid() == 101);
+    require!(book.best_bid() == Some(101));
     require!(book.validate());
     Ok(())
 }
@@ -343,7 +343,7 @@ pub fn market_sell_side_symmetry(_workload: Workload) -> CheckResult {
             ]
     );
     require_queue(&book, Side::Bid, 10, &[(1, 1)])?;
-    require!(book.best_bid() == 10);
+    require!(book.best_bid() == Some(10));
     require!(book.validate());
     Ok(())
 }
@@ -360,8 +360,8 @@ pub fn gtc_rests_and_crosses_then_rests(_workload: Workload) -> CheckResult {
     require!(crossing.rested_quantity == 7);
     require!(!book.contains(2));
     require_queue(&book, Side::Bid, 101, &[(3, 7)])?;
-    require!(book.best_bid() == 101);
-    require!(book.best_ask() == NO_ASK);
+    require!(book.best_bid() == Some(101));
+    require!(book.best_ask().is_none());
     require!(book.validate());
     Ok(())
 }
@@ -454,7 +454,7 @@ pub fn cancel_head_middle_tail_and_only_order(_workload: Workload) -> CheckResul
     require!(book.cancel(4).is_ok());
     require_queue(&book, Side::Ask, 100, &[(2, 20)])?;
     require!(book.cancel(2).is_ok());
-    require!(book.best_ask() == NO_ASK);
+    require!(book.best_ask().is_none());
     require!(book.cancel(2) == Err(OrderError::UnknownOrderId));
     require!(book.cancel(99) == Err(OrderError::OrderIdOutOfRange));
     require!(book.validate());
@@ -540,8 +540,8 @@ pub fn cancel_replace_crosses_then_rests(_workload: Workload) -> CheckResult {
     require!(!book.contains(1));
     require!(!book.contains(2));
     require_queue(&book, Side::Bid, 100, &[(3, 7)])?;
-    require!(book.best_bid() == 100);
-    require!(book.best_ask() == NO_ASK);
+    require!(book.best_bid() == Some(100));
+    require!(book.best_ask().is_none());
     require!(book.validate());
     Ok(())
 }
@@ -601,15 +601,14 @@ pub fn full_capacity_aggressive_orders(_workload: Workload) -> CheckResult {
         require!(book.validate());
     }
     {
-        // Nothing crosses, so no slot is released and the GTC must be rejected.
+        // Nothing crosses and the boot pool is full: the pool grows and the
+        // GTC rests where it used to be refused.
         let mut book = L3Book::new(1, 8);
         require!(book.add_passive(1, Side::Ask, 101, 10).is_ok());
-        let before = book.state_hash();
-        require!(
-            book.submit_limit(2, Side::Bid, 100, 5, TimeInForce::GoodTillCancel)
-                == Err(OrderError::CapacityExceeded)
-        );
-        require!(book.state_hash() == before);
+        let report = book.submit_limit(2, Side::Bid, 100, 5, TimeInForce::GoodTillCancel)?;
+        require!(report.rested_quantity == 5);
+        require!(book.live_orders() == 2);
+        require_queue(&book, Side::Bid, 100, &[(2, 5)])?;
         require!(book.validate());
     }
     {
@@ -720,7 +719,7 @@ pub fn level_iteration_and_order_lookup(_workload: Workload) -> CheckResult {
             .push((price, quantity)))
             == 2
     );
-    require!(bid_levels == [(100_u16, 6_u64), (99, 3)]);
+    require!(bid_levels == [(100_u32, 6_u64), (99, 3)]);
 
     let mut ask_prices = Vec::new();
     require!(book.for_each_level(Side::Ask, 8, |price, _| ask_prices.push(price)) == 2);
@@ -738,10 +737,65 @@ pub fn level_iteration_and_order_lookup(_workload: Workload) -> CheckResult {
     Ok(())
 }
 
+pub fn window_growth_preserves_queues_and_priority(_workload: Workload) -> CheckResult {
+    let mut book = L3Book::new(4, 64);
+    // Empty book: the window re-anchors to wherever trading starts, for free.
+    let anchor = 1_000_000_000_u32;
+    require!(book.add_passive(1, Side::Bid, anchor, 5).is_ok());
+    require!(book.add_passive(2, Side::Bid, anchor, 7).is_ok());
+    require!(book.add_passive(3, Side::Ask, anchor + 10, 9).is_ok());
+    require!(book.best_bid() == Some(anchor));
+    require!(book.best_ask() == Some(anchor + 10));
+
+    // Far below: the window shifts down; queues, priority and lookups hold —
+    // slots store absolute prices, so the shift moves no order.
+    require!(book.add_passive(4, Side::Bid, anchor - 500_000, 1).is_ok());
+    require_queue(&book, Side::Bid, anchor, &[(1, 5), (2, 7)])?;
+    require!(book.level_quantity(Side::Bid, anchor) == 12);
+    require!(book.best_bid() == Some(anchor));
+    require!(book.validate());
+
+    // Far above: the window extends up; nothing is rebuilt.
+    require!(book.add_passive(5, Side::Ask, anchor + 400_000, 2).is_ok());
+    require!(book.best_ask() == Some(anchor + 10));
+    require!(book.validate());
+
+    // Best-price repair crosses the grown span in both directions.
+    require!(book.cancel(1).is_ok());
+    require!(book.cancel(2).is_ok());
+    require!(book.best_bid() == Some(anchor - 500_000));
+    require!(book.cancel(3).is_ok());
+    require!(book.best_ask() == Some(anchor + 400_000));
+
+    // Geometry independence: a book that grew through a different window
+    // history holds the same orders and must hash identically.
+    let mut other = L3Book::new(4, 64);
+    require!(other.add_passive(4, Side::Bid, anchor - 500_000, 1).is_ok());
+    require!(other.add_passive(5, Side::Ask, anchor + 400_000, 2).is_ok());
+    require!(book.state_hash() == other.state_hash());
+    require!(book.validate());
+    require!(other.validate());
+
+    // A price outside the 31-bit domain is refused before anything grows.
+    require!(
+        book.add_passive(6, Side::Bid, crate::PRICE_LIMIT, 1) == Err(OrderError::PriceOutOfDomain)
+    );
+    require!(
+        book.submit_limit(
+            6,
+            Side::Bid,
+            crate::PRICE_LIMIT,
+            1,
+            TimeInForce::GoodTillCancel
+        ) == Err(OrderError::PriceOutOfDomain)
+    );
+    Ok(())
+}
+
 pub fn sparse_1000_level_sweep(_workload: Workload) -> CheckResult {
     let mut book = L3Book::new(1_100, 2_000);
     for index in 0..1_000_u32 {
-        let price = (30_000 + index * 31) as u16;
+        let price = 30_000 + index * 31;
         require!(
             book.add_passive(index + 1, Side::Ask, price, 1).is_ok(),
             index
@@ -764,7 +818,7 @@ pub fn sparse_1000_level_sweep(_workload: Workload) -> CheckResult {
     require!(fills.len() == 1_000);
     for (index, fill) in fills.iter().enumerate() {
         require!(fill.maker_order_id == index as u32 + 1, index);
-        require!(fill.price == (30_000 + index as u32 * 31) as u16, index);
+        require!(fill.price == 30_000 + index as u32 * 31, index);
         require!(fill.quantity == 1, index);
     }
     require!(book.live_orders() == 0);
