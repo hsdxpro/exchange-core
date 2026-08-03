@@ -33,6 +33,11 @@ fn run(args: &[&str]) -> bool {
 fn tests() -> bool {
     run(&["test", "--workspace", "--exclude", "bx-gateway"])
         && run(&["test", "-p", "bx-gateway", "--", "--test-threads=1"])
+        // The engine suite again, in release: debug builds run the Quick
+        // workload, and Quick never checks the golden replay hash or drives
+        // the randomized differentials at full depth. Without this step the
+        // gate that exists to pin determinism would never execute the pin.
+        && run(&["test", "-p", "bx-engine", "--release"])
 }
 
 fn gate() -> bool {

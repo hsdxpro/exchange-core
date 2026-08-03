@@ -177,11 +177,11 @@ accounts still accept cancels; both survive snapshot and replay.
 Nothing structural refuses an order below the `u32` slot-index space — 4.29
 billion resting per book, arithmetic rather than configuration.
 
-- **Slot pool**: `max_open_orders` sizes the boot allocation (40 bytes a
-  slot, ~55 live, pinned by test); the pool, its allocator and the engine's
-  ID table double together when it fills. Slots are indices, so growth moves
-  nothing a live order holds. The pool is shared across prices and sides:
-  one price can hold every order in the book.
+- **Slot pool**: `max_open_orders` sizes the boot allocation (48 bytes a
+  slot, ~70 per live order, pinned by test); the pool, its allocator and the
+  engine's ID table double together when it fills. Slots are indices, so
+  growth moves nothing a live order holds. The pool is shared across prices
+  and sides: one price can hold every order in the book.
 - **Price window**: the engine's price domain is 31 bits per instrument; the
   level tables boot 65,536 ticks (~2.1 MiB) and follow the prices that rest —
   re-anchored free while the book is empty, extended upward without a
@@ -190,7 +190,9 @@ billion resting per book, arithmetic rather than configuration.
   (`floor_ticks`..`ceiling_ticks`, config) is the policy bound — the
   fat-finger control and the worst-case window statement in one, since the
   window is dense between the lowest and highest resting price at 16 bytes a
-  tick per side.
+  tick per side — and the engine is handed the band as its price domain, so
+  growth past the band is impossible rather than merely unexpected. The
+  window never shrinks: one wide episode holds its peak for the book's life.
 - **Feed retention**: `retained_per_channel` × instruments × 3 public
   channels is checked against `max_feed_memory_mb` at startup — a config
   that would OOM is refused before it serves.

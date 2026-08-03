@@ -234,11 +234,22 @@ pub struct Book {
 
 impl Book {
     #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn new(instrument: Instrument) -> Self {
         let capacity = instrument.max_open_orders;
+        // The instrument's band is handed to the engine as its price domain,
+        // so the window can never be grown past the band — the band an
+        // operator states is a hard allocation bound, not a promise. The
+        // band assert bounds the cast.
+        let engine = L3Book::try_with_domain(
+            capacity as usize,
+            capacity as usize,
+            instrument.band_slots() as u32,
+        )
+        .expect("the instrument band was validated at construction");
         Self {
             instrument,
-            engine: L3Book::new(capacity as usize, capacity as usize),
+            engine,
             slots: SlotAllocator::new(capacity),
         }
     }
@@ -811,14 +822,16 @@ mod tests {
     }
     #[test]
     fn a_slot_costs_what_the_sizing_guidance_says_it_does() {
-        // Instrument::max_open_orders documents 40 bytes per slot plus a flat
+        // Instrument::max_open_orders documents 48 bytes per slot plus a flat
         // per-book cost. If these move, that guidance is wrong and operators
-        // will size their venue from a stale number.
+        // will size their venue from a stale number. The slot-to-order table
+        // holds the full OrderKey -- account and ID -- which is what an
+        // earlier revision of this test miscounted as a bare OrderId.
         let per_slot = size_of::<bx_engine::OrderSlot>()   // engine slot
             + size_of::<u32>()                             // engine id -> slot
-            + size_of::<OrderId>()                         // slot -> client id
+            + size_of::<OrderKey>()                        // slot -> client order
             + size_of::<u32>(); // free list
-        assert_eq!(per_slot, 40, "per-slot cost changed");
+        assert_eq!(per_slot, 48, "per-slot cost changed");
 
         let per_book = 2 * bx_engine::PRICE_COUNT * size_of::<bx_engine::PriceLevel>();
         assert_eq!(per_book, 2 << 20, "per-book level table changed");

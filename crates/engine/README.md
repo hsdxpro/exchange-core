@@ -81,7 +81,7 @@ cargo test --release --locked
 - Amend-down retaining queue priority; cancel/replace assigning a new ID and new priority.
 - Atomic FOK, post-only, validation, and capacity rejection.
 - Full-book aggressive matching that can recycle a released slot.
-- Fixed-capacity, allocation-free engine operations after construction.
+- Boot-sized, steady-state-allocation-free engine operations.
 - Compact 24-byte order slots and 16-byte level descriptors.
 
 ## Verification

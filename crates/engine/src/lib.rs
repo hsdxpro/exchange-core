@@ -4,8 +4,11 @@
 //! A compact single-instrument L2/L3 order book built around a hierarchical
 //! occupancy bitmap and strict price-time priority.
 //!
-//! The core is allocation-free after construction. Fill delivery uses a caller
-//! callback, so the matching path does not allocate trade-report containers.
+//! The steady state is allocation-free: the slot pool and the price window
+//! grow by doubling when the book outgrows them, amortised and off the
+//! common path, and a book inside its boot sizes never allocates at all.
+//! Fill delivery uses a caller callback, so the matching path does not
+//! allocate trade-report containers.
 
 pub mod verify;
 
@@ -32,11 +35,11 @@ const WORD_BIT_MASK: usize = BITS_PER_WORD - 1;
 const SIDE_SHIFT: u32 = 31;
 const PRICE_MASK: u32 = PRICE_LIMIT - 1;
 
-/// A market order is a limit order at the most aggressive representable tick.
-/// These are the ends of the price domain, not sentinels: a market buy crosses
-/// every ask, a market sell crosses every bid — and because IOC/FOK never
-/// rest, the extreme never enters the window or grows it.
-const MOST_AGGRESSIVE_BID_TICK: u32 = PRICE_LIMIT - 1;
+/// A market order is a limit order at the most aggressive tick the book's
+/// own domain holds. These are the ends of the domain, not sentinels: a
+/// market buy crosses every ask, a market sell crosses every bid — and
+/// because only IOC/FOK are accepted, the extreme never rests, never enters
+/// the window, and never grows it.
 const MOST_AGGRESSIVE_ASK_TICK: u32 = 0;
 
 /// Arbitrary non-zero seed so an empty book does not hash to `mix64(0)`.
@@ -761,10 +764,15 @@ struct LiquidityPreview {
 
 #[derive(Clone, Debug)]
 pub struct L3Book {
+    /// Prices this book accepts: `[0, domain)`. [`PRICE_LIMIT`] unless the
+    /// caller stated a tighter domain — a venue states its instrument band
+    /// here, which is what makes the band the window's hard bound rather
+    /// than a promise.
+    domain: u32,
     /// Price at window offset 0. `[base, base + window)` is the slice of the
-    /// 31-bit price domain the level tables and bitmaps currently cover; it
-    /// follows the prices that rest, never shrinks, and never moves while an
-    /// order rests. Slots store absolute prices, so a shift moves no slot.
+    /// domain the level tables and bitmaps currently cover; it follows the
+    /// prices that rest, never shrinks, and never moves while an order
+    /// rests. Slots store absolute prices, so a shift moves no slot.
     base: u32,
     levels: [Vec<PriceLevel>; 2],
     slots: Vec<OrderSlot>,
@@ -799,22 +807,36 @@ impl L3Book {
     }
 
     pub fn try_new(max_orders: usize, max_order_ids: usize) -> Result<Self, ConfigurationError> {
-        if max_orders >= INVALID_INDEX as usize {
+        Self::try_with_domain(max_orders, max_order_ids, PRICE_LIMIT)
+    }
+
+    /// A book over a stated price domain `[0, domain)`. The window boots at
+    /// `min(domain, PRICE_COUNT)` slots and can never grow past the domain,
+    /// so the domain a caller states — a venue states its instrument band —
+    /// is the hard bound on what the level tables can be made to allocate.
+    pub fn try_with_domain(
+        max_orders: usize,
+        max_order_ids: usize,
+        domain: u32,
+    ) -> Result<Self, ConfigurationError> {
+        if max_orders >= INVALID_INDEX as usize || domain == 0 || domain > PRICE_LIMIT {
             return Err(ConfigurationError);
         }
+        let window = (domain as usize).min(PRICE_COUNT);
         Ok(Self {
+            domain,
             base: 0,
             levels: [
-                vec![PriceLevel::empty(); PRICE_COUNT],
-                vec![PriceLevel::empty(); PRICE_COUNT],
+                vec![PriceLevel::empty(); window],
+                vec![PriceLevel::empty(); window],
             ],
             slots: vec![OrderSlot::empty(); max_orders],
             id_to_slot: vec![INVALID_INDEX; max_order_ids],
             active: [
-                HierarchicalBitmap::new(PRICE_COUNT),
-                HierarchicalBitmap::new(PRICE_COUNT),
+                HierarchicalBitmap::new(window),
+                HierarchicalBitmap::new(window),
             ],
-            best: [NO_BID, PRICE_COUNT as i32],
+            best: [NO_BID, window as i32],
             next_unused: 0,
             free_head: INVALID_INDEX,
             live_orders: 0,
@@ -861,10 +883,10 @@ impl L3Book {
     /// come here only when the window missed, and only for orders that rest.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn grow_window(&mut self, price: u32) {
-        debug_assert!(price < PRICE_LIMIT);
+        debug_assert!(price < self.domain);
         let len = self.window();
         if self.live_orders == 0 {
-            let top_base = PRICE_LIMIT - len as u32;
+            let top_base = self.domain - len as u32;
             self.base = price.saturating_sub(len as u32 / 2).min(top_base);
             return;
         }
@@ -872,7 +894,7 @@ impl L3Book {
             // Upward: existing offsets keep their meaning, so the level
             // tables extend with empties and the bitmaps with zero words.
             let need = (price - self.base) as usize + 1;
-            let cap = (PRICE_LIMIT - self.base) as usize;
+            let cap = (self.domain - self.base) as usize;
             let new_len = need.max(len.saturating_mul(2)).min(cap);
             for side in 0..2 {
                 self.levels[side].resize(new_len, PriceLevel::empty());
@@ -1019,7 +1041,7 @@ impl L3Book {
         price: u32,
         quantity: u32,
     ) -> Result<(), OrderError> {
-        if price >= PRICE_LIMIT {
+        if price >= self.domain {
             return Err(OrderError::PriceOutOfDomain);
         }
         self.validate_new_order(id, quantity)?;
@@ -1086,7 +1108,7 @@ impl L3Book {
     where
         F: FnMut(Fill),
     {
-        if new_price >= PRICE_LIMIT {
+        if new_price >= self.domain {
             return Err(OrderError::PriceOutOfDomain);
         }
         let existing = self.lookup_order(existing_id)?;
@@ -1131,7 +1153,7 @@ impl L3Book {
     where
         F: FnMut(Fill),
     {
-        if limit_price >= PRICE_LIMIT {
+        if limit_price >= self.domain {
             return Err(OrderError::PriceOutOfDomain);
         }
         self.submit_limit_impl(
@@ -1185,7 +1207,7 @@ impl L3Book {
             return Err(OrderError::UnsupportedTimeInForce);
         }
         let market_limit = match side {
-            Side::Bid => MOST_AGGRESSIVE_BID_TICK,
+            Side::Bid => self.domain - 1,
             Side::Ask => MOST_AGGRESSIVE_ASK_TICK,
         };
         self.submit_limit_with(id, side, market_limit, quantity, time_in_force, on_fill)

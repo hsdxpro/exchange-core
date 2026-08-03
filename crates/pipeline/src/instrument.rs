@@ -67,8 +67,8 @@ pub struct Instrument {
     /// because a level is a head and tail index into it rather than a
     /// container.
     ///
-    /// Cost: **40 bytes per slot** while allocated, ~15 more per *live* order
-    /// for the client-ID index — about **55 bytes per order** in a full book.
+    /// Cost: **48 bytes per slot** while allocated, ~25 more per *live* order
+    /// for the client-ID index — about **70 bytes per order** in a full book.
     /// Each book additionally boots with a ~2.1 MiB level table that grows
     /// with the span between its lowest and highest resting prices. The hard
     /// ceiling is [`MAX_OPEN_ORDERS_LIMIT`], the engine's u32 slot index.
@@ -88,12 +88,17 @@ impl Instrument {
         max_quantity: Quantity,
         max_open_orders: u32,
     ) -> Self {
+        // Checked: a floor near the top of `i64` would wrap the default
+        // ceiling negative, and release builds do not trap overflow.
+        let Some(ceiling_ticks) = floor_ticks.checked_add(DEFAULT_BAND_SLOTS - 1) else {
+            panic!("floor_ticks leaves no room for the default band");
+        };
         Self::banded(
             symbol,
             base,
             quote,
             floor_ticks,
-            floor_ticks + DEFAULT_BAND_SLOTS - 1,
+            ceiling_ticks,
             max_quantity,
             max_open_orders,
         )
@@ -115,12 +120,15 @@ impl Instrument {
         max_quantity: Quantity,
         max_open_orders: u32,
     ) -> Self {
+        // Prices are signed and a floor below zero is legitimate; what must
+        // never happen is the pair wrapping, because release builds do not
+        // trap overflow and a wrapped span passes the comparisons below.
+        let Some(span) = ceiling_ticks.checked_sub(floor_ticks) else {
+            panic!("instrument band is invalid: its width overflows");
+        };
+        assert!(span >= 0, "instrument band is empty: ceiling below floor");
         assert!(
-            ceiling_ticks >= floor_ticks,
-            "instrument band is empty: ceiling below floor"
-        );
-        assert!(
-            ceiling_ticks - floor_ticks < MAX_BAND_SLOTS,
+            span < MAX_BAND_SLOTS,
             "instrument band exceeds the engine's 31-bit price domain"
         );
         Self {

@@ -792,6 +792,33 @@ pub fn window_growth_preserves_queues_and_priority(_workload: Workload) -> Check
     Ok(())
 }
 
+pub fn the_window_never_exceeds_its_domain(_workload: Workload) -> CheckResult {
+    // A book built over a stated domain — a venue states its instrument
+    // band — can never be grown past it, whatever prices rest where. The
+    // doubling arms overshoot toward the domain edge and must clamp there.
+    let domain = 100_000_u32;
+    let mut book = L3Book::try_with_domain(4, 64, domain).expect("valid domain");
+    require!(book.add_passive(1, Side::Bid, 70_000, 1).is_ok());
+    require!(book.add_passive(2, Side::Ask, 99_999, 1).is_ok());
+    require!(book.add_passive(3, Side::Bid, 0, 1).is_ok());
+    require!(book.levels[0].len() <= domain as usize);
+    require!(book.active[0].span() <= domain as usize);
+    require!(book.validate());
+    // The domain edge is refused, not grown toward.
+    require!(book.add_passive(4, Side::Bid, domain, 1) == Err(OrderError::PriceOutOfDomain));
+    require!(
+        book.submit_limit(4, Side::Bid, domain, 1, TimeInForce::GoodTillCancel)
+            == Err(OrderError::PriceOutOfDomain)
+    );
+    // A market order sweeps to the domain's own extreme and still grows
+    // nothing: IOC never rests.
+    let report = book.submit_market(4, Side::Bid, 3, TimeInForce::ImmediateOrCancel)?;
+    require!(report.traded_quantity == 1);
+    require!(book.levels[0].len() <= domain as usize);
+    require!(book.validate());
+    Ok(())
+}
+
 pub fn sparse_1000_level_sweep(_workload: Workload) -> CheckResult {
     let mut book = L3Book::new(1_100, 2_000);
     for index in 0..1_000_u32 {

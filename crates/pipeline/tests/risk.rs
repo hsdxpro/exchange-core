@@ -9,7 +9,9 @@
 mod common;
 
 use bx_pipeline::snapshot::Snapshot;
-use bx_pipeline::{Exchange, cancel_all, limit_order, set_account_trading, set_symbol_state};
+use bx_pipeline::{
+    Exchange, cancel_all, limit_order, market_order, set_account_trading, set_symbol_state,
+};
 use bx_protocol::{Event, EventKind, RejectReason, Side, TradingState};
 use common::{SYMBOL, USD, funded, instruments};
 
@@ -24,6 +26,39 @@ fn rejected_with(events: &[Event], reason: RejectReason) -> bool {
 fn accepted(events: &[Event]) -> bool {
     events.iter().any(|e| e.kind == EventKind::Received as u8)
         && !events.iter().any(|e| e.kind == EventKind::Rejected as u8)
+}
+
+#[test]
+fn a_market_order_with_a_resting_time_in_force_is_refused() {
+    // A market order is expressed to the book as a limit at the band
+    // extreme, so a resting TIF would rest its remainder at that extreme --
+    // never what the sender meant, and with a wide band it is also how one
+    // cheap order would drag the book's window to its worst case. Refused
+    // before anything is reserved; the honest immediacies still work.
+    let mut exchange = funded();
+    let mut resting = limit_order(2, SYMBOL, 10, Side::Bid, 10_050, 5);
+    assert!(accepted(exchange.submit(&mut resting).unwrap()));
+
+    for tif in [
+        bx_protocol::TimeInForce::GoodTillCancel,
+        bx_protocol::TimeInForce::PostOnly,
+    ] {
+        let mut market = market_order(3, SYMBOL, 1, Side::Ask, 9);
+        market.time_in_force = tif as u8;
+        let events = exchange.submit(&mut market).unwrap();
+        assert!(
+            rejected_with(events, RejectReason::UnsupportedTimeInForce),
+            "market + {tif:?} must be refused"
+        );
+    }
+    // Nothing was reserved or spent: the same ID still works as a real
+    // market order, and it trades against the resting bid.
+    let mut market = market_order(3, SYMBOL, 1, Side::Ask, 2);
+    let events = exchange.submit(&mut market).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Filled as u8),
+        "the corrected market order must trade: {events:?}"
+    );
 }
 
 #[test]

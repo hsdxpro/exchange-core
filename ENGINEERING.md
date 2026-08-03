@@ -14,15 +14,18 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**475 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**480 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), everything in
+debug, and the engine suite again in release — debug runs the Quick workload,
+and only Full checks the golden replay hash and drives the randomized
+differentials at depth.
 
 | Crate | Tests | Covers |
 |---|---|---|
-| `bx-engine` | 44 | 43 named verify check groups (differential vs. independent models, exhaustive TIF/quantity combinations, randomized workloads, the golden replay hash) plus the check registry itself. |
+| `bx-engine` | 47 | 46 named verify check groups (differential vs. independent models, exhaustive TIF/quantity combinations, randomized workloads, the golden replay hash) plus the check registry itself. |
 | `bx-protocol` | 16 | Record layout, discriminants, field aliasing, subscription channels. |
 | `bx-journal` | 36 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, replication quorum and term fencing, partitions. |
-| `bx-pipeline` | 167 | Books, balances, hub, snapshots, instruments in `src`; end-to-end, chain, risk, BBO, subscription, watermark, snapshot and crash simulation in `tests/`. |
-| `bx-gateway` | 207 | Config, the Ed25519 challenge, token buckets, codec, handoff, multicast, metrics, TLS in `src`; admission, over-TCP, over-feed, over-TLS, venue snapshots, shipped binaries, failover, machine-down, idle cost and many-clients over real sockets and processes in `tests/`. |
+| `bx-pipeline` | 168 | Books, balances, hub, snapshots, instruments in `src`; end-to-end, chain, risk, BBO, subscription, watermark, snapshot and crash simulation in `tests/`. |
+| `bx-gateway` | 208 | Config, the Ed25519 challenge, token buckets, codec, handoff, multicast, metrics, TLS in `src`; admission, over-TCP, over-feed, over-TLS, venue snapshots, shipped binaries, failover, machine-down, idle cost and many-clients over real sockets and processes in `tests/`. |
 | `bx-election` | 4 | Three nodes electing one leader, a higher term after a death, a minority electing nobody, and a vote that survives a restart. |
 | `xtask` | 1 | The task-runner's own string hygiene. |
 
@@ -351,9 +354,10 @@ for the reasons above; nothing here should read as shipped until it is.
   an exhausted pool, and the caller reported both as `DuplicateOrderId` —
   `OrderLimitReached` existed and was never emitted. Growth retires that
   refusal below the `u32` index space entirely.
-- **An instrument's ladder range IS its price band.** The memory bound and the
-  fat-finger control are the same mechanism. Implemented in
-  `instrument.rs::to_slot`.
+- **An instrument's band IS its price bound, and now its allocation bound.**
+  `instrument.rs::to_slot` is the fat-finger check, and the band is handed to
+  the engine as its price domain, so the window cannot be grown past it. One
+  mechanism, both controls.
 
 ### Bugs that changed the design
 

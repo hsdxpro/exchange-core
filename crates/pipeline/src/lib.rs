@@ -953,6 +953,22 @@ impl<S: LogStorage> Exchange<S> {
             self.reject(command, RejectReason::UnsupportedTimeInForce);
             return;
         };
+        // A market order is expressed to the book as a limit at the band
+        // extreme, so a resting time-in-force would let its remainder rest
+        // *at that extreme* — never what the sender meant, and with a wide
+        // band it is also how one cheap order would drag the book's window
+        // to its worst case. The engine's own market entry point refuses
+        // exactly this; the venue does not use that entry point, so the rule
+        // is enforced here, before anything is reserved.
+        if command.is_market()
+            && !matches!(
+                tif,
+                TimeInForce::ImmediateOrCancel | TimeInForce::FillOrKill
+            )
+        {
+            self.reject(command, RejectReason::UnsupportedTimeInForce);
+            return;
+        }
         let Some(instrument) = self.instruments.get(command.symbol).copied() else {
             self.reject(command, RejectReason::UnknownSymbol);
             return;

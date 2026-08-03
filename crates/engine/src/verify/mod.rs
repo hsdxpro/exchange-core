@@ -294,9 +294,9 @@ macro_rules! register_checks {
                 names.dedup();
                 assert_eq!(names.len(), total, "duplicate check name registered");
                 assert_eq!(
-                    total, 45,
+                    total, 46,
                     "expected the 42 ported C++ groups, the Rust-only API-surface group, \
-                     and the two windowed-ladder growth groups"
+                     and the three windowed-ladder growth groups"
                 );
             }
         }
@@ -344,6 +344,7 @@ register_checks! {
     l3::level_iteration_and_order_lookup, "L3", "level iteration and direct order lookup";
     l3::sparse_1000_level_sweep, "L3", "sparse 1000-level matching sweep";
     l3::window_growth_preserves_queues_and_priority, "L3", "window growth preserves queues, priority, and the hash";
+    l3::the_window_never_exceeds_its_domain, "L3", "the window never exceeds its stated domain";
 
     differential::randomized_differential_large_capacity, "differential", "randomized differential model: large capacity";
     differential::randomized_differential_capacity_pressure, "differential", "randomized differential model: growth under pool pressure";
