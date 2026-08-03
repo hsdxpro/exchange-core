@@ -3,6 +3,10 @@
 A venue built around the existing matching engine: a binary protocol, 1000+ symbols,
 replicated durability, safe failover, deterministic recovery.
 
+[README.md](README.md) &middot; [ARCHITECTURE.md](ARCHITECTURE.md) &middot;
+[PROTOCOL.md](PROTOCOL.md) &middot; [BENCH.md](BENCH.md) &middot;
+[ENGINEERING.md](ENGINEERING.md)
+
 The guiding constraint is least code that meets the requirement. Where a number appears it
 is derived or measured, not chosen. Where a section describes something that is not built
 it says so in its first sentence — a design document whose reader cannot tell the two apart
@@ -133,9 +137,10 @@ published with the group that sealed it, so a client learns what the venue commi
 the same moment it learns the group was durable. The 32 bytes ride in the four fields a
 checkpoint has no other use for — a full digest, untruncated.
 
-**Unsigned, and that is a real limit.** A client that recomputes a different head knows the
-two disagree. It cannot yet prove to a third party which of them was right, which is what a
-venue signature over the head would add.
+**Signed, since the limit was real.** Unsigned, a chain shows only that the venue agrees
+with itself. Each head is now followed by the venue's Ed25519 signature over
+`(sealed_at, head)` under a chain-specific domain string, which is what makes the head
+evidence a third party can weigh rather than an assertion.
 
 **Snapshot cadence is derived, not picked.** Choose a target recovery time, measure replay
 throughput, snapshot often enough that replay never exceeds it. If replay runs at 5M
@@ -172,19 +177,19 @@ Applied at the risk stage, before matching, in this order:
    connect. Nothing else is accepted until it has — not an order, not a subscription.
 2. The account is inside its send allowance. A token bucket per account, refilled once per
    pass rather than once per command, so a flood is discarded before it is sequenced.
-3. Order is inside the price band. The instrument's ladder range *is* the band, so the
-   memory bound and the fat-finger control are one mechanism rather than two.
-4. The session is acting for its *own* account. A session may name only the account it
+3. The session is acting for its *own* account. A session may name only the account it
    proved, or in an open venue the one its first command claimed. Without this,
    authentication established identity at connect and then bound nothing to it, so one
    valid credential was enough to trade every account on the venue.
-5. The symbol is trading. `Trading`, `CancelOnly` or `Halted`, set by the administrator.
-6. The account has not been stopped. The kill switch, per account.
-7. Order ID above the highest that account has used, so a client may retry an order it
+4. The symbol is trading. `Trading`, `CancelOnly` or `Halted`, set by the administrator.
+5. The account has not been stopped. The kill switch, per account.
+6. Order ID above the highest that account has used, so a client may retry an order it
    never got an answer for without risking a second execution.
-8. Order is inside the price band.
-9. Sufficient free balance; reserve it.
-10. Order count under the instrument's `max_open_orders` cap.
+7. Sufficient free balance; reserve it.
+8. Order is inside the price band, checked in the book adapter as the price maps onto the
+   ladder — the instrument's ladder range *is* the band, so the memory bound and the
+   fat-finger control are one mechanism rather than two.
+9. Order count under the instrument's `max_open_orders` cap.
 
 **Every restriction stops new risk and none of them stops reducing it.** A halted symbol
 and a stopped account both still accept cancels and amends down. A venue that will not let
@@ -207,14 +212,13 @@ The first two happen in the gateway, ahead of the sequencer. That is not inciden
 lookup, a nonce and a clock reading must never reach the deterministic path, or replay
 stops reproducing state.
 
-Self-trade prevention runs inside the matching engine, because only the engine sees both
-sides of a potential match. Default cancel-newest: the resting order survives and the
-incoming aggressor is cancelled, which protects the participant who was there first. This
-matches CME's Self-Match Prevention default and Binance's `EXPIRE_TAKER`.
-
-Self-trade prevention needs an owner on the order, so `OrderSlot` grows from 24 to 32
-bytes. That is the whole justification; earlier drafts also claimed a cache-line benefit
-from an experiment that was inconclusive, and that claim is withdrawn.
+Self-trade prevention runs in the pipeline, ahead of the engine — the engine knows
+nothing about accounts, and the pipeline already maps every resting order to its owner.
+Default cancel-newest: the resting order survives and the incoming aggressor is refused,
+which protects the participant who was there first. This matches CME's Self-Match
+Prevention default and Binance's `EXPIRE_TAKER`. An account with nothing resting on the
+symbol answers the question in one lookup and never touches the book; `OrderSlot` stays
+24 bytes, compile-time asserted.
 
 **Fees never touch matching.** Matching is price-time priority on the raw limit price. The
 engine tags each fill maker or taker; fees apply downstream. Fee-adjusted matching would
@@ -224,8 +228,10 @@ make the engine depend on account state and break the determinism rule.
 
 ## 6. Transport
 
-**TCP only, unencrypted.** One way in, for retail and market makers alike: fixed 64-byte
-records with nothing between the client and the book.
+**TCP, unencrypted, as the primary door**: fixed 64-byte records with nothing between the
+client and the book. A second door, `tls_listen`, wraps the identical protocol in TLS 1.3
+for internet sessions; past the record layer the two are the same. What was rejected is
+encryption *inside the transport* for everyone — QUIC, below.
 
 This reverses an earlier decision in this document, and the measurement is the reason.
 QUIC was built, benchmarked against the same venue and the same traffic, and removed:
@@ -258,15 +264,16 @@ version byte in the header, zero-copy decode. No serialization framework on the 
 ```
 book.{symbol}      depth deltas, and a snapshot on subscribe
 trades.{symbol}    executions
+bbo.{symbol}       top of book, one event per side; restated on subscribe
 account            private: this session's own order lifecycle and fills
 checkpoint         venue-wide: chain heads, when chaining is on
 ```
 
-Three channels rather than the six an earlier draft listed. The private ones collapsed
+Five channels rather than the six an earlier draft listed. The private ones collapsed
 because a client wanting its fills wants its order states too, and splitting them costs a
-second subscription to learn the same story. `bbo.{symbol}` is the one worth adding back:
-top-of-book is the cheapest feed and what most clients actually want, and the engine
-already caches it — but nothing publishes it yet.
+second subscription to learn the same story. `bbo.{symbol}` earned its way back for the
+opposite reason: top-of-book is the cheapest feed and what most clients actually want,
+and the engine already caches it.
 
 Every message carries `(channel, sequence)`, so a client detects a gap by arithmetic rather
 than by waiting for a timeout.
@@ -355,10 +362,11 @@ time standard, so it never leaves the process.
 
 ## 9. Stack
 
-**No async runtime on the matching path.** Sequencer, risk and matching run on pinned,
-busy-polling threads with single-producer single-consumer ring buffers between them. An
-async runtime there buys nothing and costs scheduling jitter. Async lives in the gateway,
-where the problem is connection count rather than per-message latency.
+**No async runtime on the matching path — or in the gateway.** One thread runs
+sequencing, risk and matching as direct calls, and the same thread serves connections by
+`mio` readiness. An async runtime there buys nothing and costs scheduling jitter. The one
+async runtime in the tree is `openraft`'s tokio, confined to `bx-election` and the
+leadership log an order never enters.
 
 Two columns, because a design document that does not separate what exists from what is
 intended is worse than none: a reader cannot tell which parts have been tested against
@@ -369,22 +377,23 @@ reality.
 | Language | Rust 1.97+, edition 2024 | — |
 | Matching path | one thread per partition, no async runtime | thread pinning |
 | Encoding | fixed 64-byte records via `zerocopy` | — |
-| Transport | TCP, unencrypted, `mio` readiness | raw UDP or shm for colo |
-| Gateway | sessions, framing, group commit, Ed25519 challenge, per-account rate limits | `ed25519-dalek` |
+| Transport | TCP + TLS 1.3, `mio` readiness | raw UDP or shm for colo |
+| Gateway | sessions, framing, group commit, Ed25519 challenge (`ed25519-dalek`), per-account rate limits | — |
 | Durability | group commit; quorum to followers, fenced by term | — |
 | Consensus | `openraft`, on a separate leadership log | — |
 | Journal I/O | buffered `std`, one write and one sync per group | `io_uring`, SQPOLL |
 | Timestamps | `ingress_ns` journalled, `match_ns` on the ack | NIC hardware stamping |
-| Metrics | log-linear histograms, sampled every 64th pass | export to a scrape endpoint |
+| Metrics | log-linear histograms, sampled every 64th pass; Prometheus text at `metrics_listen` | — |
 
-Dependencies sit at the edge deliberately. The engine has none, `protocol`/`journal`/
-`pipeline` use only `zerocopy`, and everything the transport needs lives in `gateway` — so
-none of the thirty-three crates in the lockfile can reach the matching path.
+Dependencies sit at the edge deliberately. The engine has none; `protocol` reaches only
+`zerocopy`; `journal` adds `sha2` for the chain and `socket2` to bound replication socket
+buffers; `pipeline` adds `ed25519-dalek` for chain signatures; everything the transport
+needs lives in `gateway`. Nothing in the lockfile can reach the matching path.
 
 Two of the intended choices were deliberately deferred, with reasons in
 [`ENGINEERING.md`](ENGINEERING.md). **`openraft`** because an openraft entry is
 variable-length and heterogeneous, so routing the command log through it would cost the
-zero-copy replay and O(1) sequence seek that make a 1.3 ms restart possible; election belongs
+zero-copy replay and O(1) sequence seek that make a 0.9 ms restart possible; election belongs
 on a separate leadership log whose term feeds the fencing that already exists.
 **`io_uring`** because the measurement said the cost was one syscall *per record* rather than
 the syscall mechanism, and batching the writes recovered 8.6x without leaving `std`;
@@ -415,7 +424,7 @@ custom transport becomes the bottleneck.
 | Self-match | cancel-newest; the resting order survives |
 | Client retries an order it got no answer for | Refused. Order IDs increase per account, so an ID already accepted cannot be sent again whatever became of the order it named — a retry is safe, because at most one attempt can ever be live. `DuplicateOrderId` means the ID is live now; `OrderIdNotIncreasing` means it was used and is finished, which is what tells a retrying client its first attempt landed |
 | Leader dies between the ack and the outcome | **Closed by the watermark.** The venue journals a marker every 64 groups meaning "everything before me was handed to the feed". Recovery regenerates the private outcomes past the last marker, and the first session to act for each account is handed them on reconnect, sequence zero, before anything else — told, not queried. Never the ack itself: durable is what the ack means, so redelivering it would report every order twice. What remains outside the marker is bytes the kernel accepted but never sent, which the client detects as a gap and resolves by RESUME |
-| Two accounts choose the same order ID | **Known defect, and not an adversarial one.** Order IDs are venue-global, so the second account to use ID 1 is refused as a duplicate. This was first written down as griefing -- one client denying another an ID -- which undersold it: two ordinary clients that both number their orders from one collide on their first, which is what a client library does by default and what FIX and OUCH namespace per client precisely to avoid. `pipeline/tests/risk.rs` holds the case, ignored, so the fix has something to switch on. The cost was also mis-stated: the engine does not have to report a fill's owner and `Fill` does not have to grow. The pipeline's own slot table already maps an engine slot to a client order ID, so it can carry the account beside it -- eight bytes per order slot, on a lookup that already happens. What remains genuinely on the hot path is the reservation key widening from eight bytes to sixteen, which wants measuring before and after rather than assuming |
+| Two accounts choose the same order ID | **Fixed.** Orders are keyed by account *and* ID throughout — reservations, the slot table, the per-account high-water mark — so both clients may number from one. The cost landed where predicted, on the most lookup-heavy path: cancel measured 207 → 335 ns with the sixteen-byte key, everything else flat or better on the same run. `pipeline/tests/risk.rs` pins the case, active |
 
 A panic on a matching thread is a deliberate abort with a state dump, then replay — never a
 caught exception. An engine that continues after violating an invariant is worse than one
@@ -429,15 +438,17 @@ that stops.
    publishes only fills.
 2. **Sequencer, journal, replay, single node.** Prove replay reproduces state
    bit-identically, extending the existing golden-hash check.
-3. **Accounts, reservation, risk checks.** Including the price band and the 32-byte slot.
+3. **Accounts, reservation, risk checks.** Including the price band.
 4. **Gateway and binary protocol.** Built on QUIC, measured, moved to TCP.
 5. **Subscriptions.** Snapshot, delta, resume, ring buffer.
-6. **Quorum replication and term fencing.** Done. Election is not — see §3.
-7. **Scale-out.** Split fanout from publisher when connection count demands it.
+6. **Quorum replication, term fencing, election.** `openraft` on its separate leadership
+   log; the failover suite promotes a node with no person involved.
+7. **Scale-out.** The public feed has its own thread and port (`feed_listen`) and an
+   optional multicast leg; its own *process* is the remaining step, taken when connection
+   count rather than order rate is what hurts.
 
-Steps 1–6 exist, except election. Step 7 is untouched: one process still holds the
-publisher and the fanout, which the idle-connection measurement says is right until the
-connection count rather than the order rate is what hurts.
+Steps 1–6 exist. Step 7 is half-taken, for the reason the idle-connection measurement
+gives.
 
 Each step leaves the system runnable and verifiable. The existing approach — differential
 tests against an independently written model, plus a golden replay hash — extends to every

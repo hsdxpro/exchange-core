@@ -2,8 +2,10 @@
 
 Why the code is shaped the way it is: the decisions that were argued out, the
 alternatives that were rejected and on what grounds, and the bugs that changed
-the design. [`README.md`](README.md) is the entry point and
-[`DESIGN.md`](DESIGN.md) is the architecture.
+the design. [README.md](README.md) is the entry point,
+[ARCHITECTURE.md](ARCHITECTURE.md) the code map, [DESIGN.md](DESIGN.md) the
+design reasoning, [PROTOCOL.md](PROTOCOL.md) the wire, and
+[BENCH.md](BENCH.md) the numbers with their methodology.
 
 The measurements below were taken on one desktop and drift by a factor of two or
 more on a loaded machine, so they are reported as minimum-of-N and any A/B
@@ -12,27 +14,17 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**312 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
+**475 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), and everything.
 
 | Crate | Tests | Covers |
 |---|---|---|
-| `bx-engine` | 44 | The engine's own suite. |
-| `bx-protocol` | 12 | Record layout, discriminants, order type, subscription channels. |
-| `bx-journal` | 31 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, and replication quorum. |
-| `bx-pipeline` | 57 | Prices, balances, engine adapter, deltas, hashing, snapshots, and the crossable walk's complexity. |
-| `bx-gateway` | 56 | Framing, the group-commit loop, the HMAC challenge, token buckets, histogram buckets, config parsing and validation. |
-| end-to-end | 22 | Full path with simulated traders and a subscriber, and the open-order index under scrambled cancellation. |
-| subscription | 7 | Channels, resume after disconnect, lagging out of the window. |
-| snapshot | 6 | Snapshot/restore equality with a full replay, queue priority. |
-| simulation | 4 | Seeded crash injection, torn writes, dead device, replay determinism. |
-| over sockets | 20 | Real TCP: split records, disconnects, bursts, selective subscription, top-of-book, unsubscribe, and a subscriber index that does not grow under connection churn. |
-| top of book | 13 | What the cheap feed does not send, which is the whole point of it. |
-| venue snapshots | 7 | Cadence from a recovery target, atomic replace, corrupt snapshot refused. |
-| failover, partitioning | 4 | Real processes: a cluster elects its own leader and replaces it when it dies with nobody editing a file, promotion recovers acked records, no majority means no service, and two venues over disjoint symbol sets each own only what they list. |
+| `bx-engine` | 44 | 43 named verify check groups (differential vs. independent models, exhaustive TIF/quantity combinations, randomized workloads, the golden replay hash) plus the check registry itself. |
+| `bx-protocol` | 16 | Record layout, discriminants, field aliasing, subscription channels. |
+| `bx-journal` | 36 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, replication quorum and term fencing, partitions. |
+| `bx-pipeline` | 167 | Books, balances, hub, snapshots, instruments in `src`; end-to-end, chain, risk, BBO, subscription, watermark, snapshot and crash simulation in `tests/`. |
+| `bx-gateway` | 207 | Config, the Ed25519 challenge, token buckets, codec, handoff, multicast, metrics, TLS in `src`; admission, over-TCP, over-feed, over-TLS, venue snapshots, shipped binaries, failover, machine-down, idle cost and many-clients over real sockets and processes in `tests/`. |
 | `bx-election` | 4 | Three nodes electing one leader, a higher term after a death, a minority electing nobody, and a vote that survives a restart. |
-| idle cost | 2 | A pass over 256 idle connections costs no more than a pass over one. |
-| many clients | 1 | A million accounts, and the memory that costs. |
-| admission | 20 | Real sockets: an unproven order never reaches the book, a captured proof does not open the next connection, a flood is cut to its allowance, a refusal is counted against its reason, an acknowledgement carries when the venue saw the order. |
+| `xtask` | 1 | The task-runner's own string hygiene. |
 
 ### The end-to-end tests matter most
 
@@ -325,12 +317,12 @@ for the reasons above; nothing here should read as shipped until it is.
   `WouldBlock`, which keeps the fairness bound and costs one extra read after a
   session's last data.
 - **A per-channel cost multiplies by the instrument list.** The retention window
-  is 64 bytes an event per channel and there are two public channels per symbol,
-  so the shipped default of 65,536 wanted 7.8 GiB across a thousand
-  instruments -- an out-of-memory kill, from following the example config. The
-  default is now 8,192 (1 GiB at a thousand symbols) and the configuration
-  refuses to start when the window times the instrument list exceeds a stated
-  budget.
+  is 64 bytes an event per channel and there are three public channels per
+  symbol (book, trades, bbo), so the old default of 65,536 wanted ~11.7 GiB
+  across a thousand instruments -- an out-of-memory kill, from following the
+  example config. The default is now 8,192 (~1.5 GiB at a thousand symbols) and
+  the configuration refuses to start when the window times the instrument list
+  exceeds a stated budget.
 - **A dense table is only cheap if its index is bounded.** Instruments live in a
   table indexed by symbol, which makes lookup a bounds check and an offset. It
   also means one instrument numbered 4,294,967,295 asks for a four-billion-entry
@@ -458,13 +450,17 @@ One, and it is a distributed-systems question rather than a threading one.
    the partitions reserve against; partitioning accounts as well as symbols, with
    a crossbar between the two; or pre-allocated buying power per partition,
    rebalanced out of band. The last is what several venues actually do, because
-   it keeps the matching path free of any remote call.
+   it keeps the matching path free of any remote call — and its primitive now
+   exists: an allotment moves as a `Withdraw` sequenced in one journal and a
+   `Deposit` in the other, withdraw first so a crash strands value rather than
+   minting it. What is still unbuilt is the settlement process that drives the
+   pair and rebalances.
 
    Until that is answered, a deployment partitions by asset class or by
    settlement currency, so accounts rarely straddle a boundary — which is also
    what venues do.
 
 Smaller, if wanted: MBO for colocated clients, fee schedules at settlement,
-`io_uring` behind `LogStorage`, trading halts, NIC hardware timestamping behind
-the `ingress_ns` field.
+`io_uring` behind `LogStorage`, NIC hardware timestamping behind the
+`ingress_ns` field.
 
