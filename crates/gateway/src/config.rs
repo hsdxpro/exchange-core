@@ -162,6 +162,19 @@ impl InstrumentDraft {
                 format!("max_open_orders exceeds the engine's limit of {MAX_OPEN_ORDERS_LIMIT}"),
             ));
         }
+        // Every price the band holds must be one the venue can settle. A
+        // notional is price times quantity in unsigned money, so a trade at
+        // zero or below has no representable value: settlement would fail
+        // *after* the fill was published, leaving the maker's asset reserved
+        // against an order the engine had already deleted. Refused here,
+        // where it is a line in a file, rather than as a frozen balance.
+        if floor_ticks < 1 {
+            return Err(ConfigError::at(
+                line,
+                "floor_ticks is below 1, and the venue settles price times \
+                 quantity as unsigned money: it cannot trade at zero or less",
+            ));
+        }
         // The band is policy and the worst-case level-table allocation both:
         // the book is dense between its lowest and highest resting prices, at
         // 16 bytes a tick per side. A ceiling is therefore stated per
@@ -173,6 +186,8 @@ impl InstrumentDraft {
                     "ceiling_ticks is below floor_ticks, so the band is empty",
                 ));
             }
+            // Both are positive and ordered by the checks above, so this
+            // subtraction cannot overflow.
             if ceiling_ticks - floor_ticks >= MAX_BAND_SLOTS {
                 return Err(ConfigError::at(
                     line,
@@ -1331,10 +1346,21 @@ max_open_orders = 10
     }
 
     #[test]
-    fn a_negative_floor_price_is_allowed_because_prices_are_signed() {
-        let text = VALID.replace("floor_ticks = 10000", "floor_ticks = -5000");
+    fn a_band_the_venue_cannot_settle_is_refused() {
+        // Prices are signed on the wire, but a notional is unsigned money.
+        // A band reaching zero or below would let a trade print and then
+        // fail settlement, leaving the maker's asset reserved against an
+        // order the engine had already removed -- so it is refused at the
+        // line that declares it.
+        for floor in ["-5000", "0"] {
+            let text = VALID.replace("floor_ticks = 10000", &format!("floor_ticks = {floor}"));
+            let error = refusal(&text);
+            assert!(error.contains("floor_ticks is below 1"), "got {error}");
+        }
+        // One tick is the lowest settleable price, and it is accepted.
+        let text = VALID.replace("floor_ticks = 10000", "floor_ticks = 1");
         let config = Config::parse(&text).unwrap();
-        assert_eq!(config.instruments.get(1).unwrap().floor_ticks, -5_000);
+        assert_eq!(config.instruments.get(1).unwrap().floor_ticks, 1);
     }
 
     #[test]

@@ -29,6 +29,29 @@ fn accepted(events: &[Event]) -> bool {
 }
 
 #[test]
+fn every_price_a_book_can_print_at_is_one_the_venue_can_settle() {
+    // Settlement values a fill as price times quantity in unsigned money, so
+    // a trade at zero or below could publish and then fail to settle. The
+    // band is what makes that unreachable: its floor is the lowest price any
+    // order can name, and the floor is validated positive where it is
+    // declared. This pins the property from the trading side -- an order
+    // below the floor is refused before it can rest, so no fill can carry a
+    // price settlement cannot value.
+    let mut exchange = funded();
+    let instrument = instruments().get(SYMBOL).copied().expect("listed");
+    assert!(instrument.floor_ticks >= 1, "a band must be settleable");
+
+    let mut below = limit_order(2, SYMBOL, 10, Side::Bid, instrument.floor_ticks - 1, 1);
+    assert!(rejected_with(
+        exchange.submit(&mut below).unwrap(),
+        RejectReason::OutsidePriceBand
+    ));
+    let mut at_floor = limit_order(2, SYMBOL, 11, Side::Bid, instrument.floor_ticks, 1);
+    assert!(accepted(exchange.submit(&mut at_floor).unwrap()));
+    assert_eq!(bx_pipeline::accounting_violations(), 0);
+}
+
+#[test]
 fn a_market_order_with_a_resting_time_in_force_is_refused() {
     // A market order is expressed to the book as a limit at the band
     // extreme, so a resting TIF would rest its remainder at that extreme --

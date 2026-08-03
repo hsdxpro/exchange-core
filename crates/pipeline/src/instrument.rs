@@ -120,13 +120,21 @@ impl Instrument {
         max_quantity: Quantity,
         max_open_orders: u32,
     ) -> Self {
-        // Prices are signed and a floor below zero is legitimate; what must
-        // never happen is the pair wrapping, because release builds do not
-        // trap overflow and a wrapped span passes the comparisons below.
-        let Some(span) = ceiling_ticks.checked_sub(floor_ticks) else {
-            panic!("instrument band is invalid: its width overflows");
-        };
-        assert!(span >= 0, "instrument band is empty: ceiling below floor");
+        // Prices are a signed type on the wire, but a band may only hold
+        // prices the venue can settle: a notional is price times quantity in
+        // unsigned money, so a trade at zero or below has no representable
+        // value and would fail settlement *after* its fill was published.
+        // The configuration parser refuses this with a line number first.
+        assert!(
+            floor_ticks >= 1,
+            "instrument band starts below 1; the venue cannot settle a trade at zero or less"
+        );
+        assert!(
+            ceiling_ticks >= floor_ticks,
+            "instrument band is empty: ceiling below floor"
+        );
+        // Both positive and ordered, so the width cannot overflow.
+        let span = ceiling_ticks - floor_ticks;
         assert!(
             span < MAX_BAND_SLOTS,
             "instrument band exceeds the engine's 31-bit price domain"
@@ -260,10 +268,10 @@ mod tests {
     fn lookup_is_by_symbol_and_missing_symbols_are_absent() {
         let mut set = Instruments::new();
         set.insert(instrument());
-        set.insert(Instrument::new(9, 100, 200, 0, 10, 1_024));
+        set.insert(Instrument::new(9, 100, 200, 1, 10, 1_024));
         assert_eq!(set.iter().count(), 2);
         assert_eq!(set.get(1).unwrap().floor_ticks, 10_000);
-        assert_eq!(set.get(9).unwrap().floor_ticks, 0);
+        assert_eq!(set.get(9).unwrap().floor_ticks, 1);
         assert!(set.get(2).is_none());
         assert!(set.get(1_000).is_none());
     }

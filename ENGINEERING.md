@@ -14,7 +14,7 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**480 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), everything in
+**481 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), everything in
 debug, and the engine suite again in release — debug runs the Quick workload,
 and only Full checks the golden replay hash and drives the randomized
 differentials at depth.
@@ -24,7 +24,7 @@ differentials at depth.
 | `bx-engine` | 47 | 46 named verify check groups (differential vs. independent models, exhaustive TIF/quantity combinations, randomized workloads, the golden replay hash) plus the check registry itself. |
 | `bx-protocol` | 16 | Record layout, discriminants, field aliasing, subscription channels. |
 | `bx-journal` | 36 | Append/replay, torn writes, crash before sync, corruption, device failure, real files, replication quorum and term fencing, partitions. |
-| `bx-pipeline` | 168 | Books, balances, hub, snapshots, instruments in `src`; end-to-end, chain, risk, BBO, subscription, watermark, snapshot and crash simulation in `tests/`. |
+| `bx-pipeline` | 169 | Books, balances, hub, snapshots, instruments in `src`; end-to-end, chain, risk, BBO, subscription, watermark, snapshot and crash simulation in `tests/`. |
 | `bx-gateway` | 208 | Config, the Ed25519 challenge, token buckets, codec, handoff, multicast, metrics, TLS in `src`; admission, over-TCP, over-feed, over-TLS, venue snapshots, shipped binaries, failover, machine-down, idle cost and many-clients over real sockets and processes in `tests/`. |
 | `bx-election` | 4 | Three nodes electing one leader, a higher term after a death, a minority electing nobody, and a vote that survives a restart. |
 | `xtask` | 1 | The task-runner's own string hygiene. |
@@ -361,6 +361,23 @@ for the reasons above; nothing here should read as shipped until it is.
 
 ### Bugs that changed the design
 
+- **A band that reached zero could print a trade nothing could settle.**
+  Prices are signed on the wire and a negative floor parsed happily, but a
+  notional is price times quantity in *unsigned* money. An ask resting below
+  zero would trade, publish both fills, and then fail settlement: no assets
+  moved, the maker's reservation was never consumed, and the order it was
+  held against had already been deleted -- an asset frozen for the life of
+  the venue, with only a violations counter to show for it. The band now has
+  to start at one tick or higher, refused at the line that declares it. The
+  same rule is what keeps `notional`'s `None` unreachable from a fill.
+- **The market/TIF refusal changes how a pre-fix journal replays.** A market
+  order carrying a resting time-in-force used to be accepted and rest at the
+  band extreme; it is now refused, so a journal recorded before the fix
+  replays that command -- and anything that traded against its remainder --
+  differently. Deliberate: reproducing the old behaviour would mean
+  reproducing a way to grow a book's window to its worst case for one unit of
+  margin. Snapshots are unaffected, since `Book::restore` re-adds resting
+  orders directly and pre-fix resting prices were all inside the band.
 - **QUIC sessions were never reaped.** The venue frees a session when told the
   peer has gone; the stream writer was parked waiting for the venue to free it.
   Each waited on the other, so a disconnected client stayed in the map for good
