@@ -1,4 +1,4 @@
-use bx_engine::verify::{self, Rng, Workload, sparse_prices};
+use bx_engine::verify::{self, Rng, Workload};
 use bx_engine::{
     ExecutionReport, L3Book, OrderError, OrderSlot, PriceLevel, Side, TimeInForce, mix64,
 };
@@ -103,6 +103,41 @@ where
     }
     let sample_count = samples.len();
     (summarize(samples), sample_count)
+}
+
+/// Builds exactly `count` prices spread across `[low, high]` so traversal never
+/// benefits from dense, adjacent occupancy.
+///
+/// # Panics
+///
+/// Panics if `[low, high]` cannot supply `count` distinct prices.
+#[must_use]
+pub fn sparse_prices(low: u16, high: u16, count: usize) -> Vec<u16> {
+    let span = u32::from(high) - u32::from(low);
+    let mut prices: Vec<u16> = (0..count)
+        .map(|index| {
+            let base = u32::from(low) + ((index as u64 * u64::from(span)) / count as u64) as u32;
+            (base + (index % 3) as u32) as u16
+        })
+        .collect();
+    prices.sort_unstable();
+    prices.dedup();
+
+    let mut candidate = u32::from(low);
+    while prices.len() < count && candidate <= u32::from(high) {
+        let price = candidate as u16;
+        if prices.binary_search(&price).is_err() {
+            prices.push(price);
+            prices.sort_unstable();
+        }
+        candidate += 1;
+    }
+    assert_eq!(
+        prices.len(),
+        count,
+        "price range cannot supply {count} prices"
+    );
+    prices
 }
 
 fn make_resting_orders(count: usize) -> Vec<RestingOrder> {
@@ -708,7 +743,7 @@ fn main() -> ExitCode {
             },
             BenchResult {
                 scenario: "sweep 1,000 sparse levels",
-                does: "execute against 1,000 makers spread across the full price domain in one order",
+                does: "execute against 1,000 makers spread across 31,000 ticks in one order",
                 unit: "fill",
                 stats: sparse_stats,
                 work_per_operation: 1_000.0,

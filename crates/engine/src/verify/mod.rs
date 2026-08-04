@@ -110,42 +110,6 @@ impl Rng {
     }
 }
 
-/// Builds exactly `count` prices spread across `[low, high]` so traversal never
-/// benefits from dense, adjacent occupancy. Shared with the benchmark so both
-/// measure and verify the same sparse shape.
-///
-/// # Panics
-///
-/// Panics if `[low, high]` cannot supply `count` distinct prices.
-#[must_use]
-pub fn sparse_prices(low: u16, high: u16, count: usize) -> Vec<u16> {
-    let span = u32::from(high) - u32::from(low);
-    let mut prices: Vec<u16> = (0..count)
-        .map(|index| {
-            let base = u32::from(low) + ((index as u64 * u64::from(span)) / count as u64) as u32;
-            (base + (index % 3) as u32) as u16
-        })
-        .collect();
-    prices.sort_unstable();
-    prices.dedup();
-
-    let mut candidate = u32::from(low);
-    while prices.len() < count && candidate <= u32::from(high) {
-        let price = candidate as u16;
-        if prices.binary_search(&price).is_err() {
-            prices.push(price);
-            prices.sort_unstable();
-        }
-        candidate += 1;
-    }
-    assert_eq!(
-        prices.len(),
-        count,
-        "price range cannot supply {count} prices"
-    );
-    prices
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Check {
     pub group: &'static str,
