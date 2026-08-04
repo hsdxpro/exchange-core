@@ -11,9 +11,10 @@ use crate::{
     Side, SweepResult, TimeInForce,
 };
 
-const ALL_ERRORS: [OrderError; 10] = [
+const ALL_ERRORS: [OrderError; 11] = [
     OrderError::QuantityZero,
     OrderError::OrderIdOutOfRange,
+    OrderError::PriceOutOfDomain,
     OrderError::DuplicateOrderId,
     OrderError::UnknownOrderId,
     OrderError::CapacityExceeded,
