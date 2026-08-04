@@ -800,14 +800,6 @@ impl State {
     }
 }
 
-/// Frames one event the way a subscriber reads it. Used by tests and by
-/// anything that needs the feed's wire form without the feed.
-pub fn framed(event: &Event) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode(event, &mut out);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

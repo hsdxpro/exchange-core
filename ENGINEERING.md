@@ -14,7 +14,7 @@ timing is not evidence of anything.
 
 ## What exists, and what proves it
 
-**481 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), everything in
+**476 tests pass.** `cargo x` runs fmt, clippy (`-D warnings`), everything in
 debug, and the engine suite again in release — debug runs the Quick workload,
 and only Full checks the golden replay hash and drives the randomized
 differentials at depth.

@@ -228,8 +228,8 @@ impl Metrics {
         self.groups
     }
 
-    #[must_use]
-    pub const fn group_size(&self) -> &Histogram {
+    #[cfg(test)]
+    const fn group_size(&self) -> &Histogram {
         &self.group_size
     }
 

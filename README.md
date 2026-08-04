@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml"><img src="https://github.com/hsdxpro/exchange-core/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/rust-1.97.1-000000?logo=rust" alt="Rust 1.97.1">
-  <img src="https://img.shields.io/badge/tests-481%20passing-success" alt="481 tests">
+  <img src="https://img.shields.io/badge/tests-476%20passing-success" alt="476 tests">
   <img src="https://img.shields.io/badge/engine%20deps-0-success" alt="Zero engine dependencies">
   <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="Forbid unsafe">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
@@ -53,7 +53,7 @@ same `cargo x` on Linux and Windows — green locally and green on a runner
 cannot become two different things.
 
 ```bash
-cargo x           # format, clippy -D warnings, all 481 tests
+cargo x           # format, clippy -D warnings, all 476 tests
 cargo x latency   # reproduces BENCH.md's command-path and durability tables
 ```
 
@@ -179,7 +179,7 @@ two constraints learned by getting them wrong.
 
 ## Testing
 
-481 tests. The ones worth reading are in the claims table above; the shape:
+476 tests. The ones worth reading are in the claims table above; the shape:
 
 - **End-to-end with nothing faked** — simulated traders through the real API, a
   subscriber that knows only the event stream rebuilds the book from deltas and

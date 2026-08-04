@@ -1,14 +1,10 @@
-//! Public API surface that the ported C++ groups do not reach.
-//!
-//! The C++ suite has no equivalent of this group: these are Rust-specific
-//! surfaces (trait impls, `Default`) plus `top_checksum`, which exists for the
-//! benchmark and would otherwise ship with no test at all.
+//! Public API surface the scenario groups do not reach: trait impls,
+//! `Default`, and error formatting.
 
 use super::{CheckResult, Workload, require};
 use crate::PRICE_COUNT;
 use crate::{
-    ConfigurationError, ExecutionReport, HierarchicalBitmap, L2Book, NO_ASK, NO_BID, OrderError,
-    Side, SweepResult, TimeInForce,
+    ConfigurationError, ExecutionReport, HierarchicalBitmap, OrderError, Side, TimeInForce,
 };
 
 const ALL_ERRORS: [OrderError; 11] = [
@@ -42,21 +38,10 @@ pub fn public_api_surface(_workload: Workload) -> CheckResult {
 
     // `Default` must agree with `new` rather than deriving a zeroed state.
     require!(HierarchicalBitmap::new(PRICE_COUNT).is_empty());
-    require!(L2Book::default().best_bid() == NO_BID);
-    require!(L2Book::default().best_ask() == NO_ASK);
 
     // Average price is defined as zero when nothing traded, so callers do not
     // have to guard against a division by zero.
-    require!(SweepResult::default().average_price() == 0.0);
     require!(ExecutionReport::default().average_price() == 0.0);
-
-    let sweep = SweepResult {
-        requested_quantity: 10,
-        filled_quantity: 4,
-        notional_ticks: 404,
-        levels_visited: 2,
-    };
-    require!(sweep.average_price() == 101.0);
 
     let report = ExecutionReport {
         fills: 2,
@@ -65,27 +50,6 @@ pub fn public_api_surface(_workload: Workload) -> CheckResult {
         ..ExecutionReport::default()
     };
     require!(report.average_price() == 100.0);
-
-    // `top_checksum` must depend on price, quantity, and rank, or it would not
-    // detect a reordered book.
-    let mut book = L2Book::new();
-    book.set_level(Side::Bid, 100, 5);
-    book.set_level(Side::Bid, 99, 7);
-    let baseline = book.top_checksum(Side::Bid, 10);
-    require!(baseline != 0);
-    require!(book.top_checksum(Side::Bid, 10) == baseline);
-    require!(book.top_checksum(Side::Bid, 1) != baseline);
-    require!(book.top_checksum(Side::Ask, 10) != baseline);
-
-    book.set_level(Side::Bid, 99, 8);
-    require!(book.top_checksum(Side::Bid, 10) != baseline);
-
-    // Swapping the two quantities between the two prices must change the
-    // checksum, proving rank is mixed in rather than the multiset of levels.
-    let mut swapped = L2Book::new();
-    swapped.set_level(Side::Bid, 100, 7);
-    swapped.set_level(Side::Bid, 99, 5);
-    require!(swapped.top_checksum(Side::Bid, 10) != baseline);
 
     require!(Side::Bid.opposite() == Side::Ask);
     require!(Side::Ask.opposite() == Side::Bid);

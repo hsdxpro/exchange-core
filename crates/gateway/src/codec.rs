@@ -84,8 +84,8 @@ impl Decoder {
         decoded
     }
 
-    #[must_use]
-    pub const fn is_full(&self) -> bool {
+    #[cfg(test)]
+    const fn is_full(&self) -> bool {
         self.filled == self.buffer.len()
     }
 

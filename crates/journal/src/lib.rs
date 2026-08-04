@@ -387,10 +387,10 @@ fn seeded(head: &[u8; CHAIN_LEN]) -> Sha256 {
 
 /// Extends a chain by one group of records.
 ///
-/// One function, so the venue that publishes a head and anyone recomputing it
-/// from the feed cannot disagree about what is hashed or in what order. A client
-/// with the previous head and the records of a group arrives at the next head or
-/// finds it does not, and there is nothing else to know.
+/// The client-side recompute: a follower with the previous head and a
+/// group's records arrives at the next head or finds it does not. The venue
+/// itself folds records incrementally as they append; the chain tests hold
+/// the two paths to the same answer.
 #[must_use]
 pub fn chain_next<'a>(
     head: &[u8; CHAIN_LEN],
@@ -722,9 +722,10 @@ impl<S: LogStorage> Journal<S> {
         &self.storage
     }
 
-    /// The storage underneath, mutably. For tests and tools that need to
-    /// interfere with it — a deployment drives it through the journal.
-    pub fn storage_mut(&mut self) -> &mut S {
+    /// The storage underneath, mutably, so tests can interfere with it —
+    /// a deployment drives it through the journal.
+    #[cfg(test)]
+    pub(crate) fn storage_mut(&mut self) -> &mut S {
         &mut self.storage
     }
 

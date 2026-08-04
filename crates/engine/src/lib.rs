@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_debug_implementations)]
 
-//! A compact single-instrument L2/L3 order book built around a hierarchical
+//! A compact single-instrument limit order book built around a hierarchical
 //! occupancy bitmap and strict price-time priority.
 //!
 //! The steady state is allocation-free: the slot pool and the price window
@@ -15,8 +15,8 @@ pub mod verify;
 use core::fmt;
 use core::mem::size_of;
 
-/// The fixed price domain of [`L2Book`], and the window an [`L3Book`] boots
-/// with before growth: 65,536 slots, 2 MiB of level table per book.
+/// The price window an [`L3Book`] boots with before growth: 65,536 slots,
+/// 2 MiB of level table per book.
 pub const PRICE_COUNT: usize = 1 << 16;
 
 /// The L3 price domain: 31 bits, so a price and its side pack into one word
@@ -202,12 +202,6 @@ impl HierarchicalBitmap {
     #[must_use]
     pub fn span(&self) -> usize {
         self.span
-    }
-
-    pub fn clear(&mut self) {
-        self.leaf.fill(0);
-        self.summary.fill(0);
-        self.root.fill(0);
     }
 
     #[must_use]
@@ -433,223 +427,6 @@ fn least_bit(value: u64) -> usize {
 #[inline]
 fn greatest_bit(value: u64) -> usize {
     BITS_PER_WORD - 1 - value.leading_zeros() as usize
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SweepResult {
-    pub requested_quantity: u64,
-    pub filled_quantity: u64,
-    pub notional_ticks: u64,
-    pub levels_visited: u32,
-}
-
-impl SweepResult {
-    #[must_use]
-    pub fn average_price(self) -> f64 {
-        if self.filled_quantity == 0 {
-            0.0
-        } else {
-            self.notional_ticks as f64 / self.filled_quantity as f64
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct L2Side {
-    quantity: Box<[u32]>,
-    active: HierarchicalBitmap,
-    best: i32,
-    total_quantity: u64,
-}
-
-impl L2Side {
-    fn new(best: i32) -> Self {
-        Self {
-            quantity: vec![0; PRICE_COUNT].into_boxed_slice(),
-            active: HierarchicalBitmap::new(PRICE_COUNT),
-            best,
-            total_quantity: 0,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct L2Book {
-    sides: [L2Side; 2],
-}
-
-impl L2Book {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            sides: [L2Side::new(NO_BID), L2Side::new(NO_ASK)],
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.sides[0].quantity.fill(0);
-        self.sides[0].active.clear();
-        self.sides[0].best = NO_BID;
-        self.sides[0].total_quantity = 0;
-
-        self.sides[1].quantity.fill(0);
-        self.sides[1].active.clear();
-        self.sides[1].best = NO_ASK;
-        self.sides[1].total_quantity = 0;
-    }
-
-    pub fn set_level(&mut self, side: Side, price: u16, quantity: u32) {
-        let state = &mut self.sides[side.index()];
-        let price_index = usize::from(price);
-        let old_quantity = state.quantity[price_index];
-        if old_quantity == quantity {
-            return;
-        }
-
-        state.quantity[price_index] = quantity;
-        state.total_quantity = state.total_quantity - u64::from(old_quantity) + u64::from(quantity);
-
-        if old_quantity == 0 && quantity != 0 {
-            state.active.insert(u32::from(price));
-            match side {
-                Side::Bid => state.best = state.best.max(i32::from(price)),
-                Side::Ask => state.best = state.best.min(i32::from(price)),
-            }
-        } else if old_quantity != 0 && quantity == 0 {
-            state.active.remove(u32::from(price));
-            if state.best == i32::from(price) {
-                state.best = match side {
-                    Side::Bid => state.active.last(),
-                    Side::Ask => state.active.first(),
-                };
-            }
-        }
-    }
-
-    #[must_use]
-    pub fn quantity(&self, side: Side, price: u16) -> u32 {
-        self.sides[side.index()].quantity[usize::from(price)]
-    }
-
-    #[must_use]
-    pub fn total_quantity(&self, side: Side) -> u64 {
-        self.sides[side.index()].total_quantity
-    }
-
-    #[must_use]
-    pub fn best_bid(&self) -> i32 {
-        self.sides[Side::Bid.index()].best
-    }
-
-    #[must_use]
-    pub fn best_ask(&self) -> i32 {
-        self.sides[Side::Ask.index()].best
-    }
-
-    pub fn for_each_top<F>(&self, side: Side, limit: usize, mut visitor: F) -> usize
-    where
-        F: FnMut(u16, u32),
-    {
-        let state = &self.sides[side.index()];
-        let mut price = state.best;
-        let mut visited = 0;
-        while visited < limit && valid_price(price) {
-            visitor(price as u16, state.quantity[price as usize]);
-            visited += 1;
-            price = match side {
-                Side::Bid => state.active.previous(price as u32),
-                Side::Ask => state.active.next(price as u32),
-            };
-        }
-        visited
-    }
-
-    #[must_use]
-    pub fn sweep(&self, side: Side, target_quantity: u64) -> SweepResult {
-        let state = &self.sides[side.index()];
-        let mut result = SweepResult {
-            requested_quantity: target_quantity,
-            ..SweepResult::default()
-        };
-        let mut remaining = target_quantity;
-        let mut price = state.best;
-
-        while remaining != 0 && valid_price(price) {
-            let available = u64::from(state.quantity[price as usize]);
-            let fill = remaining.min(available);
-            remaining -= fill;
-            result.filled_quantity += fill;
-            result.notional_ticks += fill * price as u64;
-            result.levels_visited += 1;
-            price = match side {
-                Side::Bid => state.active.previous(price as u32),
-                Side::Ask => state.active.next(price as u32),
-            };
-        }
-        result
-    }
-
-    #[must_use]
-    pub fn top_checksum(&self, side: Side, limit: usize) -> u64 {
-        let mut hash = 0_u64;
-        let mut rank = 1_u64;
-        self.for_each_top(side, limit, |price, quantity| {
-            hash = mix64(hash ^ (u64::from(price) << 32) ^ u64::from(quantity) ^ rank);
-            rank += 1;
-        });
-        hash
-    }
-
-    /// Hash of every occupied level, for differential comparison.
-    ///
-    /// Diagnostic only: walks all 65,536 prices on both sides.
-    #[must_use]
-    pub fn state_hash(&self) -> u64 {
-        let mut hash = mix64((self.best_bid() + 1) as u64) ^ mix64((self.best_ask() + 1) as u64);
-        for side in 0..2 {
-            for price in 0..PRICE_COUNT {
-                let quantity = self.sides[side].quantity[price];
-                if quantity != 0 {
-                    hash = mix64(
-                        hash ^ ((side as u64) << 63) ^ ((price as u64) << 32) ^ u64::from(quantity),
-                    );
-                }
-            }
-        }
-        hash
-    }
-
-    /// Checks bitmap, cached BBO, and total-quantity consistency.
-    ///
-    /// Diagnostic only: walks all 65,536 prices on both sides.
-    #[must_use]
-    pub fn validate(&self) -> bool {
-        for side in 0..2 {
-            let state = &self.sides[side];
-            if !state.active.validate() {
-                return false;
-            }
-            let mut total = 0_u64;
-            for price in 0..PRICE_COUNT {
-                let quantity = state.quantity[price];
-                total += u64::from(quantity);
-                if state.active.contains(price as u32) != (quantity != 0) {
-                    return false;
-                }
-            }
-            if total != state.total_quantity {
-                return false;
-            }
-        }
-        self.best_bid() == self.sides[0].active.last()
-            && self.best_ask() == self.sides[1].active.first()
-    }
-}
-
-impl Default for L2Book {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1739,12 +1516,6 @@ impl L3Book {
         }
         self.release_slot(slot_index);
     }
-}
-
-/// Validity in the fixed [`PRICE_COUNT`] domain — the [`L2Book`] convention.
-#[inline]
-fn valid_price(price: i32) -> bool {
-    (0..PRICE_COUNT as i32).contains(&price)
 }
 
 /// Whether a maker at `maker_offset` crosses a limit expressed relative to

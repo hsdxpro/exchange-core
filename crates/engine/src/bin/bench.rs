@@ -1,6 +1,6 @@
 use bx_engine::verify::{self, Rng, Workload, sparse_prices};
 use bx_engine::{
-    ExecutionReport, L2Book, L3Book, OrderError, OrderSlot, PriceLevel, Side, TimeInForce, mix64,
+    ExecutionReport, L3Book, OrderError, OrderSlot, PriceLevel, Side, TimeInForce, mix64,
 };
 use std::cmp::min;
 use std::hint::black_box;
@@ -25,13 +25,6 @@ struct BenchResult {
     stats: Stats,
     work_per_operation: f64,
     samples: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct L2Update {
-    side: Side,
-    price: u16,
-    quantity: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,45 +103,6 @@ where
     }
     let sample_count = samples.len();
     (summarize(samples), sample_count)
-}
-
-fn make_l2_updates(count: usize) -> Vec<L2Update> {
-    let bids = sparse_prices(512, 32_000, 2_048);
-    let asks = sparse_prices(33_536, 65_000, 2_048);
-    let mut rng = Rng::new(0x3f27_5c81_117a_902d);
-    let mut updates = Vec::with_capacity(count);
-    for _ in 0..count {
-        let random = rng.next_u64();
-        let side = if random & 1 == 0 {
-            Side::Bid
-        } else {
-            Side::Ask
-        };
-        let prices = if side == Side::Bid { &bids } else { &asks };
-        let price = prices[((random >> 8) as usize) % prices.len()];
-        let quantity = if (random >> 32).is_multiple_of(11) {
-            0
-        } else {
-            1 + ((random >> 40) % 10_000) as u32
-        };
-        updates.push(L2Update {
-            side,
-            price,
-            quantity,
-        });
-    }
-    updates
-}
-
-fn make_sparse_l2() -> L2Book {
-    let mut book = L2Book::new();
-    let bids = sparse_prices(512, 32_000, 1_000);
-    let asks = sparse_prices(33_536, 65_000, 1_000);
-    for index in 0..1_000 {
-        book.set_level(Side::Bid, bids[index], 100 + (index % 100) as u32);
-        book.set_level(Side::Ask, asks[index], 100 + ((index * 7) % 100) as u32);
-    }
-    book
 }
 
 fn make_resting_orders(count: usize) -> Vec<RestingOrder> {
@@ -357,9 +311,9 @@ enum Affinity {
 fn print_header(affinity: Affinity, runs: usize) {
     println!("\nBitmap Exchange — Rust 1.97.1 / Edition 2024");
     println!(
-        "Single-instrument L2/L3 order book and price-time FIFO matching engine over a\n\
-         65,536-tick ladder with a 3-tier occupancy bitmap. OrderSlot={} B, PriceLevel={} B,\n\
-         no allocation after construction, no third-party crates, #![forbid(unsafe_code)].",
+        "Single-instrument limit order book and price-time FIFO matching engine over a\n\
+         windowed bitmap ladder over a 31-bit price domain. OrderSlot={} B, PriceLevel={} B,\n\
+         allocation-free steady state, no third-party crates, #![forbid(unsafe_code)].",
         size_of::<OrderSlot>(),
         size_of::<PriceLevel>()
     );
@@ -455,7 +409,6 @@ fn main() -> ExitCode {
     let quick = std::env::args().any(|argument| argument == "--quick");
     let skip_verification = std::env::args().any(|argument| argument == "--bench-only");
     let runs = if quick { 1 } else { 3 };
-    let l2_update_count = if quick { 300_000 } else { 2_000_000 };
     let l3_count = if quick { 80_000 } else { 300_000 };
     let mut sink = 0_u64;
     print_header(affinity(), runs);
@@ -482,122 +435,6 @@ fn main() -> ExitCode {
              slower than the release build and should not be quoted. Use --release."
         );
     }
-
-    let l2_updates = make_l2_updates(l2_update_count);
-    let (l2_update_stats, l2_update_samples) = measure_batches(
-        l2_update_count,
-        4_096,
-        runs,
-        L2Book::new,
-        |book, begin, end| {
-            let mut hash = 0_u64;
-            for update in &l2_updates[begin..end] {
-                book.set_level(update.side, update.price, update.quantity);
-                hash = mix64(
-                    hash ^ (book.best_bid() + 1) as u64 ^ (((book.best_ask() + 1) as u64) << 32),
-                );
-            }
-            hash
-        },
-        L2Book::state_hash,
-        &mut sink,
-    );
-
-    let top10_operations = if quick { 20_000 } else { 150_000 };
-    let (top10_stats, top10_samples) = measure_batches(
-        top10_operations,
-        128,
-        runs,
-        make_sparse_l2,
-        |book, begin, end| {
-            let mut hash = 0_u64;
-            for index in begin..end {
-                let side = if index & 1 == 0 { Side::Bid } else { Side::Ask };
-                hash = mix64(hash ^ book.top_checksum(side, 10));
-            }
-            hash
-        },
-        L2Book::state_hash,
-        &mut sink,
-    );
-
-    let top1000_operations = if quick { 1_000 } else { 12_000 };
-    let (top1000_stats, top1000_samples) = measure_batches(
-        top1000_operations,
-        8,
-        runs,
-        make_sparse_l2,
-        |book, begin, end| {
-            let mut hash = 0_u64;
-            for index in begin..end {
-                let side = if index & 1 == 0 { Side::Bid } else { Side::Ask };
-                hash = mix64(hash ^ book.top_checksum(side, 1_000));
-            }
-            hash
-        },
-        L2Book::state_hash,
-        &mut sink,
-    );
-
-    let (vwap1000_stats, vwap1000_samples) = measure_batches(
-        top1000_operations,
-        8,
-        runs,
-        make_sparse_l2,
-        |book, begin, end| {
-            let mut hash = 0_u64;
-            for index in begin..end {
-                let side = if index & 1 == 0 { Side::Bid } else { Side::Ask };
-                let result = book.sweep(side, book.total_quantity(side));
-                hash = mix64(
-                    hash ^ result.notional_ticks
-                        ^ result.filled_quantity
-                        ^ u64::from(result.levels_visited),
-                );
-            }
-            hash
-        },
-        L2Book::state_hash,
-        &mut sink,
-    );
-
-    print_section(
-        "L2 bitmap ladder — sparse occupancy",
-        &[
-            BenchResult {
-                scenario: "set level + cached BBO",
-                does: "write one price level, then read both best prices back",
-                unit: "update",
-                stats: l2_update_stats,
-                work_per_operation: 1.0,
-                samples: l2_update_samples,
-            },
-            BenchResult {
-                scenario: "top 10 sparse levels",
-                does: "walk the 10 best levels of a book whose prices are far apart",
-                unit: "level",
-                stats: top10_stats,
-                work_per_operation: 10.0,
-                samples: top10_samples,
-            },
-            BenchResult {
-                scenario: "top 1,000 sparse levels",
-                does: "walk 1,000 occupied levels spread across the full 65,536-tick domain",
-                unit: "level",
-                stats: top1000_stats,
-                work_per_operation: 1_000.0,
-                samples: top1000_samples,
-            },
-            BenchResult {
-                scenario: "VWAP across 1,000 sparse levels",
-                does: "sweep the same 1,000 levels accumulating filled quantity and notional",
-                unit: "level",
-                stats: vwap1000_stats,
-                work_per_operation: 1_000.0,
-                samples: vwap1000_samples,
-            },
-        ],
-    );
 
     let orders = make_resting_orders(l3_count);
 

@@ -6,7 +6,7 @@
 //! and so `cargo test` and the binary run byte-for-byte the same checks.
 
 pub mod api;
-pub mod bitmap_l2;
+pub mod bitmap;
 pub mod differential;
 pub mod l3;
 pub mod reference;
@@ -294,9 +294,8 @@ macro_rules! register_checks {
                 names.dedup();
                 assert_eq!(names.len(), total, "duplicate check name registered");
                 assert_eq!(
-                    total, 46,
-                    "expected the 42 ported C++ groups, the Rust-only API-surface group, \
-                     and the three windowed-ladder growth groups"
+                    total, 41,
+                    "a check was added or removed without updating this count"
                 );
             }
         }
@@ -304,16 +303,11 @@ macro_rules! register_checks {
 }
 
 register_checks! {
-    bitmap_l2::bitmap_empty_and_idempotence, "bitmap/L2", "bitmap empty state and idempotence";
-    bitmap_l2::bitmap_all_singletons, "bitmap/L2", "bitmap every singleton price";
-    bitmap_l2::bitmap_hierarchy_boundaries, "bitmap/L2", "bitmap word and hierarchy boundaries";
-    bitmap_l2::bitmap_full_domain_and_queries, "bitmap/L2", "bitmap full-domain next/previous";
-    bitmap_l2::bitmap_random_differential, "bitmap/L2", "bitmap randomized differential model";
-    bitmap_l2::l2_empty_boundaries_and_totals, "bitmap/L2", "L2 empty, boundary prices, and 64-bit totals";
-    bitmap_l2::l2_top_order_and_limit, "bitmap/L2", "L2 top-N ordering and limits";
-    bitmap_l2::l2_sweep_zero_partial_exact_and_shortfall, "bitmap/L2", "L2 sweep zero, partial, exact, and shortfall";
-    bitmap_l2::l2_sparse_top_1000, "bitmap/L2", "L2 sparse top-1000 traversal and VWAP";
-    bitmap_l2::l2_random_differential, "bitmap/L2", "L2 randomized differential model";
+    bitmap::bitmap_empty_and_idempotence, "bitmap", "bitmap empty state and idempotence";
+    bitmap::bitmap_all_singletons, "bitmap", "bitmap every singleton price";
+    bitmap::bitmap_hierarchy_boundaries, "bitmap", "bitmap word and hierarchy boundaries";
+    bitmap::bitmap_full_domain_and_queries, "bitmap", "bitmap full-domain next/previous";
+    bitmap::bitmap_random_differential, "bitmap", "bitmap randomized differential model";
 
     l3::compact_layout_and_empty_state, "L3", "compact L3 layout and empty state";
     l3::invalid_capacity_is_rejected_before_allocation, "L3", "invalid slot capacity rejected before allocation";

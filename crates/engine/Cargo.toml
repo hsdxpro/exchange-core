@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "Dependency-free hierarchical-bitmap MBP/MBO order book and price-time FIFO matching engine"
+description = "Dependency-free hierarchical-bitmap order book and price-time FIFO matching engine"
 
 [lib]
 name = "bx_engine"

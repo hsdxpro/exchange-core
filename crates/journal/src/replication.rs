@@ -320,8 +320,8 @@ impl<L: LogStorage> ReplicatedLog<L> {
     }
 
     /// Followers still answering.
-    #[must_use]
-    pub fn live_followers(&self) -> usize {
+    #[cfg(test)]
+    fn live_followers(&self) -> usize {
         self.followers.iter().filter(|f| f.live).count()
     }
 
